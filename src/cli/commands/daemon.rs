@@ -38,7 +38,7 @@ async fn start_daemon(foreground: bool) -> Result<()> {
         println!("Socket: {:?}", socket_path);
         println!("Press Ctrl+C to stop");
 
-        let mut daemon = Daemon::new(config);
+        let mut daemon = Daemon::new(config)?;
         daemon.run().await?;
     } else {
         // Daemonize (fork to background)
