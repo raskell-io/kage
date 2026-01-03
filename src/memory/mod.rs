@@ -1,14 +1,17 @@
 //! Two-tier memory system for context sharing
 //!
 //! - Working Memory: Fast, in-memory, session-scoped
-//! - Long-Term Memory: Persistent append-only logs
+//! - Long-Term Memory: Persistent storage (filesystem, S3, or Azure Blob)
 
+pub mod backend;
+pub mod backends;
 mod bus;
 pub mod entry;
 mod longterm;
 mod query;
 mod working;
 
+pub use backend::{MemoryBackend, MemoryBackendConfig};
 pub use bus::ContextBus;
 pub use entry::{MemoryContent, MemoryEntry, MemoryId, MemoryScope};
 pub use longterm::LongTermMemory;

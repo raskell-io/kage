@@ -1,11 +1,16 @@
-//! Secrets management via OS keychain
+//! Secrets management with pluggable backends
 //!
-//! Secrets are never stored on disk - always in the OS keychain:
-//! - macOS: Keychain
-//! - Linux: Secret Service (GNOME Keyring, KWallet)
-//! - Windows: Credential Manager
+//! Supports multiple backends:
+//! - OS Keychain (default): macOS Keychain, Linux Secret Service, Windows Credential Manager
+//! - AWS Secrets Manager (requires `secrets-aws` feature)
+//! - Azure Key Vault (requires `secrets-azure` feature)
+
+pub mod backend;
+pub mod backends;
 
 use anyhow::Result;
+
+pub use backend::{SecretsBackend, SecretsBackendConfig};
 
 const SERVICE_NAME: &str = "kage";
 

@@ -14,6 +14,9 @@ use std::path::PathBuf;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+use crate::memory::backend::MemoryBackendConfig;
+use crate::secrets::backend::SecretsBackendConfig;
+
 /// Global Kage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +33,10 @@ pub struct Config {
     #[serde(default)]
     pub memory: MemoryConfig,
 
+    /// Secrets backend settings
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+
     /// Namespace definitions
     #[serde(default)]
     pub namespaces: std::collections::HashMap<String, NamespaceConfig>,
@@ -41,6 +48,7 @@ impl Default for Config {
             daemon: DaemonConfig::default(),
             claude: ClaudeConfig::default(),
             memory: MemoryConfig::default(),
+            secrets: SecretsConfig::default(),
             namespaces: std::collections::HashMap::new(),
         }
     }
@@ -120,6 +128,10 @@ impl Default for ClaudeConfig {
 /// Memory/context configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
+    /// Storage backend configuration
+    #[serde(default)]
+    pub backend: MemoryBackendConfig,
+
     /// Working memory TTL (e.g., "24h")
     #[serde(default = "default_working_memory_ttl")]
     pub working_memory_ttl: String,
@@ -136,9 +148,26 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
+            backend: MemoryBackendConfig::default(),
             working_memory_ttl: default_working_memory_ttl(),
             long_term_retention: default_long_term_retention(),
             max_entries_per_namespace: default_max_entries(),
+        }
+    }
+}
+
+/// Secrets backend configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    /// Secrets backend configuration
+    #[serde(default)]
+    pub backend: SecretsBackendConfig,
+}
+
+impl Default for SecretsConfig {
+    fn default() -> Self {
+        Self {
+            backend: SecretsBackendConfig::default(),
         }
     }
 }

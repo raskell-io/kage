@@ -17,6 +17,17 @@ tui = ["ratatui", "crossterm"]
 # Enable gRPC for remote/multi-user mode
 server = ["tonic", "prost", "prost-types", "tokio-stream", "tonic-build"]
 
+# Enterprise storage backends
+storage-s3 = ["aws-sdk-s3", "aws-config"]
+storage-azure = ["azure_storage_blobs", "azure_identity"]
+
+# Enterprise secrets backends
+secrets-aws = ["aws-sdk-secretsmanager", "aws-config"]
+secrets-azure = ["azure_security_keyvault_secrets", "azure_identity"]
+
+# All enterprise features
+enterprise = ["storage-s3", "storage-azure", "secrets-aws", "secrets-azure"]
+
 [[bin]]
 name = "kage"
 path = "src/main.rs"
@@ -74,6 +85,16 @@ tonic = { version = "0.11", optional = true }
 prost = { version = "0.12", optional = true }
 prost-types = { version = "0.12", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
+
+# AWS SDKs (optional, for enterprise storage/secrets)
+aws-config = { version = "1.1", optional = true }
+aws-sdk-s3 = { version = "1.15", optional = true }
+aws-sdk-secretsmanager = { version = "1.15", optional = true }
+
+# Azure SDKs (optional, for enterprise storage/secrets)
+azure_identity = { version = "0.30", optional = true }
+azure_storage_blobs = { version = "0.21", optional = true }
+azure_security_keyvault_secrets = { version = "0.9", optional = true }
 
 # Async utilities
 futures = "0.3"
