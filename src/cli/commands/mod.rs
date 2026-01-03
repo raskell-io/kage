@@ -1,6 +1,7 @@
 //! CLI command implementations
 
 pub mod agent;
+pub mod approval;
 pub mod daemon;
 pub mod memory;
 pub mod namespace;

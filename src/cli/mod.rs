@@ -54,6 +54,12 @@ pub enum Commands {
         command: SubscriptionCommands,
     },
 
+    /// Approval management (approve/reject agent actions)
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommands,
+    },
+
     /// User management (multi-user mode)
     #[cfg(feature = "server")]
     User {
@@ -334,6 +340,35 @@ pub enum MemoryCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ApprovalCommands {
+    /// List pending approvals
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve an action
+    Approve {
+        /// Approval ID (or "all" to approve all pending)
+        id: String,
+    },
+    /// Reject an action
+    Reject {
+        /// Approval ID
+        id: String,
+
+        /// Reason for rejection
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Show approval details
+    Show {
+        /// Approval ID
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum NamespaceCommands {
     /// Create a new namespace
     Create {
@@ -551,6 +586,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
         Commands::Namespace { command } => commands::namespace::run(command).await,
         Commands::Secret { command } => commands::secret::run(command).await,
         Commands::Subscription { command } => commands::subscription::run(command).await,
+        Commands::Approval { command } => commands::approval::execute(command).await,
 
         #[cfg(feature = "server")]
         Commands::User { command } => commands::user::run(command).await,

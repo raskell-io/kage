@@ -25,7 +25,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, TaskInfo as DaemonTaskInfo};
+use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
 
 /// Message from background data fetcher
 enum DataUpdate {
@@ -45,6 +45,8 @@ enum DataUpdate {
         lines: Vec<OutputLineDisplay>,
         has_more: bool,
     },
+    /// Pending approvals
+    Approvals(Vec<DaemonApprovalInfo>),
     /// Log message
     Log(LogEntry),
 }
@@ -70,6 +72,10 @@ enum Action {
     CancelTask { id: String },
     /// Request output for a specific agent
     RequestOutput { id: String },
+    /// Approve an action
+    Approve { id: String },
+    /// Reject an action
+    Reject { id: String },
 }
 
 /// Purple theme colors matching the mascot
@@ -102,6 +108,8 @@ pub struct Dashboard {
     tasks: TaskListState,
     /// Log entries
     logs: LogState,
+    /// Pending approvals
+    approvals: ApprovalListState,
     /// Daemon connection status
     daemon_status: DaemonStatus,
     /// Daemon version
@@ -114,6 +122,8 @@ pub struct Dashboard {
     show_agent_details: bool,
     /// Show task details popup
     show_task_details: bool,
+    /// Show approvals popup
+    show_approvals: bool,
     /// Last tick time (for animations)
     last_tick: Instant,
     /// Last data refresh
@@ -404,6 +414,91 @@ enum LogLevel {
     Debug,
 }
 
+/// Approval display info
+#[derive(Debug, Clone)]
+struct ApprovalDisplayInfo {
+    id: String,
+    agent_id: String,
+    summary: String,
+    context: Vec<String>,
+    created: String,
+}
+
+/// Approval list state
+struct ApprovalListState {
+    items: Vec<ApprovalDisplayInfo>,
+    state: ListState,
+}
+
+impl ApprovalListState {
+    fn new() -> Self {
+        let mut state = ListState::default();
+        state.select(Some(0));
+        Self {
+            items: Vec::new(),
+            state,
+        }
+    }
+
+    fn update_from_daemon(&mut self, approvals: Vec<DaemonApprovalInfo>) {
+        let selected_id = self.selected().map(|a| a.id.clone());
+
+        self.items = approvals.into_iter().map(|a| {
+            let created_ago = format_duration_ago(a.created_at);
+            ApprovalDisplayInfo {
+                id: a.id.to_string(),
+                agent_id: a.agent_id.to_string(),
+                summary: a.summary,
+                context: a.context,
+                created: created_ago,
+            }
+        }).collect();
+
+        // Preserve selection if possible
+        if let Some(id) = selected_id {
+            if let Some(idx) = self.items.iter().position(|a| a.id == id) {
+                self.state.select(Some(idx));
+            } else if !self.items.is_empty() {
+                self.state.select(Some(0));
+            }
+        } else if !self.items.is_empty() && self.state.selected().is_none() {
+            self.state.select(Some(0));
+        }
+    }
+
+    fn next(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let i = match self.state.selected() {
+            Some(i) => (i + 1) % self.items.len(),
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn previous(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+        let i = match self.state.selected() {
+            Some(i) => {
+                if i == 0 {
+                    self.items.len() - 1
+                } else {
+                    i - 1
+                }
+            }
+            None => 0,
+        };
+        self.state.select(Some(i));
+    }
+
+    fn selected(&self) -> Option<&ApprovalDisplayInfo> {
+        self.state.selected().and_then(|i| self.items.get(i))
+    }
+}
+
 /// Log state
 struct LogState {
     entries: Vec<LogEntry>,
@@ -533,12 +628,14 @@ impl Dashboard {
             output: OutputState::new(),
             tasks: TaskListState::new(),
             logs: LogState::new(),
+            approvals: ApprovalListState::new(),
             daemon_status: DaemonStatus::Disconnected,
             daemon_version: None,
             daemon_uptime: None,
             show_help: false,
             show_agent_details: false,
             show_task_details: false,
+            show_approvals: false,
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
             should_quit: false,
@@ -648,6 +745,34 @@ impl Dashboard {
             return;
         }
 
+        if self.show_approvals {
+            match key {
+                KeyCode::Esc | KeyCode::Char('a') | KeyCode::Char('q') => {
+                    self.show_approvals = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.approvals.previous();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.approvals.next();
+                }
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    // Approve selected
+                    self.handle_approve();
+                }
+                KeyCode::Char('n') | KeyCode::Char('r') => {
+                    // Reject selected
+                    self.handle_reject();
+                }
+                KeyCode::Char('Y') => {
+                    // Approve all
+                    self.handle_approve_all();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Global keys - Ctrl combinations first (they need priority)
         match (key, modifiers.contains(KeyModifiers::CONTROL)) {
             // Ctrl+C or Ctrl+Q to quit
@@ -706,6 +831,7 @@ impl Dashboard {
             KeyCode::Char('x') | KeyCode::Delete => self.handle_delete(), // Kill/cancel
             KeyCode::Backspace => self.handle_delete(),        // Kill/cancel
             KeyCode::Char('c') => self.handle_cancel(),        // Cancel task
+            KeyCode::Char('a') => self.show_approvals = true,  // Open approvals popup
             KeyCode::Char('r') => self.refresh(),              // Refresh
             KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
@@ -869,8 +995,39 @@ impl Dashboard {
             self.show_agent_details = false;
         } else if self.show_task_details {
             self.show_task_details = false;
+        } else if self.show_approvals {
+            self.show_approvals = false;
         }
         // Could also deselect items if needed
+    }
+
+    /// Handle approve - approve the selected action
+    fn handle_approve(&mut self) {
+        if let Some(approval) = self.approvals.selected() {
+            let id = approval.id.clone();
+            self.logs.add_info("dashboard", &format!("Approving action {}...", &id[..8.min(id.len())]));
+            self.send_action(Action::Approve { id });
+        }
+    }
+
+    /// Handle reject - reject the selected action
+    fn handle_reject(&mut self) {
+        if let Some(approval) = self.approvals.selected() {
+            let id = approval.id.clone();
+            self.logs.add_info("dashboard", &format!("Rejecting action {}...", &id[..8.min(id.len())]));
+            self.send_action(Action::Reject { id });
+        }
+    }
+
+    /// Handle approve all - approve all pending actions
+    fn handle_approve_all(&mut self) {
+        let count = self.approvals.items.len();
+        if count > 0 {
+            self.logs.add_info("dashboard", &format!("Approving {} action(s)...", count));
+            for approval in &self.approvals.items {
+                self.send_action(Action::Approve { id: approval.id.clone() });
+            }
+        }
     }
 
     fn refresh(&mut self) {
@@ -917,6 +1074,9 @@ impl Dashboard {
                     DataUpdate::AgentOutput { agent_id, lines, has_more } => {
                         self.output.update(agent_id, lines, has_more);
                     }
+                    DataUpdate::Approvals(approvals) => {
+                        self.approvals.update_from_daemon(approvals);
+                    }
                     DataUpdate::Log(entry) => {
                         self.logs.add(entry);
                     }
@@ -962,6 +1122,9 @@ impl Dashboard {
         if self.show_task_details {
             self.render_task_details_popup(f, area);
         }
+        if self.show_approvals {
+            self.render_approvals_popup(f, area);
+        }
     }
 
     /// Render the header
@@ -1005,15 +1168,27 @@ impl Dashboard {
         // Stats
         let running_agents = self.agents.items.iter().filter(|a| a.status == AgentDisplayStatus::Running).count();
         let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
+        let pending_approvals = self.approvals.items.len();
 
-        let stats = Paragraph::new(Line::from(vec![
+        let mut stats_spans = vec![
             Span::styled(format!("{}", running_agents), Style::default().fg(theme::SUCCESS)),
             Span::styled(" running  ", Style::default().fg(theme::DIM)),
             Span::styled(format!("{}", pending_tasks), Style::default().fg(theme::WARNING)),
             Span::styled(" pending", Style::default().fg(theme::DIM)),
-        ]))
-        .alignment(Alignment::Right)
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::BORDER)));
+        ];
+
+        // Add approvals indicator if there are pending approvals
+        if pending_approvals > 0 {
+            stats_spans.push(Span::styled("  ", Style::default()));
+            stats_spans.push(Span::styled(
+                format!("⚠ {} approval{}", pending_approvals, if pending_approvals == 1 { "" } else { "s" }),
+                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+            ));
+        }
+
+        let stats = Paragraph::new(Line::from(stats_spans))
+            .alignment(Alignment::Right)
+            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::BORDER)));
         f.render_widget(stats, chunks[2]);
     }
 
@@ -1402,6 +1577,25 @@ impl Dashboard {
                 Span::styled("Toggle auto-scroll", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
+            Line::from(Span::styled("Approvals", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  a                ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Open approvals popup", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  y / Enter        ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Approve selected action", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  n / r            ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Reject selected action", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Y                ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Approve all pending", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(""),
             Line::from(Span::styled("General", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
@@ -1574,6 +1768,106 @@ impl Dashboard {
         f.render_widget(ratatui::widgets::Clear, popup_area);
         f.render_widget(details, popup_area);
     }
+
+    /// Render approvals popup
+    fn render_approvals_popup(&self, f: &mut Frame, area: Rect) {
+        let popup_area = centered_rect(75, 70, area);
+
+        let title = format!(
+            " Pending Approvals ({}) ",
+            self.approvals.items.len()
+        );
+
+        // Build list items
+        let items: Vec<ListItem> = self.approvals.items.iter().map(|approval| {
+            let short_id = if approval.id.len() > 8 {
+                &approval.id[..8]
+            } else {
+                &approval.id
+            };
+            let short_agent = if approval.agent_id.len() > 8 {
+                &approval.agent_id[..8]
+            } else {
+                &approval.agent_id
+            };
+
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled("⚠ ", Style::default().fg(theme::WARNING)),
+                    Span::styled(truncate(&approval.summary, 50), Style::default().fg(theme::TEXT)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("  Agent: {} ", short_agent), Style::default().fg(theme::LIGHT_PURPLE)),
+                    Span::styled(format!("ID: {} ", short_id), Style::default().fg(theme::DIM)),
+                    Span::styled(&approval.created, Style::default().fg(theme::DIM)),
+                ]),
+            ])
+        }).collect();
+
+        if items.is_empty() {
+            let content = Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled("  No pending approvals", Style::default().fg(theme::DIM))),
+                Line::from(""),
+                Line::from(Span::styled("  Agents will request approval for file writes, git commits,", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  and other sensitive actions based on the approval level.", Style::default().fg(theme::DIM))),
+                Line::from(""),
+                Line::from(""),
+                Line::from(Span::styled("  [Esc/a] Close", Style::default().fg(theme::DIM))),
+            ])
+            .block(
+                Block::default()
+                    .title(Span::styled(&title, Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::PURPLE))
+                    .style(Style::default().bg(theme::BG)),
+            );
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
+            f.render_widget(content, popup_area);
+        } else {
+            // Split popup into list and footer
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(5),
+                    Constraint::Length(3),
+                ])
+                .split(popup_area);
+
+            let list = List::new(items)
+                .block(
+                    Block::default()
+                        .title(Span::styled(&title, Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme::PURPLE))
+                        .style(Style::default().bg(theme::BG)),
+                )
+                .highlight_style(
+                    Style::default()
+                        .bg(theme::BG_HIGHLIGHT)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▸ ");
+
+            let footer = Paragraph::new(Line::from(vec![
+                Span::styled(" y/Enter ", Style::default().fg(theme::BG).bg(theme::SUCCESS)),
+                Span::styled(" Approve  ", Style::default().fg(theme::DIM)),
+                Span::styled(" n/r ", Style::default().fg(theme::BG).bg(theme::ERROR)),
+                Span::styled(" Reject  ", Style::default().fg(theme::DIM)),
+                Span::styled(" Y ", Style::default().fg(theme::BG).bg(theme::WARNING)),
+                Span::styled(" Approve All  ", Style::default().fg(theme::DIM)),
+                Span::styled(" Esc ", Style::default().fg(theme::BG).bg(theme::PURPLE)),
+                Span::styled(" Close", Style::default().fg(theme::DIM)),
+            ]))
+            .alignment(Alignment::Center)
+            .block(Block::default().style(Style::default().bg(theme::BG)));
+
+            f.render_widget(ratatui::widgets::Clear, popup_area);
+            f.render_stateful_widget(list, chunks[0], &mut self.approvals.state.clone());
+            f.render_widget(footer, chunks[1]);
+        }
+    }
 }
 
 /// Helper to get a centered rect
@@ -1686,6 +1980,16 @@ async fn data_fetcher(
                         Action::RequestOutput { .. } => {
                             // Already handled above
                         }
+                        Action::Approve { id } => {
+                            if let Ok(approval_id) = id.parse::<crate::task::ApprovalId>() {
+                                let _ = client.approve(approval_id).await;
+                            }
+                        }
+                        Action::Reject { id } => {
+                            if let Ok(approval_id) = id.parse::<crate::task::ApprovalId>() {
+                                let _ = client.reject(approval_id, None).await;
+                            }
+                        }
                     }
                 }
 
@@ -1729,6 +2033,14 @@ async fn data_fetcher(
                 match client.list_tasks(None).await {
                     Ok(Response::TaskList { tasks }) => {
                         let _ = tx.send(DataUpdate::Tasks(tasks));
+                    }
+                    _ => {}
+                }
+
+                // Fetch pending approvals
+                match client.list_approvals().await {
+                    Ok(Response::ApprovalList { approvals }) => {
+                        let _ = tx.send(DataUpdate::Approvals(approvals));
                     }
                     _ => {}
                 }

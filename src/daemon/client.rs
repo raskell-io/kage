@@ -163,6 +163,21 @@ impl DaemonClient {
         self.request(&Request::CancelTask { id }).await
     }
 
+    /// List pending approvals
+    pub async fn list_approvals(&mut self) -> Result<Response> {
+        self.request(&Request::ListApprovals).await
+    }
+
+    /// Approve an action
+    pub async fn approve(&mut self, id: crate::task::ApprovalId) -> Result<Response> {
+        self.request(&Request::Approve { id }).await
+    }
+
+    /// Reject an action
+    pub async fn reject(&mut self, id: crate::task::ApprovalId, reason: Option<String>) -> Result<Response> {
+        self.request(&Request::Reject { id, reason }).await
+    }
+
     /// Shutdown the daemon
     pub async fn shutdown(&mut self) -> Result<Response> {
         self.request(&Request::Shutdown).await

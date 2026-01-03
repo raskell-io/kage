@@ -14,8 +14,9 @@ use crate::agent::AgentId;
 use crate::config::Config;
 use crate::subscription::pool::{RequestContext, SubscriptionPool};
 use crate::subscription::{SubscriptionId, SubscriptionRegistry};
+use crate::task::{ApprovalAction, ApprovalId, ApprovalLevel, ApprovalRequest, TaskId};
 
-use super::protocol::{AgentInfo, OutputLine};
+use super::protocol::{AgentInfo, ApprovalInfo, OutputLine};
 
 /// Supervisor manages all active agents
 pub struct Supervisor {
@@ -24,6 +25,12 @@ pub struct Supervisor {
     agent_counter: u32,
     /// Subscription pool for API key management
     subscription_pool: Option<Arc<SubscriptionPool>>,
+    /// Pending approval requests
+    pending_approvals: HashMap<ApprovalId, ApprovalRequest>,
+    /// Agent to approval level mapping (from tasks)
+    agent_approval_levels: HashMap<AgentId, ApprovalLevel>,
+    /// Agent to task mapping
+    agent_tasks: HashMap<AgentId, TaskId>,
 }
 
 /// A managed agent with PTY and output tracking
@@ -58,6 +65,9 @@ impl Supervisor {
             agents: HashMap::new(),
             agent_counter: 0,
             subscription_pool: None,
+            pending_approvals: HashMap::new(),
+            agent_approval_levels: HashMap::new(),
+            agent_tasks: HashMap::new(),
         }
     }
 
@@ -68,6 +78,9 @@ impl Supervisor {
             agents: HashMap::new(),
             agent_counter: 0,
             subscription_pool: Some(pool),
+            pending_approvals: HashMap::new(),
+            agent_approval_levels: HashMap::new(),
+            agent_tasks: HashMap::new(),
         }
     }
 
@@ -574,6 +587,258 @@ impl Supervisor {
             agent.tokens_used += tokens;
         }
     }
+
+    // ========== Approval Methods ==========
+
+    /// Set approval level for an agent (called when spawning for a task)
+    pub fn set_agent_approval(&mut self, agent_id: AgentId, level: ApprovalLevel, task_id: Option<TaskId>) {
+        self.agent_approval_levels.insert(agent_id, level);
+        if let Some(tid) = task_id {
+            self.agent_tasks.insert(agent_id, tid);
+        }
+    }
+
+    /// Get approval level for an agent
+    pub fn get_agent_approval_level(&self, agent_id: AgentId) -> ApprovalLevel {
+        self.agent_approval_levels.get(&agent_id).copied().unwrap_or(ApprovalLevel::None)
+    }
+
+    /// Check if an agent is waiting for approval
+    pub fn is_agent_awaiting_approval(&self, agent_id: AgentId) -> bool {
+        self.pending_approvals.values().any(|r| r.agent_id == agent_id)
+    }
+
+    /// Process agent output to detect actions requiring approval
+    /// Returns Some(ApprovalRequest) if agent should be paused for approval
+    pub fn check_output_for_approval(&mut self, agent_id: AgentId, line: &str) -> Option<ApprovalRequest> {
+        let level = self.get_agent_approval_level(agent_id);
+        if level == ApprovalLevel::None {
+            return None;
+        }
+
+        // Detect file write patterns (Claude Code output format)
+        if let Some(action) = self.detect_file_write(line) {
+            if level.requires_approval(&action) {
+                let context = self.get_output_context(agent_id, 5);
+                let task_id = self.agent_tasks.get(&agent_id).copied();
+                let request = ApprovalRequest::new(agent_id, task_id, action, context);
+                self.pending_approvals.insert(request.id, request.clone());
+                return Some(request);
+            }
+        }
+
+        // Detect git commit patterns
+        if let Some(action) = self.detect_git_commit(line) {
+            if level.requires_approval(&action) {
+                let context = self.get_output_context(agent_id, 5);
+                let task_id = self.agent_tasks.get(&agent_id).copied();
+                let request = ApprovalRequest::new(agent_id, task_id, action, context);
+                self.pending_approvals.insert(request.id, request.clone());
+                return Some(request);
+            }
+        }
+
+        // Detect tool use (for Always level)
+        if level == ApprovalLevel::Always {
+            if let Some(action) = self.detect_tool_use(line) {
+                let context = self.get_output_context(agent_id, 5);
+                let task_id = self.agent_tasks.get(&agent_id).copied();
+                let request = ApprovalRequest::new(agent_id, task_id, action, context);
+                self.pending_approvals.insert(request.id, request.clone());
+                return Some(request);
+            }
+        }
+
+        None
+    }
+
+    /// Get recent output context for approval request
+    fn get_output_context(&self, agent_id: AgentId, lines: usize) -> Vec<String> {
+        self.agents
+            .get(&agent_id)
+            .map(|a| {
+                a.output_history
+                    .iter()
+                    .rev()
+                    .take(lines)
+                    .rev()
+                    .map(|l| l.text.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Detect file write from Claude Code output
+    fn detect_file_write(&self, line: &str) -> Option<ApprovalAction> {
+        // Claude Code outputs patterns like:
+        // "✏️  Wrote to /path/to/file.rs"
+        // "Write(/path/to/file.rs)"
+        // "edit_file: /path/to/file.rs"
+        let patterns = [
+            ("Wrote to ", true),
+            ("Write(", false),
+            ("edit_file: ", true),
+            ("Created ", true),
+        ];
+
+        for (pattern, has_path_after) in patterns {
+            if line.contains(pattern) {
+                let path_str = if has_path_after {
+                    line.split(pattern).nth(1).unwrap_or("").trim()
+                } else {
+                    line.split(pattern)
+                        .nth(1)
+                        .and_then(|s| s.split(')').next())
+                        .unwrap_or("")
+                        .trim()
+                };
+
+                if !path_str.is_empty() {
+                    return Some(ApprovalAction::FileWrite {
+                        path: PathBuf::from(path_str),
+                        lines_added: 0,  // Could parse from output if available
+                        lines_removed: 0,
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Detect git commit from Claude Code output
+    fn detect_git_commit(&self, line: &str) -> Option<ApprovalAction> {
+        // Claude Code outputs patterns like:
+        // "git commit -m \"message\""
+        // "[main abc1234] Commit message"
+        if line.contains("git commit") || line.starts_with('[') && line.contains(']') {
+            // Try to extract commit message
+            let message = if let Some(start) = line.find("-m") {
+                line[start + 2..]
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string()
+            } else if line.starts_with('[') {
+                line.split(']')
+                    .nth(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|| "Commit".to_string())
+            } else {
+                "Commit".to_string()
+            };
+
+            return Some(ApprovalAction::GitCommit {
+                message,
+                files_changed: vec![],  // Could be parsed from git status
+            });
+        }
+        None
+    }
+
+    /// Detect tool use for Always approval level
+    fn detect_tool_use(&self, line: &str) -> Option<ApprovalAction> {
+        // Detect any tool invocation patterns
+        let tools = [
+            ("Bash(", "Running command"),
+            ("Read(", "Reading file"),
+            ("Write(", "Writing file"),
+            ("Edit(", "Editing file"),
+            ("Glob(", "Finding files"),
+            ("Grep(", "Searching files"),
+        ];
+
+        for (pattern, desc) in tools {
+            if line.contains(pattern) {
+                let tool_name = pattern.trim_end_matches('(');
+                return Some(ApprovalAction::ToolUse {
+                    tool: tool_name.to_string(),
+                    description: desc.to_string(),
+                });
+            }
+        }
+        None
+    }
+
+    /// List all pending approvals
+    pub fn list_approvals(&self) -> Vec<ApprovalInfo> {
+        self.pending_approvals
+            .values()
+            .map(|req| ApprovalInfo {
+                id: req.id,
+                agent_id: req.agent_id,
+                task_id: req.task_id,
+                action: req.action.clone(),
+                summary: req.action.summary(),
+                created_at: req.created_at.timestamp(),
+                context: req.context.clone(),
+            })
+            .collect()
+    }
+
+    /// Get pending approvals for a specific agent
+    pub fn get_agent_pending_approval(&self, agent_id: AgentId) -> Option<&ApprovalRequest> {
+        self.pending_approvals.values().find(|r| r.agent_id == agent_id)
+    }
+
+    /// Approve an action and resume the agent
+    pub fn approve(&mut self, id: ApprovalId) -> Result<AgentId> {
+        let request = self.pending_approvals.remove(&id)
+            .ok_or_else(|| anyhow::anyhow!("Approval {} not found", id))?;
+
+        let agent_id = request.agent_id;
+
+        // Resume the agent by sending a confirmation
+        // (In practice, Claude Code continues automatically after we un-pause)
+        tracing::info!("Approved action for agent {}: {}", agent_id, request.action.summary());
+
+        Ok(agent_id)
+    }
+
+    /// Reject an action and notify the agent
+    pub fn reject(&mut self, id: ApprovalId, reason: Option<String>) -> Result<AgentId> {
+        let request = self.pending_approvals.remove(&id)
+            .ok_or_else(|| anyhow::anyhow!("Approval {} not found", id))?;
+
+        let agent_id = request.agent_id;
+
+        // Send rejection message to agent
+        let msg = format!(
+            "Action rejected: {}{}",
+            request.action.summary(),
+            reason.map(|r| format!(" ({})", r)).unwrap_or_default()
+        );
+
+        // Try to send the rejection message to the agent
+        if let Err(e) = self.send_to_agent(agent_id, &msg) {
+            tracing::warn!("Failed to send rejection to agent {}: {}", agent_id, e);
+        }
+
+        tracing::info!("Rejected action for agent {}: {}", agent_id, request.action.summary());
+
+        Ok(agent_id)
+    }
+
+    /// Get count of pending approvals
+    pub fn pending_approval_count(&self) -> usize {
+        self.pending_approvals.len()
+    }
+
+    /// Clean up approval state when agent is killed
+    fn cleanup_agent_approvals(&mut self, agent_id: AgentId) {
+        self.agent_approval_levels.remove(&agent_id);
+        self.agent_tasks.remove(&agent_id);
+        self.pending_approvals.retain(|_, r| r.agent_id != agent_id);
+    }
+
+    /// Helper to send text to an agent's PTY
+    fn send_to_agent(&self, id: AgentId, text: &str) -> Result<()> {
+        if let Some(agent) = self.agents.get(&id) {
+            if let Some(ref mut writer) = *agent.writer.lock().unwrap() {
+                writeln!(writer, "{}", text)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 // Note: Clone is needed for the daemon to share the supervisor across connections
@@ -581,12 +846,15 @@ impl Supervisor {
 // but is required by the original trait bounds
 impl Clone for Supervisor {
     fn clone(&self) -> Self {
-        // This is a shallow clone - agents are not cloned
+        // This is a shallow clone - agents and approvals are not cloned
         Self {
             config: self.config.clone(),
             agents: HashMap::new(),
             agent_counter: self.agent_counter,
             subscription_pool: self.subscription_pool.clone(),
+            pending_approvals: HashMap::new(),
+            agent_approval_levels: HashMap::new(),
+            agent_tasks: HashMap::new(),
         }
     }
 }

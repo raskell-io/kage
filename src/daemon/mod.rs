@@ -658,6 +658,42 @@ async fn handle_request(
             }
         }
 
+        Request::ListApprovals => {
+            let sup = supervisor.read().await;
+            let approvals = sup.list_approvals();
+            Some(Response::ApprovalList { approvals })
+        }
+
+        Request::Approve { id } => {
+            let mut sup = supervisor.write().await;
+            match sup.approve(id) {
+                Ok(agent_id) => {
+                    // Resume the agent after approval
+                    if let Err(e) = sup.resume(agent_id).await {
+                        tracing::warn!("Failed to resume agent {} after approval: {}", agent_id, e);
+                    }
+                    tracing::info!("Approved action {} for agent {}", id, agent_id);
+                    Some(Response::Ok)
+                }
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
+        Request::Reject { id, reason } => {
+            let mut sup = supervisor.write().await;
+            match sup.reject(id, reason) {
+                Ok(agent_id) => {
+                    tracing::info!("Rejected action {} for agent {}", id, agent_id);
+                    Some(Response::Ok)
+                }
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
         Request::Shutdown => {
             tracing::info!("Shutdown requested by client");
             // The daemon will handle the actual shutdown

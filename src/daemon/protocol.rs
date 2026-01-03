@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::agent::AgentId;
-use crate::task::TaskId;
+use crate::task::{ApprovalAction, ApprovalId, TaskId};
 
 /// Request from client to daemon
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +118,23 @@ pub enum Request {
         id: TaskId,
     },
 
+    /// List pending approvals
+    ListApprovals,
+
+    /// Approve an action
+    Approve {
+        /// Approval ID
+        id: ApprovalId,
+    },
+
+    /// Reject an action
+    Reject {
+        /// Approval ID
+        id: ApprovalId,
+        /// Reason for rejection (optional)
+        reason: Option<String>,
+    },
+
     /// Shutdown the daemon
     Shutdown,
 }
@@ -207,6 +224,12 @@ pub enum Response {
 
     /// Stream ended
     StreamEnd,
+
+    /// Approval list
+    ApprovalList {
+        /// List of pending approvals
+        approvals: Vec<ApprovalInfo>,
+    },
 }
 
 /// Agent information for responses
@@ -241,6 +264,25 @@ pub struct OutputLine {
     pub is_error: bool,
     /// Timestamp (unix timestamp)
     pub timestamp: i64,
+}
+
+/// Approval information for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    /// Approval ID
+    pub id: ApprovalId,
+    /// Agent ID
+    pub agent_id: AgentId,
+    /// Task ID (if associated)
+    pub task_id: Option<TaskId>,
+    /// Action type
+    pub action: ApprovalAction,
+    /// Action summary
+    pub summary: String,
+    /// Created at (unix timestamp)
+    pub created_at: i64,
+    /// Context lines
+    pub context: Vec<String>,
 }
 
 /// Task information for responses

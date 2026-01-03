@@ -376,6 +376,131 @@ pub enum ApprovalLevel {
     Always,
 }
 
+impl ApprovalLevel {
+    /// Check if an action requires approval at this level
+    pub fn requires_approval(&self, action: &ApprovalAction) -> bool {
+        match self {
+            Self::None => false,
+            Self::OnWrite => matches!(action, ApprovalAction::FileWrite { .. } | ApprovalAction::GitCommit { .. }),
+            Self::OnCommit => matches!(action, ApprovalAction::GitCommit { .. }),
+            Self::Always => true,
+        }
+    }
+}
+
+/// Type of action requiring approval
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalAction {
+    /// File write operation
+    FileWrite {
+        /// Path being written
+        path: PathBuf,
+        /// Lines added
+        lines_added: usize,
+        /// Lines removed
+        lines_removed: usize,
+    },
+    /// Git commit
+    GitCommit {
+        /// Commit message
+        message: String,
+        /// Files changed
+        files_changed: Vec<String>,
+    },
+    /// Tool use (for Always level)
+    ToolUse {
+        /// Tool name
+        tool: String,
+        /// Tool description
+        description: String,
+    },
+}
+
+impl ApprovalAction {
+    /// Get a short description of the action
+    pub fn summary(&self) -> String {
+        match self {
+            Self::FileWrite { path, lines_added, lines_removed } => {
+                format!("Write {} (+{}, -{})", path.display(), lines_added, lines_removed)
+            }
+            Self::GitCommit { message, files_changed } => {
+                format!("Commit: {} ({} files)", message, files_changed.len())
+            }
+            Self::ToolUse { tool, .. } => {
+                format!("Tool: {}", tool)
+            }
+        }
+    }
+}
+
+/// A pending approval request
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    /// Unique ID for this request
+    pub id: ApprovalId,
+    /// Agent that triggered the request
+    pub agent_id: crate::agent::AgentId,
+    /// Task ID (if associated with a task)
+    pub task_id: Option<TaskId>,
+    /// The action requiring approval
+    pub action: ApprovalAction,
+    /// When the request was created
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Context from agent output (last few lines before action)
+    pub context: Vec<String>,
+}
+
+impl ApprovalRequest {
+    /// Create a new approval request
+    pub fn new(
+        agent_id: crate::agent::AgentId,
+        task_id: Option<TaskId>,
+        action: ApprovalAction,
+        context: Vec<String>,
+    ) -> Self {
+        Self {
+            id: ApprovalId::new(),
+            agent_id,
+            task_id,
+            action,
+            created_at: chrono::Utc::now(),
+            context,
+        }
+    }
+}
+
+/// Unique identifier for an approval request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ApprovalId(Ulid);
+
+impl ApprovalId {
+    /// Create a new approval ID
+    pub fn new() -> Self {
+        Self(Ulid::new())
+    }
+}
+
+impl Default for ApprovalId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for ApprovalId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for ApprovalId {
+    type Err = ulid::DecodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.parse()?))
+    }
+}
+
 /// Criteria for success/abort detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
