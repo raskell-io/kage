@@ -27,21 +27,67 @@ pub struct MemorySystem {
     /// Fast in-memory working memory
     pub working: Arc<RwLock<WorkingMemory>>,
 
-    /// Persistent long-term memory
-    pub longterm: Arc<LongTermMemory>,
+    /// Persistent long-term memory backend
+    longterm_backend: Arc<dyn MemoryBackend>,
 
     /// Real-time pub/sub bus
     pub bus: Arc<ContextBus>,
+
+    /// Legacy accessor for direct LongTermMemory access (prune, etc.)
+    /// TODO: Remove once all callers use the backend trait
+    pub longterm: Arc<LongTermMemory>,
 }
 
 impl MemorySystem {
-    /// Create a new memory system
+    /// Create a new memory system with default filesystem backend
     pub fn new(state_dir: std::path::PathBuf) -> anyhow::Result<Self> {
+        let longterm = Arc::new(LongTermMemory::new(state_dir.clone())?);
+        let backend = backends::FilesystemBackend::new(state_dir.join("events"))?;
+
         Ok(Self {
             working: Arc::new(RwLock::new(WorkingMemory::new())),
-            longterm: Arc::new(LongTermMemory::new(state_dir)?),
+            longterm_backend: Arc::new(backend),
             bus: Arc::new(ContextBus::new()),
+            longterm,
         })
+    }
+
+    /// Create a new memory system with configurable backend
+    pub async fn with_config(
+        config: &MemoryBackendConfig,
+        state_dir: std::path::PathBuf,
+    ) -> anyhow::Result<Self> {
+        let longterm = Arc::new(LongTermMemory::new(state_dir.clone())?);
+        let backend: Arc<dyn MemoryBackend> = Arc::from(
+            backend::create_backend(config, state_dir).await?
+        );
+
+        Ok(Self {
+            working: Arc::new(RwLock::new(WorkingMemory::new())),
+            longterm_backend: backend,
+            bus: Arc::new(ContextBus::new()),
+            longterm,
+        })
+    }
+
+    /// Create a new memory system with a specific backend
+    pub fn with_backend(
+        backend: Box<dyn MemoryBackend>,
+        state_dir: std::path::PathBuf,
+    ) -> anyhow::Result<Self> {
+        let longterm = Arc::new(LongTermMemory::new(state_dir)?);
+
+        Ok(Self {
+            working: Arc::new(RwLock::new(WorkingMemory::new())),
+            longterm_backend: Arc::from(backend),
+            bus: Arc::new(ContextBus::new()),
+            longterm,
+        })
+    }
+
+    /// Get the backend name
+    pub fn backend_name(&self) -> &'static str {
+        self.longterm_backend.name()
     }
 
     /// Store a memory entry
@@ -54,7 +100,7 @@ impl MemorySystem {
 
         // Persist to long-term if not agent-scoped
         if !matches!(scope, MemoryScope::Agent(_)) {
-            self.longterm.append(entry.clone(), scope.clone())?;
+            self.longterm_backend.append(entry.clone(), scope.clone()).await?;
         }
 
         // Broadcast to subscribers
@@ -83,8 +129,8 @@ impl MemorySystem {
             }
         }
 
-        // 2. Query long-term memory (slower, historical)
-        if let Ok(longterm_entries) = self.longterm.query(&query) {
+        // 2. Query long-term backend (slower, historical)
+        if let Ok(longterm_entries) = self.longterm_backend.query(&query).await {
             for entry in longterm_entries {
                 let id_str = entry.id.to_string();
                 if !seen_ids.contains(&id_str) {
@@ -103,5 +149,15 @@ impl MemorySystem {
         }
 
         results
+    }
+
+    /// Prune old entries from long-term storage
+    pub async fn prune(&self, older_than_days: u32, dry_run: bool) -> anyhow::Result<(usize, u64)> {
+        self.longterm_backend.prune(older_than_days, dry_run).await
+    }
+
+    /// Check backend health
+    pub async fn health_check(&self) -> anyhow::Result<()> {
+        self.longterm_backend.health_check().await
     }
 }

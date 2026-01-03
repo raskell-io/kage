@@ -24,6 +24,7 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::memory::MemorySystem;
+use crate::secrets::SecretsManager;
 use crate::task::{
     CheckpointStore, CriteriaAction, CriteriaContext, Task, TaskConfig, TaskRegistry,
     TaskScheduler, TaskStatus,
@@ -44,6 +45,8 @@ pub struct Daemon {
     checkpoint_store: Arc<CheckpointStore>,
     /// Memory system for context sharing
     memory: Arc<MemorySystem>,
+    /// Secrets manager
+    secrets: Arc<SecretsManager>,
     /// Event bus for real-time streaming to UI clients
     event_bus: Arc<EventBus>,
 }
@@ -71,7 +74,11 @@ impl Daemon {
 
         // Initialize memory system
         let memory = Arc::new(MemorySystem::new(config.daemon.state_dir.clone())?);
-        tracing::info!("Memory system initialized");
+        tracing::info!("Memory system initialized (backend: {})", memory.backend_name());
+
+        // Initialize secrets manager
+        let secrets = Arc::new(SecretsManager::new());
+        tracing::info!("Secrets manager initialized (backend: {})", secrets.backend_name());
 
         // Initialize event bus for real-time streaming
         let event_bus = Arc::new(EventBus::new());
@@ -86,6 +93,7 @@ impl Daemon {
             scheduler,
             checkpoint_store,
             memory,
+            secrets,
             event_bus,
         })
     }
@@ -216,7 +224,7 @@ impl Daemon {
                         prune_counter += 1;
                         if prune_counter >= 1200 {
                             prune_counter = 0;
-                            match health_memory.longterm.prune(retention_days, false) {
+                            match health_memory.prune(retention_days, false).await {
                                 Ok((count, bytes)) if count > 0 => {
                                     tracing::info!("Pruned {} old memory entries ({} bytes freed)", count, bytes);
                                 }
@@ -940,7 +948,7 @@ async fn handle_request(
             older_than_days,
             dry_run,
         } => {
-            match _memory.longterm.prune(older_than_days, dry_run) {
+            match _memory.prune(older_than_days, dry_run).await {
                 Ok((count, bytes_freed)) => Some(Response::MemoryPruned { count, bytes_freed }),
                 Err(e) => Some(Response::Error {
                     message: e.to_string(),
