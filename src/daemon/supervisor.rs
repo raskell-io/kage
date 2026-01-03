@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -12,6 +12,8 @@ use tokio::sync::broadcast;
 
 use crate::agent::AgentId;
 use crate::config::Config;
+use crate::subscription::pool::{RequestContext, SubscriptionPool};
+use crate::subscription::{SubscriptionId, SubscriptionRegistry};
 
 use super::protocol::{AgentInfo, OutputLine};
 
@@ -20,6 +22,8 @@ pub struct Supervisor {
     config: Config,
     agents: HashMap<AgentId, ManagedAgent>,
     agent_counter: u32,
+    /// Subscription pool for API key management
+    subscription_pool: Option<Arc<SubscriptionPool>>,
 }
 
 /// A managed agent with PTY and output tracking
@@ -40,6 +44,10 @@ struct ManagedAgent {
     started_at: Instant,
     /// Maximum output history lines
     max_history: usize,
+    /// Subscription being used by this agent
+    subscription_id: Option<SubscriptionId>,
+    /// Token count for usage tracking (estimated from output)
+    tokens_used: u64,
 }
 
 impl Supervisor {
@@ -49,7 +57,38 @@ impl Supervisor {
             config,
             agents: HashMap::new(),
             agent_counter: 0,
+            subscription_pool: None,
         }
+    }
+
+    /// Create a supervisor with a subscription pool
+    pub fn with_subscription_pool(config: Config, pool: Arc<SubscriptionPool>) -> Self {
+        Self {
+            config,
+            agents: HashMap::new(),
+            agent_counter: 0,
+            subscription_pool: Some(pool),
+        }
+    }
+
+    /// Set the subscription pool
+    pub fn set_subscription_pool(&mut self, pool: Arc<SubscriptionPool>) {
+        self.subscription_pool = Some(pool);
+    }
+
+    /// Initialize subscription pool from config
+    pub fn init_subscription_pool(&mut self) -> Result<()> {
+        let db_path = self.config.daemon.state_dir.join("subscriptions.redb");
+        let registry = Arc::new(SubscriptionRegistry::open(db_path)?);
+        let pool = Arc::new(SubscriptionPool::new(registry));
+        self.subscription_pool = Some(pool);
+        tracing::info!("Subscription pool initialized");
+        Ok(())
+    }
+
+    /// Get the subscription pool
+    pub fn subscription_pool(&self) -> Option<&Arc<SubscriptionPool>> {
+        self.subscription_pool.as_ref()
     }
 
     /// Spawn a new agent
@@ -72,6 +111,42 @@ impl Supervisor {
             namespace
         );
 
+        // Try to acquire a subscription from the pool
+        let (subscription_id, api_key) = if let Some(ref pool) = self.subscription_pool {
+            let context = RequestContext::new()
+                .with_agent(id)
+                .with_namespace(namespace.as_deref().unwrap_or("default"));
+
+            match pool.acquire(&context) {
+                Ok(lease) => {
+                    let sub_id = lease.id();
+                    let key_ref = lease.api_key_ref().to_string();
+
+                    // Get the actual API key from keychain
+                    let api_key = crate::secrets::get(&key_ref, &crate::secrets::SecretScope::Global)?
+                        .ok_or_else(|| anyhow::anyhow!("API key not found in keychain: {}", key_ref))?;
+
+                    tracing::info!(
+                        "Agent {} acquired subscription {} ({})",
+                        name,
+                        lease.name(),
+                        sub_id
+                    );
+
+                    // Don't call success/failure yet - we'll do that when agent completes
+                    // Just store the subscription info
+                    (Some(sub_id), Some(api_key))
+                }
+                Err(e) => {
+                    tracing::warn!("No subscription available, spawning without API key: {}", e);
+                    (None, None)
+                }
+            }
+        } else {
+            tracing::debug!("No subscription pool configured, spawning without managed API key");
+            (None, None)
+        };
+
         // Create PTY
         let pty_system = native_pty_system();
         let pty_pair = pty_system
@@ -85,6 +160,11 @@ impl Supervisor {
 
         // Build command
         let mut cmd = CommandBuilder::new("claude");
+
+        // Set API key if we have one from subscription pool
+        if let Some(ref key) = api_key {
+            cmd.env("ANTHROPIC_API_KEY", key);
+        }
 
         // Add model if specified
         if let Some(ref m) = model {
@@ -141,6 +221,8 @@ impl Supervisor {
             child: Mutex::new(Some(child)),
             started_at: Instant::now(),
             max_history: 10000,
+            subscription_id,
+            tokens_used: 0,
         };
 
         self.agents.insert(id, agent);
@@ -250,6 +332,18 @@ impl Supervisor {
         agent.info.status = "stopped".to_string();
         *agent.child.lock().unwrap() = None;
         *agent.writer.lock().unwrap() = None;
+
+        // Release subscription if one was used
+        if let Some(sub_id) = agent.subscription_id {
+            if let Some(ref pool) = self.subscription_pool {
+                // Agent was stopped/killed - mark as failure for usage tracking
+                if let Err(e) = pool.release(sub_id, false, 0) {
+                    tracing::warn!("Failed to release subscription {}: {}", sub_id, e);
+                }
+                // Clear sticky session for this agent
+                pool.clear_sticky_session(id);
+            }
+        }
 
         Ok(())
     }
@@ -398,13 +492,17 @@ impl Supervisor {
 
     /// Check and update agent statuses
     pub async fn health_check(&mut self) {
-        for agent in self.agents.values_mut() {
+        // Collect agents that completed to release their subscriptions after the loop
+        let mut completed_agents: Vec<(AgentId, Option<SubscriptionId>, bool, u64)> = Vec::new();
+
+        for (agent_id, agent) in self.agents.iter_mut() {
             let mut child_guard = agent.child.lock().unwrap();
             if let Some(ref mut child) = *child_guard {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         // Process exited
-                        if status.success() {
+                        let success = status.success();
+                        if success {
                             agent.info.status = "completed".to_string();
                         } else {
                             agent.info.status = "failed".to_string();
@@ -414,6 +512,16 @@ impl Supervisor {
                             agent.info.name,
                             status
                         );
+
+                        // Mark for subscription release
+                        if agent.subscription_id.is_some() {
+                            completed_agents.push((
+                                *agent_id,
+                                agent.subscription_id,
+                                success,
+                                agent.tokens_used,
+                            ));
+                        }
                     }
                     Ok(None) => {
                         // Still running
@@ -423,6 +531,32 @@ impl Supervisor {
                     }
                 }
             }
+        }
+
+        // Release subscriptions for completed agents
+        if let Some(ref pool) = self.subscription_pool {
+            for (agent_id, sub_id, success, tokens) in completed_agents {
+                if let Some(sub_id) = sub_id {
+                    if let Err(e) = pool.release(sub_id, success, tokens) {
+                        tracing::warn!("Failed to release subscription {}: {}", sub_id, e);
+                    }
+                    pool.clear_sticky_session(agent_id);
+                    tracing::debug!(
+                        "Released subscription {} for agent {} (success: {}, tokens: {})",
+                        sub_id,
+                        agent_id,
+                        success,
+                        tokens
+                    );
+                }
+            }
+        }
+    }
+
+    /// Update token usage for an agent (called when parsing output)
+    pub fn update_token_usage(&mut self, id: AgentId, tokens: u64) {
+        if let Some(agent) = self.agents.get_mut(&id) {
+            agent.tokens_used += tokens;
         }
     }
 }
@@ -437,6 +571,7 @@ impl Clone for Supervisor {
             config: self.config.clone(),
             agents: HashMap::new(),
             agent_counter: self.agent_counter,
+            subscription_pool: self.subscription_pool.clone(),
         }
     }
 }

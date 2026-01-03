@@ -35,9 +35,16 @@ impl Daemon {
     /// Create a new daemon instance
     pub fn new(config: Config) -> Self {
         let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
+        let mut supervisor = Supervisor::new(config.clone());
+
+        // Initialize subscription pool
+        if let Err(e) = supervisor.init_subscription_pool() {
+            tracing::warn!("Failed to initialize subscription pool: {}", e);
+        }
+
         Self {
             socket_path: config.daemon.socket_path.clone(),
-            supervisor: Arc::new(RwLock::new(Supervisor::new(config.clone()))),
+            supervisor: Arc::new(RwLock::new(supervisor)),
             config,
             started_at: Instant::now(),
             shutdown_tx: Some(shutdown_tx),
