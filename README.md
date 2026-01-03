@@ -1,131 +1,75 @@
-# Kage (影)
+<div align="center">
 
-A local-first agentic work orchestrator that enables Claude Code agents to work autonomously, share context, and scale across multiple repositories.
+<h1 align="center">
+  <img src=".github/static/kage-mascot.png" alt="kage mascot" width="96" />
+  <br>
+  Kage (影)
+</h1>
 
-> Shadow agents working invisibly, executing with precision.
+<p align="center">
+  <em>A local-first agentic work orchestrator.</em><br>
+  <em>Shadow agents working invisibly, executing with precision.</em>
+</p>
 
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+<p align="center">
+  <a href="https://www.rust-lang.org/">
+    <img alt="Rust" src="https://img.shields.io/badge/Rust-stable-000000?logo=rust&logoColor=white&style=for-the-badge">
+  </a>
+  <a href="https://www.anthropic.com/claude-code">
+    <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-Native-e07b53?style=for-the-badge">
+  </a>
+  <a href="LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/License-Apache--2.0-a78bfa?style=for-the-badge">
+  </a>
+</p>
 
-## Overview
+<p align="center">
+  <a href="https://kage.raskell.io/docs">Documentation</a> •
+  <a href="https://github.com/raskell-io/kage/discussions">Discussions</a> •
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-Kage acts as a **supervisor** for AI agents, not just a session manager. It enables you to:
+</div>
+
+---
+
+Kage enables **Claude Code** agents to work autonomously while you're away, share context with each other, and scale across multiple repositories.
+
+## Quick Start
+
+```bash
+# Install
+curl -fsSL https://kage.raskell.io/install.sh | sh
+
+# Or via Cargo
+cargo install kage
+
+# Run
+kage daemon start
+kage agent spawn --repo ~/code/myproject
+```
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Supervisor Pattern** | Spawn agents with goals, monitor progress, enforce limits |
+| **Event Sourcing** | Immutable audit trails, replay, time-travel queries |
+| **Namespace Organization** | Group repos, share context across agents |
+| **Two-Tier Memory** | Working memory + persistent long-term storage |
+| **Multi-Subscription** | Pool multiple Claude subscriptions for parallel scaling |
+| **Single Binary** | Zero dependencies, just download and run |
+
+## Why Kage
+
+Running a single Claude Code session is straightforward. But what happens when you need agents working across multiple repositories? When you want to step away and let them work autonomously? When they need to share what they've learned?
+
+Kage solves these problems with a supervisor architecture:
 
 - **Spawn agents with specific goals** — Give your agents clear objectives and let them work
 - **Monitor health and progress** — Track what your agents are doing in real-time
 - **Enforce iteration limits** — Set guardrails to prevent runaway execution
 - **Checkpoint and resume** — Save state, review progress, provide guidance, and continue
-
-## Features
-
-### Supervisor Pattern
-Kage manages the complete lifecycle of AI agents. Spawn agents, monitor their health, enforce limits, and enable checkpoint/resume workflows for human-in-the-loop collaboration.
-
-### Event Sourcing
-All agent context is stored as immutable events, enabling full audit trails, cross-agent context sharing, replay for debugging, and time-travel queries.
-
-### Namespace Organization
-Group repositories into namespaces (e.g., "backend", "frontend"). Agents within a namespace automatically share context and coordinate work.
-
-### Two-Tier Memory
-Working memory for fast, session-scoped context. Long-term memory persisted to disk for discoveries, patterns, and decisions that survive restarts.
-
-### Multi-Subscription Pooling
-Register multiple Claude Code subscriptions to scale your development capacity. Kage handles intelligent routing, rate limit management, and automatic failover.
-
-### Single Binary
-Distributed as a single static binary with zero runtime dependencies. No database server, no external services. Just download and run.
-
-## Installation
-
-### Quick Install
-
-```bash
-curl -fsSL https://kage.raskell.io/install.sh | sh
-```
-
-### Cargo
-
-```bash
-cargo install kage
-```
-
-### From Source
-
-```bash
-git clone https://github.com/raskell-io/kage.git
-cd kage
-cargo build --release
-```
-
-## Quick Start
-
-```bash
-# Start the daemon
-kage daemon start
-
-# Spawn an agent in your project
-kage agent spawn --repo ~/code/myproject
-
-# List running agents
-kage agent list
-
-# Attach to an agent
-kage agent attach <agent-id>
-
-# Detach: Ctrl+A, then D
-
-# Assign a task
-kage task add "Fix all TypeScript errors in the project"
-```
-
-## Configuration
-
-Kage uses TOML for configuration with layered precedence:
-
-```
-CLI flags > Environment > Task-specific > Namespace > Global
-```
-
-### Global Config
-
-```toml
-# ~/.config/kage/config.toml
-
-[daemon]
-socket = "/tmp/kage.sock"
-log_level = "info"
-
-[defaults]
-max_iterations = 50
-checkpoint_interval = 10
-
-[namespaces.backend]
-repos = [
-    "~/code/api-server",
-    "~/code/auth-service",
-]
-memory_sharing = "full"
-```
-
-### Per-Project Config
-
-```toml
-# .kage/config.toml
-
-max_iterations = 100
-```
-
-## File Locations
-
-| Purpose | Path |
-|---------|------|
-| Global config | `~/.config/kage/config.toml` |
-| State directory | `~/.local/share/kage/state/` |
-| Daemon logs | `~/.local/share/kage/logs/` |
-| Unix socket | `/tmp/kage.sock` |
-| Per-project config | `.kage/config.toml` |
-
-Secrets (API keys) are stored in your OS keychain, never in plaintext files.
 
 ## Architecture
 
@@ -153,6 +97,33 @@ Secrets (API keys) are stored in your OS keychain, never in plaintext files.
 │  │  └────┘ └────┘ └────┘ └────┘               │   │
 │  └─────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────┘
+```
+
+## Configuration
+
+Kage uses TOML for configuration with layered precedence:
+
+```
+CLI flags > Environment > Task-specific > Namespace > Global
+```
+
+```toml
+# ~/.config/kage/config.toml
+
+[daemon]
+socket = "/tmp/kage.sock"
+log_level = "info"
+
+[defaults]
+max_iterations = 50
+checkpoint_interval = 10
+
+[namespaces.backend]
+repos = [
+    "~/code/api-server",
+    "~/code/auth-service",
+]
+memory_sharing = "full"
 ```
 
 ## CLI Reference
@@ -191,13 +162,17 @@ kage memory list              # List recent memories
 kage memory inject <target> --from <source>  # Share context
 ```
 
-### Subscriptions
+## File Locations
 
-```bash
-kage subscription add     # Add a subscription
-kage subscription list    # List subscriptions
-kage subscription usage   # View usage stats
-```
+| Purpose | Path |
+|---------|------|
+| Global config | `~/.config/kage/config.toml` |
+| State directory | `~/.local/share/kage/state/` |
+| Daemon logs | `~/.local/share/kage/logs/` |
+| Unix socket | `/tmp/kage.sock` |
+| Per-project config | `.kage/config.toml` |
+
+Secrets (API keys) are stored in your OS keychain, never in plaintext files.
 
 ## Built With
 

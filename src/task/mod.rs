@@ -1,4 +1,18 @@
 //! Task scheduling and checkpoint management
+//!
+//! The task system enables agents to work autonomously toward goals with:
+//! - Iteration limits and checkpoints
+//! - Resume capability with guidance injection
+//! - Success/abort criteria detection
+//! - Approval workflows
+
+pub mod checkpoint;
+pub mod registry;
+pub mod scheduler;
+
+pub use checkpoint::CheckpointStore;
+pub use registry::TaskRegistry;
+pub use scheduler::TaskScheduler;
 
 use std::path::PathBuf;
 
