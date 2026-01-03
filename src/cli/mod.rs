@@ -148,7 +148,7 @@ pub enum TaskCommands {
 
         /// Repository
         #[arg(short, long)]
-        repo: Option<String>,
+        repo: Option<std::path::PathBuf>,
 
         /// Maximum iterations
         #[arg(long, default_value = "10")]
@@ -161,12 +161,24 @@ pub enum TaskCommands {
         /// Approval level (none, on-write, on-commit, always)
         #[arg(long, default_value = "on-commit")]
         approval: String,
+
+        /// Priority (0-255, higher = more urgent)
+        #[arg(short, long, default_value = "100")]
+        priority: u8,
+
+        /// Depends on another task (can specify multiple times)
+        #[arg(long)]
+        depends_on: Vec<String>,
     },
     /// List tasks
     List {
-        /// Filter by status
+        /// Filter by status (pending, running, paused, completed, failed, cancelled)
         #[arg(short, long)]
         status: Option<String>,
+
+        /// Filter by namespace
+        #[arg(short, long)]
+        namespace: Option<String>,
 
         /// Output as JSON
         #[arg(long)]
@@ -178,8 +190,8 @@ pub enum TaskCommands {
         id: String,
 
         /// Extend iteration limit
-        #[arg(long)]
-        extend_iterations: Option<u32>,
+        #[arg(long, default_value = "5")]
+        extend_iterations: u32,
 
         /// Provide guidance
         #[arg(long)]
@@ -190,10 +202,51 @@ pub enum TaskCommands {
         /// Task ID
         id: String,
     },
+    /// Pause a running task
+    Pause {
+        /// Task ID
+        id: String,
+    },
     /// Cancel a task
     Cancel {
         /// Task ID
         id: String,
+
+        /// Force cancel without confirmation
+        #[arg(short, long)]
+        force: bool,
+    },
+    /// Manage task checkpoints
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CheckpointCommands {
+    /// List checkpoints for a task
+    List {
+        /// Task ID
+        task_id: String,
+    },
+    /// Show checkpoint details
+    Show {
+        /// Task ID
+        task_id: String,
+
+        /// Checkpoint ID (defaults to latest)
+        #[arg(short, long)]
+        checkpoint_id: Option<String>,
+    },
+    /// Prune old checkpoints
+    Prune {
+        /// Task ID
+        task_id: String,
+
+        /// Number of checkpoints to keep
+        #[arg(long, default_value = "3")]
+        keep: usize,
     },
 }
 

@@ -43,6 +43,14 @@ impl std::fmt::Display for TaskId {
     }
 }
 
+impl std::str::FromStr for TaskId {
+    type Err = ulid::DecodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Ulid::from_string(s)?))
+    }
+}
+
 /// Task status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
@@ -92,11 +100,26 @@ pub struct Task {
     /// Current iteration count
     pub iterations: u32,
 
+    /// Priority (higher = more urgent, 0-255)
+    pub priority: u8,
+
+    /// Dependencies (tasks that must complete first)
+    pub depends_on: Vec<TaskId>,
+
+    /// User-provided guidance for resume
+    pub guidance: Option<String>,
+
+    /// Error message if failed
+    pub error: Option<String>,
+
     /// When this was created
     pub created_at: chrono::DateTime<chrono::Utc>,
 
     /// When this was last updated
     pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    /// When this was started (assigned to agent)
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
 
     /// When this was completed (if applicable)
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -115,8 +138,13 @@ impl Task {
             repository: None,
             config: TaskConfig::default(),
             iterations: 0,
+            priority: 100, // Default middle priority
+            depends_on: Vec::new(),
+            guidance: None,
+            error: None,
             created_at: now,
             updated_at: now,
+            started_at: None,
             completed_at: None,
         }
     }
@@ -139,6 +167,33 @@ impl Task {
         self
     }
 
+    /// Set priority
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Add a dependency
+    pub fn with_dependency(mut self, task_id: TaskId) -> Self {
+        self.depends_on.push(task_id);
+        self
+    }
+
+    /// Set guidance
+    pub fn with_guidance(mut self, guidance: &str) -> Self {
+        self.guidance = Some(guidance.to_string());
+        self
+    }
+
+    /// Check if task is ready to run (no unmet dependencies)
+    pub fn is_ready(&self, completed_tasks: &[TaskId]) -> bool {
+        self.status == TaskStatus::Pending
+            && self
+                .depends_on
+                .iter()
+                .all(|dep| completed_tasks.contains(dep))
+    }
+
     /// Increment iteration count
     pub fn increment_iteration(&mut self) {
         self.iterations += 1;
@@ -150,6 +205,26 @@ impl Task {
         self.iterations >= self.config.max_iterations
     }
 
+    /// Check if checkpoint is due
+    pub fn is_checkpoint_due(&self) -> bool {
+        self.config.checkpoint_every > 0 && self.iterations % self.config.checkpoint_every == 0
+    }
+
+    /// Assign to an agent
+    pub fn assign(&mut self, agent_id: AgentId) {
+        self.agent = Some(agent_id);
+        self.status = TaskStatus::Running;
+        self.started_at = Some(chrono::Utc::now());
+        self.updated_at = chrono::Utc::now();
+    }
+
+    /// Unassign from agent
+    pub fn unassign(&mut self) {
+        self.agent = None;
+        self.status = TaskStatus::Pending;
+        self.updated_at = chrono::Utc::now();
+    }
+
     /// Mark as completed
     pub fn complete(&mut self) {
         self.status = TaskStatus::Completed;
@@ -158,8 +233,9 @@ impl Task {
     }
 
     /// Mark as failed
-    pub fn fail(&mut self) {
+    pub fn fail(&mut self, error: Option<&str>) {
         self.status = TaskStatus::Failed;
+        self.error = error.map(|s| s.to_string());
         self.updated_at = chrono::Utc::now();
     }
 
@@ -167,6 +243,30 @@ impl Task {
     pub fn pause(&mut self) {
         self.status = TaskStatus::Paused;
         self.updated_at = chrono::Utc::now();
+    }
+
+    /// Resume the task with optional guidance
+    pub fn resume(&mut self, guidance: Option<&str>, extend_iterations: u32) {
+        self.status = TaskStatus::Pending;
+        self.config.max_iterations = self.iterations + extend_iterations;
+        if let Some(g) = guidance {
+            self.guidance = Some(g.to_string());
+        }
+        self.updated_at = chrono::Utc::now();
+    }
+
+    /// Cancel the task
+    pub fn cancel(&mut self) {
+        self.status = TaskStatus::Cancelled;
+        self.updated_at = chrono::Utc::now();
+    }
+
+    /// Get duration if completed
+    pub fn duration(&self) -> Option<chrono::Duration> {
+        match (self.started_at, self.completed_at) {
+            (Some(start), Some(end)) => Some(end - start),
+            _ => None,
+        }
     }
 }
 

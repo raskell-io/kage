@@ -44,7 +44,7 @@ pub use daemon::Supervisor;
 pub use memory::{MemoryEntry, MemoryScope, MemorySystem};
 pub use namespace::{Namespace, NamespaceId};
 pub use subscription::{Subscription, SubscriptionId, SubscriptionPool};
-pub use task::{Task, TaskId, TaskStatus};
+pub use task::{CheckpointStore, Task, TaskId, TaskRegistry, TaskScheduler, TaskStatus};
 
 /// Kage version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
