@@ -64,6 +64,10 @@ pub struct DaemonConfig {
     /// Maximum concurrent agents
     #[serde(default = "default_max_agents")]
     pub max_agents: usize,
+
+    /// gRPC listen address (optional, enables remote connections)
+    #[serde(default)]
+    pub grpc_listen: Option<std::net::SocketAddr>,
 }
 
 impl Default for DaemonConfig {
@@ -73,6 +77,7 @@ impl Default for DaemonConfig {
             state_dir: default_state_dir(),
             log_dir: default_log_dir(),
             max_agents: default_max_agents(),
+            grpc_listen: None,
         }
     }
 }

@@ -176,6 +176,15 @@ pub enum Request {
 
     /// Shutdown the daemon
     Shutdown,
+
+    /// Subscribe to daemon events (real-time streaming)
+    Subscribe {
+        /// Event types to subscribe to (empty = all)
+        event_types: Vec<String>,
+    },
+
+    /// Unsubscribe from daemon events
+    Unsubscribe,
 }
 
 /// Response from daemon to client
@@ -296,6 +305,76 @@ pub enum Response {
         count: usize,
         /// Bytes freed
         bytes_freed: u64,
+    },
+
+    /// Subscription confirmed
+    Subscribed,
+
+    /// Daemon event (streamed to subscribers)
+    Event(DaemonEvent),
+}
+
+/// Daemon event for real-time streaming
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    /// Agent spawned
+    AgentSpawned {
+        agent: AgentInfo,
+    },
+
+    /// Agent status changed
+    AgentStatusChanged {
+        id: AgentId,
+        old_status: String,
+        new_status: String,
+    },
+
+    /// Agent killed/stopped
+    AgentStopped {
+        id: AgentId,
+        reason: String,
+    },
+
+    /// Agent output line
+    AgentOutput {
+        id: AgentId,
+        line: OutputLine,
+    },
+
+    /// Task added
+    TaskAdded {
+        task: TaskInfo,
+    },
+
+    /// Task status changed
+    TaskStatusChanged {
+        id: TaskId,
+        old_status: String,
+        new_status: String,
+    },
+
+    /// Task completed
+    TaskCompleted {
+        id: TaskId,
+        success: bool,
+        message: Option<String>,
+    },
+
+    /// Approval created
+    ApprovalCreated {
+        approval: ApprovalInfo,
+    },
+
+    /// Approval resolved
+    ApprovalResolved {
+        id: ApprovalId,
+        approved: bool,
+    },
+
+    /// Connection heartbeat
+    Heartbeat {
+        timestamp: i64,
     },
 }
 

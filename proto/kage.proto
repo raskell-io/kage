@@ -1,0 +1,327 @@
+syntax = "proto3";
+
+package kage.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// =============================================================================
+// KageService - Main service for daemon communication
+// =============================================================================
+
+service KageService {
+  // System
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Status(StatusRequest) returns (StatusResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Agent Management
+  rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
+  rpc KillAgent(KillAgentRequest) returns (KillAgentResponse);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc GetAgent(GetAgentRequest) returns (GetAgentResponse);
+  rpc PauseAgent(PauseAgentRequest) returns (PauseAgentResponse);
+  rpc ResumeAgent(ResumeAgentRequest) returns (ResumeAgentResponse);
+
+  // Agent I/O
+  rpc SendInput(SendInputRequest) returns (SendInputResponse);
+  rpc GetOutput(GetOutputRequest) returns (GetOutputResponse);
+  rpc Attach(AttachRequest) returns (stream OutputLine);
+  rpc Detach(DetachRequest) returns (DetachResponse);
+
+  // Task Management
+  rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
+  rpc ListTasks(ListTasksRequest) returns (ListTasksResponse);
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Approval Workflow
+  rpc ListApprovals(ListApprovalsRequest) returns (ListApprovalsResponse);
+  rpc Approve(ApproveRequest) returns (ApproveResponse);
+  rpc Reject(RejectRequest) returns (RejectResponse);
+
+  // Memory System
+  rpc QueryMemory(QueryMemoryRequest) returns (QueryMemoryResponse);
+  rpc GetMemory(GetMemoryRequest) returns (GetMemoryResponse);
+  rpc StoreMemory(StoreMemoryRequest) returns (StoreMemoryResponse);
+  rpc PruneMemory(PruneMemoryRequest) returns (PruneMemoryResponse);
+}
+
+// =============================================================================
+// Common Types
+// =============================================================================
+
+message AgentInfo {
+  string id = 1;
+  string namespace = 2;
+  string status = 3;
+  string working_dir = 4;
+  string prompt = 5;
+  uint32 iterations = 6;
+  google.protobuf.Timestamp started_at = 7;
+}
+
+message OutputLine {
+  string text = 1;
+  bool is_error = 2;
+  google.protobuf.Timestamp timestamp = 3;
+}
+
+message TaskInfo {
+  string id = 1;
+  string goal = 2;
+  string status = 3;
+  optional string agent_id = 4;
+  optional string namespace = 5;
+  uint32 iterations = 6;
+  uint32 max_iterations = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message ApprovalInfo {
+  string id = 1;
+  string agent_id = 2;
+  optional string task_id = 3;
+  ApprovalAction action = 4;
+  string summary = 5;
+  google.protobuf.Timestamp created_at = 6;
+  repeated string context = 7;
+}
+
+message ApprovalAction {
+  oneof action {
+    FileWrite file_write = 1;
+    GitCommit git_commit = 2;
+    ToolUse tool_use = 3;
+  }
+}
+
+message FileWrite {
+  string path = 1;
+  uint32 lines_added = 2;
+  uint32 lines_removed = 3;
+}
+
+message GitCommit {
+  string message = 1;
+  repeated string files_changed = 2;
+}
+
+message ToolUse {
+  string tool = 1;
+  string description = 2;
+}
+
+message MemoryInfo {
+  string id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  string created_by = 3;
+  string content_type = 4;
+  string content_summary = 5;
+  string content = 6;
+  repeated string tags = 7;
+  string scope = 8;
+}
+
+// =============================================================================
+// System Messages
+// =============================================================================
+
+message PingRequest {}
+
+message PingResponse {
+  string version = 1;
+  uint64 uptime_secs = 2;
+}
+
+message StatusRequest {}
+
+message StatusResponse {
+  string version = 1;
+  uint64 uptime_secs = 2;
+  uint32 active_agents = 3;
+  uint32 pending_tasks = 4;
+  uint32 running_tasks = 5;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {}
+
+// =============================================================================
+// Agent Messages
+// =============================================================================
+
+message SpawnAgentRequest {
+  string working_dir = 1;
+  optional string namespace = 2;
+  optional string prompt = 3;
+  optional string model = 4;
+  optional uint32 max_iterations = 5;
+}
+
+message SpawnAgentResponse {
+  string agent_id = 1;
+}
+
+message KillAgentRequest {
+  string agent_id = 1;
+  bool force = 2;
+}
+
+message KillAgentResponse {}
+
+message ListAgentsRequest {
+  optional string namespace = 1;
+  bool include_stopped = 2;
+}
+
+message ListAgentsResponse {
+  repeated AgentInfo agents = 1;
+}
+
+message GetAgentRequest {
+  string agent_id = 1;
+}
+
+message GetAgentResponse {
+  AgentInfo agent = 1;
+}
+
+message PauseAgentRequest {
+  string agent_id = 1;
+}
+
+message PauseAgentResponse {}
+
+message ResumeAgentRequest {
+  string agent_id = 1;
+}
+
+message ResumeAgentResponse {}
+
+// =============================================================================
+// Agent I/O Messages
+// =============================================================================
+
+message SendInputRequest {
+  string agent_id = 1;
+  string input = 2;
+}
+
+message SendInputResponse {}
+
+message GetOutputRequest {
+  string agent_id = 1;
+  uint32 lines = 2;
+}
+
+message GetOutputResponse {
+  repeated OutputLine lines = 1;
+  bool has_more = 2;
+}
+
+message AttachRequest {
+  string agent_id = 1;
+}
+
+message DetachRequest {
+  string agent_id = 1;
+}
+
+message DetachResponse {}
+
+// =============================================================================
+// Task Messages
+// =============================================================================
+
+message AddTaskRequest {
+  string goal = 1;
+  optional string namespace = 2;
+  optional string repository = 3;
+  optional uint32 max_iterations = 4;
+}
+
+message AddTaskResponse {
+  string task_id = 1;
+}
+
+message ListTasksRequest {
+  optional string status = 1;
+}
+
+message ListTasksResponse {
+  repeated TaskInfo tasks = 1;
+}
+
+message CancelTaskRequest {
+  string task_id = 1;
+}
+
+message CancelTaskResponse {}
+
+// =============================================================================
+// Approval Messages
+// =============================================================================
+
+message ListApprovalsRequest {}
+
+message ListApprovalsResponse {
+  repeated ApprovalInfo approvals = 1;
+}
+
+message ApproveRequest {
+  string approval_id = 1;
+}
+
+message ApproveResponse {}
+
+message RejectRequest {
+  string approval_id = 1;
+  optional string reason = 2;
+}
+
+message RejectResponse {}
+
+// =============================================================================
+// Memory Messages
+// =============================================================================
+
+message QueryMemoryRequest {
+  optional string text = 1;
+  optional string scope = 2;
+  optional string memory_type = 3;
+  repeated string tags = 4;
+  optional int64 since = 5;
+  optional uint32 limit = 6;
+}
+
+message QueryMemoryResponse {
+  repeated MemoryInfo entries = 1;
+  uint32 total = 2;
+}
+
+message GetMemoryRequest {
+  string id = 1;
+}
+
+message GetMemoryResponse {
+  MemoryInfo entry = 1;
+}
+
+message StoreMemoryRequest {
+  string content_json = 1;
+  string scope = 2;
+}
+
+message StoreMemoryResponse {
+  string id = 1;
+}
+
+message PruneMemoryRequest {
+  uint32 older_than_days = 1;
+  bool dry_run = 2;
+}
+
+message PruneMemoryResponse {
+  uint32 count = 1;
+  uint64 bytes_freed = 2;
+}

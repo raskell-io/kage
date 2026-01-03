@@ -3,10 +3,14 @@
 //! The daemon manages agent lifecycles, task scheduling, and IPC.
 
 pub mod client;
+pub mod core;
+pub mod events;
 pub mod protocol;
 mod supervisor;
 
 pub use client::DaemonClient;
+pub use core::HandlerState;
+pub use events::EventBus;
 pub use supervisor::Supervisor;
 
 use std::path::PathBuf;
@@ -40,6 +44,8 @@ pub struct Daemon {
     checkpoint_store: Arc<CheckpointStore>,
     /// Memory system for context sharing
     memory: Arc<MemorySystem>,
+    /// Event bus for real-time streaming to UI clients
+    event_bus: Arc<EventBus>,
 }
 
 impl Daemon {
@@ -67,6 +73,10 @@ impl Daemon {
         let memory = Arc::new(MemorySystem::new(config.daemon.state_dir.clone())?);
         tracing::info!("Memory system initialized");
 
+        // Initialize event bus for real-time streaming
+        let event_bus = Arc::new(EventBus::new());
+        tracing::info!("Event bus initialized");
+
         Ok(Self {
             socket_path: config.daemon.socket_path.clone(),
             supervisor: Arc::new(RwLock::new(supervisor)),
@@ -76,6 +86,7 @@ impl Daemon {
             scheduler,
             checkpoint_store,
             memory,
+            event_bus,
         })
     }
 
@@ -171,9 +182,11 @@ impl Daemon {
         let health_supervisor = Arc::clone(&self.supervisor);
         let health_scheduler = Arc::clone(&self.scheduler);
         let health_memory = Arc::clone(&self.memory);
+        let health_event_bus = Arc::clone(&self.event_bus);
         let retention_days = parse_duration_days(&self.config.memory.long_term_retention);
         let mut health_shutdown_rx = shutdown_tx.subscribe();
         let mut prune_counter: u32 = 0;
+        let mut heartbeat_counter: u32 = 0;
         let health_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -181,6 +194,15 @@ impl Daemon {
                         // Run health check on supervisor
                         let mut sup = health_supervisor.write().await;
                         sup.health_check().await;
+
+                        // Publish heartbeat every 15 seconds (5 iterations)
+                        heartbeat_counter += 1;
+                        if heartbeat_counter >= 5 {
+                            heartbeat_counter = 0;
+                            health_event_bus.publish(protocol::DaemonEvent::Heartbeat {
+                                timestamp: chrono::Utc::now().timestamp(),
+                            });
+                        }
 
                         // Extract and store memory events from agent output
                         let memory_events = sup.extract_memory_events();
@@ -245,6 +267,13 @@ impl Daemon {
                                             }
                                             if let Err(e) = health_scheduler.registry().complete_task(task.id) {
                                                 tracing::error!("Failed to complete task {}: {}", task.id, e);
+                                            } else {
+                                                // Publish task completed event
+                                                health_event_bus.publish(protocol::DaemonEvent::TaskCompleted {
+                                                    id: task.id,
+                                                    success: true,
+                                                    message: Some(format!("{}: {}", criterion, details)),
+                                                });
                                             }
                                             continue;
                                         }
@@ -260,6 +289,13 @@ impl Daemon {
                                             let error_msg = format!("{}: {}", criterion, details);
                                             if let Err(e) = health_scheduler.registry().fail_task(task.id, Some(&error_msg)) {
                                                 tracing::error!("Failed to fail task {}: {}", task.id, e);
+                                            } else {
+                                                // Publish task completed (failed) event
+                                                health_event_bus.publish(protocol::DaemonEvent::TaskCompleted {
+                                                    id: task.id,
+                                                    success: false,
+                                                    message: Some(error_msg),
+                                                });
                                             }
                                             continue;
                                         }
@@ -276,6 +312,12 @@ impl Daemon {
                                             tracing::error!("Failed to complete task {}: {}", task.id, e);
                                         } else {
                                             tracing::info!("Task {} completed (agent {} finished)", task.id, agent.id);
+                                            // Publish task completed event
+                                            health_event_bus.publish(protocol::DaemonEvent::TaskCompleted {
+                                                id: task.id,
+                                                success: true,
+                                                message: None,
+                                            });
                                         }
                                     }
                                     "failed" | "stopped" => {
@@ -284,6 +326,12 @@ impl Daemon {
                                             tracing::error!("Failed to fail task {}: {}", task.id, e);
                                         } else {
                                             tracing::info!("Task {} failed (agent {} {})", task.id, agent.id, agent.status);
+                                            // Publish task completed (failed) event
+                                            health_event_bus.publish(protocol::DaemonEvent::TaskCompleted {
+                                                id: task.id,
+                                                success: false,
+                                                message: Some(error_msg),
+                                            });
                                         }
                                     }
                                     _ => {
@@ -302,6 +350,26 @@ impl Daemon {
             }
         });
 
+        // Start gRPC server if configured
+        #[cfg(feature = "server")]
+        let grpc_handle = if let Some(grpc_addr) = self.config.daemon.grpc_listen {
+            let state = Arc::new(core::HandlerState::new(
+                Arc::clone(&self.supervisor),
+                Arc::clone(&self.scheduler),
+                Arc::clone(&self.memory),
+                self.started_at,
+            ));
+            let grpc_server = crate::rpc::GrpcServer::new(grpc_addr, state);
+            let grpc_shutdown_rx = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                if let Err(e) = grpc_server.run(grpc_shutdown_rx).await {
+                    tracing::error!("gRPC server error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
         // Accept connections
         loop {
             tokio::select! {
@@ -312,12 +380,13 @@ impl Daemon {
                             let scheduler = Arc::clone(&self.scheduler);
                             let checkpoint_store = Arc::clone(&self.checkpoint_store);
                             let memory = Arc::clone(&self.memory);
+                            let event_bus = Arc::clone(&self.event_bus);
                             let started_at = self.started_at;
                             let mut conn_shutdown_rx = shutdown_tx.subscribe();
 
                             tokio::spawn(async move {
                                 tokio::select! {
-                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, memory, started_at) => {
+                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, memory, event_bus, started_at) => {
                                         if let Err(e) = result {
                                             tracing::debug!("Connection closed: {}", e);
                                         }
@@ -348,6 +417,10 @@ impl Daemon {
         tracing::info!("Stopping background tasks...");
         let _ = orchestrator_handle.await;
         let _ = health_handle.await;
+        #[cfg(feature = "server")]
+        if let Some(handle) = grpc_handle {
+            let _ = handle.await;
+        }
 
         // Graceful shutdown: kill all agents
         tracing::info!("Stopping all agents...");
@@ -370,6 +443,7 @@ async fn handle_connection(
     scheduler: Arc<TaskScheduler>,
     checkpoint_store: Arc<CheckpointStore>,
     memory: Arc<MemorySystem>,
+    event_bus: Arc<EventBus>,
     started_at: Instant,
 ) -> Result<()> {
     loop {
@@ -422,6 +496,7 @@ async fn handle_connection(
             &scheduler,
             &checkpoint_store,
             &memory,
+            &event_bus,
             started_at,
             &mut stream,
         )
@@ -448,6 +523,7 @@ async fn handle_request(
     scheduler: &Arc<TaskScheduler>,
     _checkpoint_store: &Arc<CheckpointStore>,
     _memory: &Arc<MemorySystem>,
+    event_bus: &Arc<EventBus>,
     started_at: Instant,
     stream: &mut UnixStream,
 ) -> Option<Response> {
@@ -482,10 +558,16 @@ async fn handle_request(
         } => {
             let mut sup = supervisor.write().await;
             match sup
-                .spawn(working_dir, namespace, prompt, model, max_iterations)
+                .spawn(working_dir.clone(), namespace.clone(), prompt, model, max_iterations)
                 .await
             {
-                Ok(id) => Some(Response::AgentSpawned { id }),
+                Ok(id) => {
+                    // Publish event
+                    if let Some(agent_info) = sup.get_info(id).await {
+                        event_bus.publish(protocol::DaemonEvent::AgentSpawned { agent: agent_info });
+                    }
+                    Some(Response::AgentSpawned { id })
+                }
                 Err(e) => Some(Response::Error {
                     message: e.to_string(),
                 }),
@@ -495,7 +577,15 @@ async fn handle_request(
         Request::KillAgent { id, force } => {
             let mut sup = supervisor.write().await;
             match sup.kill(id, force).await {
-                Ok(()) => Some(Response::Ok),
+                Ok(()) => {
+                    // Publish event
+                    let reason = if force { "force killed" } else { "killed" };
+                    event_bus.publish(protocol::DaemonEvent::AgentStopped {
+                        id,
+                        reason: reason.to_string(),
+                    });
+                    Some(Response::Ok)
+                }
                 Err(e) => Some(Response::Error {
                     message: e.to_string(),
                 }),
@@ -636,9 +726,24 @@ async fn handle_request(
                 task = task.with_repository(repo);
             }
 
-            match scheduler.registry().add(task) {
+            match scheduler.registry().add(task.clone()) {
                 Ok(id) => {
                     tracing::info!("Task {} added: {}", id, goal);
+
+                    // Publish event
+                    event_bus.publish(protocol::DaemonEvent::TaskAdded {
+                        task: TaskInfo {
+                            id,
+                            goal: task.goal,
+                            status: "pending".to_string(),
+                            agent: None,
+                            namespace: task.namespace,
+                            iterations: 0,
+                            max_iterations: task.config.max_iterations,
+                            created_at: task.created_at.timestamp(),
+                        },
+                    });
+
                     Some(Response::TaskAdded { id })
                 }
                 Err(e) => Some(Response::Error {
@@ -711,6 +816,13 @@ async fn handle_request(
                         tracing::warn!("Failed to resume agent {} after approval: {}", agent_id, e);
                     }
                     tracing::info!("Approved action {} for agent {}", id, agent_id);
+
+                    // Publish event
+                    event_bus.publish(protocol::DaemonEvent::ApprovalResolved {
+                        id,
+                        approved: true,
+                    });
+
                     Some(Response::Ok)
                 }
                 Err(e) => Some(Response::Error {
@@ -724,6 +836,13 @@ async fn handle_request(
             match sup.reject(id, reason) {
                 Ok(agent_id) => {
                     tracing::info!("Rejected action {} for agent {}", id, agent_id);
+
+                    // Publish event
+                    event_bus.publish(protocol::DaemonEvent::ApprovalResolved {
+                        id,
+                        approved: false,
+                    });
+
                     Some(Response::Ok)
                 }
                 Err(e) => Some(Response::Error {
@@ -827,6 +946,45 @@ async fn handle_request(
                     message: e.to_string(),
                 }),
             }
+        }
+
+        Request::Subscribe { event_types: _ } => {
+            // Subscribe to daemon events
+            let (_id, mut rx) = event_bus.subscribe();
+            tracing::debug!("Client subscribed to event stream");
+
+            // Send subscription confirmation
+            if send_response(stream, &Response::Subscribed).await.is_err() {
+                return None;
+            }
+
+            // Stream events to client
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let resp = Response::Event(event);
+                        if send_response(stream, &resp).await.is_err() {
+                            tracing::debug!("Event stream: client disconnected");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("Event stream: client lagged {} events", n);
+                        // Continue streaming
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::debug!("Event stream: channel closed");
+                        break;
+                    }
+                }
+            }
+
+            None // Response already sent via stream
+        }
+
+        Request::Unsubscribe => {
+            // Client can simply disconnect to unsubscribe
+            Some(Response::Ok)
         }
     }
 }

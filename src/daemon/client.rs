@@ -226,6 +226,57 @@ impl DaemonClient {
         })
         .await
     }
+
+    /// Subscribe to daemon events (real-time streaming)
+    ///
+    /// After calling this, use `read_event()` to receive events.
+    pub async fn subscribe(&mut self, event_types: Vec<String>) -> Result<()> {
+        let data = protocol::encode_message(&Request::Subscribe { event_types })?;
+        self.stream.write_all(&data).await?;
+
+        // Wait for Subscribed confirmation
+        let mut len_buf = [0u8; 4];
+        self.stream.read_exact(&mut len_buf).await?;
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut data = vec![0u8; len];
+        self.stream.read_exact(&mut data).await?;
+
+        let response: Response = protocol::decode_message(&data)?;
+        match response {
+            Response::Subscribed => Ok(()),
+            Response::Error { message } => anyhow::bail!("{}", message),
+            _ => anyhow::bail!("Unexpected response to subscribe"),
+        }
+    }
+
+    /// Read next event (for subscribe mode)
+    ///
+    /// Returns None if the connection is closed.
+    pub async fn read_event(&mut self) -> Result<Option<protocol::DaemonEvent>> {
+        // Read response length
+        let mut len_buf = [0u8; 4];
+        match self.stream.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len > 10 * 1024 * 1024 {
+            anyhow::bail!("Response too large: {} bytes", len);
+        }
+
+        let mut data = vec![0u8; len];
+        self.stream.read_exact(&mut data).await?;
+
+        let response: Response = protocol::decode_message(&data)?;
+        match response {
+            Response::Event(event) => Ok(Some(event)),
+            Response::Error { message } => anyhow::bail!("{}", message),
+            _ => anyhow::bail!("Unexpected response in event stream"),
+        }
+    }
 }
 
 /// Check if daemon is running

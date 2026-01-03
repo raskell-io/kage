@@ -49,6 +49,8 @@ enum DataUpdate {
     Approvals(Vec<DaemonApprovalInfo>),
     /// Log message
     Log(LogEntry),
+    /// Real-time daemon event
+    Event(crate::daemon::protocol::DaemonEvent),
 }
 
 /// Output line for display
@@ -1080,6 +1082,9 @@ impl Dashboard {
                     DataUpdate::Log(entry) => {
                         self.logs.add(entry);
                     }
+                    DataUpdate::Event(event) => {
+                        self.handle_daemon_event(event);
+                    }
                 }
             }
         }
@@ -1087,6 +1092,97 @@ impl Dashboard {
         // Request output for newly selected agent
         if let Some(agent_id) = request_output_for {
             self.send_action(Action::RequestOutput { id: agent_id });
+        }
+    }
+
+    /// Handle a real-time daemon event
+    fn handle_daemon_event(&mut self, event: crate::daemon::protocol::DaemonEvent) {
+        use crate::daemon::protocol::DaemonEvent;
+
+        match event {
+            DaemonEvent::AgentSpawned { agent } => {
+                self.logs.add_info("event", &format!("Agent {} spawned", &agent.id.to_string()[..8]));
+                // Agent list will be updated on next poll
+            }
+            DaemonEvent::AgentStatusChanged { id, old_status, new_status } => {
+                self.logs.add_info("event", &format!(
+                    "Agent {} status: {} → {}",
+                    &id.to_string()[..8], old_status, new_status
+                ));
+                // Update agent in list if present
+                if let Some(agent) = self.agents.agents.iter_mut().find(|a| a.id == id.to_string()) {
+                    agent.status = new_status;
+                }
+            }
+            DaemonEvent::AgentStopped { id, reason } => {
+                self.logs.add_info("event", &format!(
+                    "Agent {} stopped: {}",
+                    &id.to_string()[..8], reason
+                ));
+            }
+            DaemonEvent::AgentOutput { id, line } => {
+                // Add output line if this is the current agent
+                if let Some(current_agent) = &self.output.agent_id {
+                    if current_agent == &id.to_string() {
+                        self.output.lines.push(OutputLineDisplay {
+                            text: line.text,
+                            is_error: line.is_error,
+                            timestamp: line.timestamp,
+                        });
+                        // Auto-scroll to bottom
+                        if !self.output.lines.is_empty() {
+                            self.output.scroll = self.output.lines.len().saturating_sub(1);
+                        }
+                    }
+                }
+            }
+            DaemonEvent::TaskAdded { task } => {
+                self.logs.add_info("event", &format!(
+                    "Task added: {}",
+                    truncate(&task.goal, 40)
+                ));
+            }
+            DaemonEvent::TaskStatusChanged { id, old_status, new_status } => {
+                self.logs.add_info("event", &format!(
+                    "Task {} status: {} → {}",
+                    &id.to_string()[..8], old_status, new_status
+                ));
+            }
+            DaemonEvent::TaskCompleted { id, success, message } => {
+                let status = if success { "completed" } else { "failed" };
+                let msg = message.map(|m| format!(": {}", truncate(&m, 40))).unwrap_or_default();
+                self.logs.add_info("event", &format!(
+                    "Task {} {}{}",
+                    &id.to_string()[..8], status, msg
+                ));
+            }
+            DaemonEvent::ApprovalCreated { approval } => {
+                self.logs.add_warning("event", &format!(
+                    "Approval needed: {}",
+                    truncate(&approval.summary, 40)
+                ));
+                // Add to approvals list for popup
+                self.approvals.items.push(ApprovalItem {
+                    id: approval.id.to_string(),
+                    agent_id: approval.agent_id.to_string(),
+                    summary: approval.summary,
+                    action_type: format!("{:?}", approval.action),
+                    created_at: approval.created_at,
+                    context: approval.context,
+                });
+            }
+            DaemonEvent::ApprovalResolved { id, approved } => {
+                let status = if approved { "approved" } else { "rejected" };
+                self.logs.add_info("event", &format!(
+                    "Approval {} {}",
+                    &id.to_string()[..8], status
+                ));
+                // Remove from approvals list
+                self.approvals.items.retain(|a| a.id != id.to_string());
+            }
+            DaemonEvent::Heartbeat { timestamp: _ } => {
+                // Keep-alive, no action needed
+            }
         }
     }
 
@@ -1925,6 +2021,13 @@ async fn data_fetcher(
     use crate::daemon::client::DaemonClient;
     use crate::daemon::protocol::Response;
 
+    // Spawn event stream listener for real-time updates
+    let event_tx = tx.clone();
+    let event_socket_path = socket_path.clone();
+    tokio::spawn(async move {
+        event_stream_listener(event_tx, event_socket_path).await;
+    });
+
     // Track which agent we should fetch output for
     let mut current_agent_id: Option<String> = None;
 
@@ -2067,8 +2170,71 @@ async fn data_fetcher(
             }
         }
 
-        // Wait before next fetch
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        // Wait before next fetch (can be longer now since events are real-time)
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+    }
+}
+
+/// Background task that listens for real-time daemon events
+async fn event_stream_listener(
+    tx: mpsc::Sender<DataUpdate>,
+    socket_path: std::path::PathBuf,
+) {
+    use crate::daemon::client::DaemonClient;
+
+    loop {
+        // Try to connect and subscribe
+        match DaemonClient::connect(&socket_path).await {
+            Ok(mut client) => {
+                // Subscribe to all events
+                if client.subscribe(vec![]).await.is_ok() {
+                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                        timestamp: Instant::now(),
+                        level: LogLevel::Info,
+                        source: "events".to_string(),
+                        message: "Connected to real-time event stream".to_string(),
+                    }));
+
+                    // Read events in a loop
+                    loop {
+                        match client.read_event().await {
+                            Ok(Some(event)) => {
+                                // Forward event to dashboard
+                                if tx.send(DataUpdate::Event(event)).is_err() {
+                                    // Channel closed, exit
+                                    return;
+                                }
+                            }
+                            Ok(None) => {
+                                // Connection closed
+                                let _ = tx.send(DataUpdate::Log(LogEntry {
+                                    timestamp: Instant::now(),
+                                    level: LogLevel::Warning,
+                                    source: "events".to_string(),
+                                    message: "Event stream disconnected".to_string(),
+                                }));
+                                break;
+                            }
+                            Err(e) => {
+                                let _ = tx.send(DataUpdate::Log(LogEntry {
+                                    timestamp: Instant::now(),
+                                    level: LogLevel::Error,
+                                    source: "events".to_string(),
+                                    message: format!("Event stream error: {}", e),
+                                }));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // Could not connect, will retry
+            }
+        }
+
+        // Wait before reconnecting
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
     }
 }
 

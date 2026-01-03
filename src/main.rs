@@ -19,6 +19,9 @@ mod subscription;
 mod task;
 mod tui;
 
+#[cfg(feature = "server")]
+mod rpc;
+
 use cli::Commands;
 
 /// Kage - Shadow agents for autonomous code work
