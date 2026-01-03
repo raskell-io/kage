@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use super::entry::{MemoryEntry, MemoryId, MemoryScope};
+use super::entry::{MemoryContent, MemoryEntry, MemoryId, MemoryScope};
+use super::query::MemoryQuery;
 
 /// Fast in-memory working memory
 pub struct WorkingMemory {
@@ -89,6 +90,76 @@ impl WorkingMemory {
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Query entries matching criteria
+    pub fn query(&self, query: &MemoryQuery) -> Vec<MemoryEntry> {
+        self.entries
+            .values()
+            .filter(|(entry, scope)| {
+                // Filter by scope
+                if let Some(ref query_scope) = query.scope {
+                    if scope != query_scope {
+                        return false;
+                    }
+                }
+
+                // Filter by time range
+                if let Some(since) = query.since {
+                    if entry.created_at < since {
+                        return false;
+                    }
+                }
+                if let Some(until) = query.until {
+                    if entry.created_at > until {
+                        return false;
+                    }
+                }
+
+                // Filter by memory type
+                if let Some(ref memory_type) = query.memory_type {
+                    let entry_type = content_type_name(&entry.content);
+                    if entry_type != memory_type {
+                        return false;
+                    }
+                }
+
+                // Filter by tags (all must match)
+                for tag in &query.tags {
+                    if !entry.tags.contains(tag) {
+                        return false;
+                    }
+                }
+
+                // Filter by text (simple substring match)
+                if let Some(ref text) = query.text {
+                    let text_lower = text.to_lowercase();
+                    let content_str = format!("{:?}", entry.content).to_lowercase();
+                    let id_str = entry.id.to_string().to_lowercase();
+
+                    if !content_str.contains(&text_lower) && !id_str.contains(&text_lower) {
+                        return false;
+                    }
+                }
+
+                true
+            })
+            .map(|(entry, _)| entry.clone())
+            .collect()
+    }
+}
+
+/// Get the type name for a MemoryContent variant
+fn content_type_name(content: &MemoryContent) -> &'static str {
+    match content {
+        MemoryContent::FileDiscovered { .. } => "file_discovered",
+        MemoryContent::PatternLearned { .. } => "pattern_learned",
+        MemoryContent::DependencyMapped { .. } => "dependency_mapped",
+        MemoryContent::ErrorEncountered { .. } => "error_encountered",
+        MemoryContent::DecisionMade { .. } => "decision_made",
+        MemoryContent::TaskCompleted { .. } => "task_completed",
+        MemoryContent::InsightShared { .. } => "insight_shared",
+        MemoryContent::QuestionAsked { .. } => "question_asked",
     }
 }
 

@@ -12,6 +12,7 @@ use tokio::sync::broadcast;
 
 use crate::agent::AgentId;
 use crate::config::Config;
+use crate::memory::{MemoryContent, MemoryEntry, MemoryScope};
 use crate::subscription::pool::{RequestContext, SubscriptionPool};
 use crate::subscription::{SubscriptionId, SubscriptionRegistry};
 use crate::task::{ApprovalAction, ApprovalId, ApprovalLevel, ApprovalRequest, TaskId};
@@ -55,6 +56,8 @@ struct ManagedAgent {
     subscription_id: Option<SubscriptionId>,
     /// Token count for usage tracking (estimated from output)
     tokens_used: u64,
+    /// Index of last output line processed for memory events
+    memory_processed_idx: usize,
 }
 
 impl Supervisor {
@@ -236,6 +239,7 @@ impl Supervisor {
             max_history: 10000,
             subscription_id,
             tokens_used: 0,
+            memory_processed_idx: 0,
         };
 
         self.agents.insert(id, agent);
@@ -838,6 +842,137 @@ impl Supervisor {
             }
         }
         Ok(())
+    }
+
+    // --- Memory Event Detection ---
+
+    /// Extract memory events from new output lines for all agents
+    pub fn extract_memory_events(&mut self) -> Vec<(MemoryEntry, MemoryScope)> {
+        let mut events = Vec::new();
+
+        for (id, agent) in self.agents.iter_mut() {
+            let start_idx = agent.memory_processed_idx;
+            let history_len = agent.output_history.len();
+
+            if start_idx >= history_len {
+                continue;
+            }
+
+            // Process new lines
+            for i in start_idx..history_len {
+                let line = &agent.output_history[i].text;
+
+                // Detect file discovery
+                if let Some(content) = Self::detect_file_discovery(line) {
+                    let entry = MemoryEntry::new(*id, content)
+                        .with_tags(vec!["auto".to_string(), "file".to_string()]);
+                    let scope = agent
+                        .info
+                        .namespace
+                        .as_ref()
+                        .map(|ns| MemoryScope::Namespace(ns.clone()))
+                        .unwrap_or(MemoryScope::Agent(*id));
+                    events.push((entry, scope));
+                }
+
+                // Detect errors
+                if let Some(content) = Self::detect_error_encountered(line) {
+                    let entry = MemoryEntry::new(*id, content)
+                        .with_tags(vec!["auto".to_string(), "error".to_string()]);
+                    let scope = agent
+                        .info
+                        .namespace
+                        .as_ref()
+                        .map(|ns| MemoryScope::Namespace(ns.clone()))
+                        .unwrap_or(MemoryScope::Agent(*id));
+                    events.push((entry, scope));
+                }
+            }
+
+            // Update processed index
+            agent.memory_processed_idx = history_len;
+        }
+
+        events
+    }
+
+    /// Detect file read/discovery from Claude Code output
+    fn detect_file_discovery(line: &str) -> Option<MemoryContent> {
+        // Claude Code outputs patterns like:
+        // "Read file: /path/to/file.rs"
+        // "Reading /path/to/file.rs"
+        // "Viewing file: /path/to/file"
+        // "📖 Read /path/to/file"
+        let patterns = [
+            ("Read file: ", ""),
+            ("Read(", ")"),
+            ("Reading ", ""),
+            ("Viewing file: ", ""),
+            ("📖 Read ", ""),
+            ("Glob(", ")"),
+            ("Search(", ")"),
+        ];
+
+        for (start, end) in patterns {
+            if let Some(rest) = line.strip_prefix(start).or_else(|| {
+                line.find(start).map(|i| &line[i + start.len()..])
+            }) {
+                let path_str = if end.is_empty() {
+                    rest.split_whitespace().next().unwrap_or("")
+                } else {
+                    rest.split(end).next().unwrap_or("")
+                };
+
+                if !path_str.is_empty() && path_str.starts_with('/') {
+                    return Some(MemoryContent::FileDiscovered {
+                        path: PathBuf::from(path_str),
+                        summary: format!("Agent read file: {}", path_str),
+                        structure: None,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Detect error from Claude Code output
+    fn detect_error_encountered(line: &str) -> Option<MemoryContent> {
+        // Common error patterns
+        let error_indicators = [
+            "Error:",
+            "error:",
+            "ERROR:",
+            "Failed:",
+            "failed:",
+            "FAILED:",
+            "error[E",
+            "Err(",
+            "panic",
+            "thread 'main' panicked",
+            "Compilation failed",
+            "Build failed",
+            "Test failed",
+        ];
+
+        for indicator in error_indicators {
+            if line.contains(indicator) {
+                // Truncate long error messages
+                let error_msg = if line.len() > 200 {
+                    format!("{}...", &line[..200])
+                } else {
+                    line.to_string()
+                };
+
+                return Some(MemoryContent::ErrorEncountered {
+                    error: error_msg,
+                    resolution: None,
+                    worked: false,
+                });
+            }
+        }
+
+        None
     }
 }
 

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::agent::AgentId;
+use crate::memory::{MemoryEntry, MemoryScope};
 use crate::task::{ApprovalAction, ApprovalId, TaskId};
 
 /// Request from client to daemon
@@ -135,6 +136,44 @@ pub enum Request {
         reason: Option<String>,
     },
 
+    /// Query memory entries
+    QueryMemory {
+        /// Text search (optional)
+        text: Option<String>,
+        /// Scope filter (optional)
+        scope: Option<String>,
+        /// Memory type filter (optional)
+        memory_type: Option<String>,
+        /// Tag filters
+        tags: Vec<String>,
+        /// Since timestamp (optional)
+        since: Option<i64>,
+        /// Result limit (optional)
+        limit: Option<usize>,
+    },
+
+    /// Get a specific memory entry
+    GetMemory {
+        /// Memory ID
+        id: String,
+    },
+
+    /// Store a memory entry
+    StoreMemory {
+        /// Memory content
+        entry: MemoryEntry,
+        /// Scope
+        scope: MemoryScope,
+    },
+
+    /// Prune old memory entries
+    PruneMemory {
+        /// Delete entries older than this many days
+        older_than_days: u32,
+        /// Dry run (don't actually delete)
+        dry_run: bool,
+    },
+
     /// Shutdown the daemon
     Shutdown,
 }
@@ -230,6 +269,34 @@ pub enum Response {
         /// List of pending approvals
         approvals: Vec<ApprovalInfo>,
     },
+
+    /// Memory query results
+    MemoryList {
+        /// List of memory entries
+        entries: Vec<MemoryInfo>,
+        /// Total count (may be more than returned)
+        total: usize,
+    },
+
+    /// Memory entry details
+    MemoryDetails {
+        /// Memory entry
+        entry: MemoryInfo,
+    },
+
+    /// Memory entry stored
+    MemoryStored {
+        /// Memory ID
+        id: String,
+    },
+
+    /// Memory pruned
+    MemoryPruned {
+        /// Number of entries deleted
+        count: usize,
+        /// Bytes freed
+        bytes_freed: u64,
+    },
 }
 
 /// Agent information for responses
@@ -304,6 +371,27 @@ pub struct TaskInfo {
     pub max_iterations: u32,
     /// Created at (unix timestamp)
     pub created_at: i64,
+}
+
+/// Memory entry information for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryInfo {
+    /// Memory ID
+    pub id: String,
+    /// Created at (unix timestamp)
+    pub created_at: i64,
+    /// Created by agent ID
+    pub created_by: String,
+    /// Content type (e.g., "file_discovered", "error_encountered")
+    pub content_type: String,
+    /// Content summary
+    pub content_summary: String,
+    /// Full content (serialized)
+    pub content: String,
+    /// Tags
+    pub tags: Vec<String>,
+    /// Scope (e.g., "agent:xxx", "namespace:backend", "global")
+    pub scope: String,
 }
 
 /// Encode a message with length prefix

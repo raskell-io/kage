@@ -226,19 +226,19 @@ This roadmap outlines the implementation phases for Kage, from MVP to full ecosy
 
 ---
 
-## Phase 3: Context Sharing & Memory
+## Phase 3: Context Sharing & Memory ✓
 
 **Goal:** Agents can share discoveries, learn from each other, and build persistent memory.
 
 ### 3.1 Memory Store Architecture
-- [ ] Two-tier memory system:
+- [x] Two-tier memory system:
   - **Working Memory**: Current session context (in-memory, fast)
   - **Long-Term Memory**: Persisted discoveries (append-only logs)
-- [ ] Memory scopes:
+- [x] Memory scopes:
   - `agent` - Private to one agent
   - `namespace` - Shared within namespace
   - `global` - Available to all agents (opt-in)
-- [ ] Memory types:
+- [x] Memory types:
   ```rust
   pub enum MemoryEntry {
       // Code understanding
@@ -258,25 +258,25 @@ This roadmap outlines the implementation phases for Kage, from MVP to full ecosy
   ```
 
 ### 3.2 Event Log Persistence
-- [ ] Append-only log files (daily rotation)
-- [ ] MessagePack serialization (compact, fast)
-- [ ] Write-ahead logging for crash safety
-- [ ] Automatic compaction of old logs
-- [ ] Event IDs (ULID) for ordering and deduplication
-- [ ] Index files for efficient queries:
+- [x] Append-only log files (daily rotation)
+- [x] MessagePack serialization (compact, fast)
+- [x] Write-ahead logging for crash safety
+- [x] Automatic compaction of old logs
+- [x] Event IDs (ULID) for ordering and deduplication
+- [ ] Index files for efficient queries: (deferred - using in-memory filtering)
   - By agent, namespace, memory type
   - By time range
   - By topic/keyword
 
 ### 3.3 Context Bus (Real-Time)
-- [ ] In-memory pub/sub for live events
-- [ ] Agents auto-subscribe to their namespace
-- [ ] Subscription filters by memory type
-- [ ] Replay historical events on agent spawn
-- [ ] Configurable replay depth (last N events, last N hours)
+- [x] In-memory pub/sub for live events
+- [x] Agents auto-subscribe to their namespace
+- [ ] Subscription filters by memory type (deferred)
+- [ ] Replay historical events on agent spawn (deferred)
+- [ ] Configurable replay depth (last N events, last N hours) (deferred)
 
 ### 3.4 Memory Sharing Controls
-- [ ] Per-namespace settings:
+- [x] Per-namespace settings:
   ```toml
   [namespaces.backend]
   memory_sharing = "full"       # All memories shared automatically
@@ -284,43 +284,43 @@ This roadmap outlines the implementation phases for Kage, from MVP to full ecosy
   [namespaces.experiments]
   memory_sharing = "explicit"   # Only share what's marked
   ```
-- [ ] Per-memory visibility:
+- [x] Per-memory visibility:
   - `kage memory share <id> --scope namespace`
   - `kage memory share <id> --scope global`
-- [ ] Cross-namespace sharing with explicit opt-in
-- [ ] Memory access audit log
+- [ ] Cross-namespace sharing with explicit opt-in (deferred)
+- [ ] Memory access audit log (deferred)
 
 ### 3.5 Context Injection
-- [ ] `kage context inject <target-agent> --from <source-agent>`
-- [ ] Filters:
+- [ ] `kage context inject <target-agent> --from <source-agent>` (deferred)
+- [ ] Filters: (deferred)
   - `--type patterns` - Only learned patterns
   - `--type errors` - Error resolutions
   - `--topic "auth"` - Keyword filter
   - `--since 1h` - Time-based
-- [ ] Automatic summarization for large context
-- [ ] Inject methods:
+- [ ] Automatic summarization for large context (deferred)
+- [ ] Inject methods: (deferred)
   - As Claude CLAUDE.md additions
   - As conversation context
   - As files in working directory
 
 ### 3.6 Memory Queries
-- [ ] `kage memory search "<query>"` - Full-text search
-- [ ] `kage memory list --namespace backend --type patterns`
-- [ ] `kage memory show <id>` - View specific entry
-- [ ] `kage memory export --format json|markdown`
+- [x] `kage memory search "<query>"` - Full-text search
+- [x] `kage memory list --namespace backend --type patterns`
+- [x] `kage memory show <id>` - View specific entry
+- [x] `kage memory export --format json|markdown`
 - [ ] Future: semantic/vector search
 
 ### 3.7 Memory Lifecycle
-- [ ] Configurable retention policies:
+- [x] Configurable retention policies:
   ```toml
   [memory]
   working_memory_ttl = "24h"
   long_term_retention = "90d"
   max_entries_per_namespace = 10000
   ```
-- [ ] Automatic summarization of old context
-- [ ] Manual cleanup: `kage memory prune --older-than 30d`
-- [ ] Archive to external storage (S3, etc.) for compliance
+- [ ] Automatic summarization of old context (deferred)
+- [x] Manual cleanup: `kage memory prune --older-than 30d`
+- [ ] Archive to external storage (S3, etc.) for compliance (deferred)
 
 **Deliverable:** Agent working on auth automatically sees patterns, errors, and decisions from other agents in same namespace.
 

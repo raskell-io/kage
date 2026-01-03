@@ -19,6 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
+use crate::memory::MemorySystem;
 use crate::task::{
     CheckpointStore, CriteriaAction, CriteriaContext, Task, TaskConfig, TaskRegistry,
     TaskScheduler, TaskStatus,
@@ -37,6 +38,8 @@ pub struct Daemon {
     scheduler: Arc<TaskScheduler>,
     /// Checkpoint store
     checkpoint_store: Arc<CheckpointStore>,
+    /// Memory system for context sharing
+    memory: Arc<MemorySystem>,
 }
 
 impl Daemon {
@@ -60,6 +63,10 @@ impl Daemon {
         let checkpoint_store = Arc::new(CheckpointStore::new(config.daemon.state_dir.clone())?);
         tracing::info!("Checkpoint store initialized");
 
+        // Initialize memory system
+        let memory = Arc::new(MemorySystem::new(config.daemon.state_dir.clone())?);
+        tracing::info!("Memory system initialized");
+
         Ok(Self {
             socket_path: config.daemon.socket_path.clone(),
             supervisor: Arc::new(RwLock::new(supervisor)),
@@ -68,6 +75,7 @@ impl Daemon {
             shutdown_tx: Some(shutdown_tx),
             scheduler,
             checkpoint_store,
+            memory,
         })
     }
 
@@ -162,7 +170,10 @@ impl Daemon {
         // Start health check loop - updates task status based on agent completion and criteria
         let health_supervisor = Arc::clone(&self.supervisor);
         let health_scheduler = Arc::clone(&self.scheduler);
+        let health_memory = Arc::clone(&self.memory);
+        let retention_days = parse_duration_days(&self.config.memory.long_term_retention);
         let mut health_shutdown_rx = shutdown_tx.subscribe();
+        let mut prune_counter: u32 = 0;
         let health_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -170,6 +181,29 @@ impl Daemon {
                         // Run health check on supervisor
                         let mut sup = health_supervisor.write().await;
                         sup.health_check().await;
+
+                        // Extract and store memory events from agent output
+                        let memory_events = sup.extract_memory_events();
+                        for (entry, scope) in memory_events {
+                            if let Err(e) = health_memory.store(entry, scope).await {
+                                tracing::warn!("Failed to store memory event: {}", e);
+                            }
+                        }
+
+                        // Periodic memory pruning (every ~1 hour = 1200 iterations at 3s interval)
+                        prune_counter += 1;
+                        if prune_counter >= 1200 {
+                            prune_counter = 0;
+                            match health_memory.longterm.prune(retention_days, false) {
+                                Ok((count, bytes)) if count > 0 => {
+                                    tracing::info!("Pruned {} old memory entries ({} bytes freed)", count, bytes);
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Memory prune failed: {}", e);
+                                }
+                                _ => {}
+                            }
+                        }
 
                         // Get all agents and update corresponding task statuses
                         let agents = sup.list_all().await;
@@ -277,12 +311,13 @@ impl Daemon {
                             let supervisor = Arc::clone(&self.supervisor);
                             let scheduler = Arc::clone(&self.scheduler);
                             let checkpoint_store = Arc::clone(&self.checkpoint_store);
+                            let memory = Arc::clone(&self.memory);
                             let started_at = self.started_at;
                             let mut conn_shutdown_rx = shutdown_tx.subscribe();
 
                             tokio::spawn(async move {
                                 tokio::select! {
-                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, started_at) => {
+                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, memory, started_at) => {
                                         if let Err(e) = result {
                                             tracing::debug!("Connection closed: {}", e);
                                         }
@@ -334,6 +369,7 @@ async fn handle_connection(
     supervisor: Arc<RwLock<Supervisor>>,
     scheduler: Arc<TaskScheduler>,
     checkpoint_store: Arc<CheckpointStore>,
+    memory: Arc<MemorySystem>,
     started_at: Instant,
 ) -> Result<()> {
     loop {
@@ -385,6 +421,7 @@ async fn handle_connection(
             &supervisor,
             &scheduler,
             &checkpoint_store,
+            &memory,
             started_at,
             &mut stream,
         )
@@ -410,6 +447,7 @@ async fn handle_request(
     supervisor: &Arc<RwLock<Supervisor>>,
     scheduler: &Arc<TaskScheduler>,
     _checkpoint_store: &Arc<CheckpointStore>,
+    _memory: &Arc<MemorySystem>,
     started_at: Instant,
     stream: &mut UnixStream,
 ) -> Option<Response> {
@@ -699,5 +737,183 @@ async fn handle_request(
             // The daemon will handle the actual shutdown
             Some(Response::Ok)
         }
+
+        Request::QueryMemory {
+            text,
+            scope,
+            memory_type,
+            tags,
+            since,
+            limit,
+        } => {
+            use crate::memory::MemoryQuery;
+
+            let mut query = MemoryQuery::new();
+
+            if let Some(t) = text {
+                query = query.text(&t);
+            }
+            if let Some(s) = scope {
+                // Parse scope string to MemoryScope
+                if let Some(parsed_scope) = parse_scope_string(&s) {
+                    query = query.scope(parsed_scope);
+                }
+            }
+            if let Some(mt) = memory_type {
+                query = query.memory_type(&mt);
+            }
+            for tag in tags {
+                query = query.tag(&tag);
+            }
+            if let Some(s) = since {
+                if let Some(dt) = chrono::DateTime::from_timestamp(s, 0) {
+                    query = query.since(dt);
+                }
+            }
+            if let Some(l) = limit {
+                query = query.limit(l);
+            }
+
+            let entries = _memory.query(query).await;
+            let total = entries.len();
+
+            let infos: Vec<protocol::MemoryInfo> = entries
+                .into_iter()
+                .map(|e| memory_entry_to_info(&e))
+                .collect();
+
+            Some(Response::MemoryList {
+                entries: infos,
+                total,
+            })
+        }
+
+        Request::GetMemory { id } => {
+            // Query by ID
+            use crate::memory::MemoryQuery;
+
+            let query = MemoryQuery::new().text(&id).limit(1);
+            let entries = _memory.query(query).await;
+
+            if let Some(entry) = entries.first() {
+                Some(Response::MemoryDetails {
+                    entry: memory_entry_to_info(entry),
+                })
+            } else {
+                Some(Response::Error {
+                    message: format!("Memory entry {} not found", id),
+                })
+            }
+        }
+
+        Request::StoreMemory { entry, scope } => {
+            match _memory.store(entry.clone(), scope).await {
+                Ok(()) => Some(Response::MemoryStored {
+                    id: entry.id.to_string(),
+                }),
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
+        Request::PruneMemory {
+            older_than_days,
+            dry_run,
+        } => {
+            match _memory.longterm.prune(older_than_days, dry_run) {
+                Ok((count, bytes_freed)) => Some(Response::MemoryPruned { count, bytes_freed }),
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
     }
+}
+
+/// Parse a scope string like "global", "namespace:backend", "agent:xxx"
+fn parse_scope_string(s: &str) -> Option<crate::memory::MemoryScope> {
+    use crate::memory::MemoryScope;
+
+    if s == "global" {
+        return Some(MemoryScope::Global);
+    }
+
+    if let Some(ns) = s.strip_prefix("namespace:") {
+        return Some(MemoryScope::Namespace(ns.to_string()));
+    }
+
+    if let Some(agent_str) = s.strip_prefix("agent:") {
+        if let Ok(agent_id) = agent_str.parse() {
+            return Some(MemoryScope::Agent(agent_id));
+        }
+    }
+
+    None
+}
+
+/// Convert a MemoryEntry to MemoryInfo for wire format
+fn memory_entry_to_info(entry: &crate::memory::MemoryEntry) -> protocol::MemoryInfo {
+    use crate::memory::entry::MemoryContent;
+
+    let (content_type, content_summary) = match &entry.content {
+        MemoryContent::FileDiscovered { path, summary, .. } => {
+            ("file_discovered".to_string(), format!("{}: {}", path.display(), summary))
+        }
+        MemoryContent::PatternLearned { pattern, confidence, .. } => {
+            ("pattern_learned".to_string(), format!("{} (confidence: {:.0}%)", pattern, confidence * 100.0))
+        }
+        MemoryContent::DependencyMapped { from, to, relationship } => {
+            ("dependency_mapped".to_string(), format!("{} {} {}", from, relationship, to))
+        }
+        MemoryContent::ErrorEncountered { error, worked, .. } => {
+            let status = if *worked { "resolved" } else { "unresolved" };
+            ("error_encountered".to_string(), format!("[{}] {}", status, error))
+        }
+        MemoryContent::DecisionMade { decision, .. } => {
+            ("decision_made".to_string(), decision.clone())
+        }
+        MemoryContent::TaskCompleted { task_id, summary, .. } => {
+            ("task_completed".to_string(), format!("{}: {}", task_id, summary))
+        }
+        MemoryContent::InsightShared { topic, content } => {
+            ("insight_shared".to_string(), format!("{}: {}", topic, content))
+        }
+        MemoryContent::QuestionAsked { question, answer } => {
+            let status = if answer.is_some() { "answered" } else { "unanswered" };
+            ("question_asked".to_string(), format!("[{}] {}", status, question))
+        }
+    };
+
+    // Serialize full content to JSON for storage
+    let content_json = serde_json::to_string(&entry.content).unwrap_or_default();
+
+    protocol::MemoryInfo {
+        id: entry.id.to_string(),
+        created_at: entry.created_at.timestamp(),
+        created_by: entry.created_by.to_string(),
+        content_type,
+        content_summary,
+        content: content_json,
+        tags: entry.tags.clone(),
+        scope: String::new(), // Will be set by caller if needed
+    }
+}
+
+/// Parse a duration string (e.g., "90d", "1w", "2m") to days
+fn parse_duration_days(s: &str) -> u32 {
+    let s = s.trim().to_lowercase();
+
+    if let Some(days) = s.strip_suffix('d') {
+        return days.parse().unwrap_or(90);
+    }
+    if let Some(weeks) = s.strip_suffix('w') {
+        return weeks.parse::<u32>().unwrap_or(13) * 7;
+    }
+    if let Some(months) = s.strip_suffix('m') {
+        return months.parse::<u32>().unwrap_or(3) * 30;
+    }
+
+    // Try parsing as plain number (days)
+    s.parse().unwrap_or(90)
 }

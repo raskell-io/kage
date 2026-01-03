@@ -4,13 +4,13 @@
 //! - Long-Term Memory: Persistent append-only logs
 
 mod bus;
-mod entry;
+pub mod entry;
 mod longterm;
 mod query;
 mod working;
 
 pub use bus::ContextBus;
-pub use entry::{MemoryEntry, MemoryScope};
+pub use entry::{MemoryContent, MemoryEntry, MemoryId, MemoryScope};
 pub use longterm::LongTermMemory;
 pub use query::MemoryQuery;
 pub use working::WorkingMemory;
@@ -62,7 +62,43 @@ impl MemorySystem {
 
     /// Query memory
     pub async fn query(&self, query: MemoryQuery) -> Vec<MemoryEntry> {
-        // TODO: Implement query across both tiers
-        vec![]
+        use std::collections::HashSet;
+
+        let mut results = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
+
+        // 1. Query working memory first (fast, recent)
+        {
+            let working = self.working.read().await;
+            let working_entries = working.query(&query);
+            for entry in working_entries {
+                let id_str = entry.id.to_string();
+                if !seen_ids.contains(&id_str) {
+                    seen_ids.insert(id_str);
+                    results.push(entry);
+                }
+            }
+        }
+
+        // 2. Query long-term memory (slower, historical)
+        if let Ok(longterm_entries) = self.longterm.query(&query) {
+            for entry in longterm_entries {
+                let id_str = entry.id.to_string();
+                if !seen_ids.contains(&id_str) {
+                    seen_ids.insert(id_str);
+                    results.push(entry);
+                }
+            }
+        }
+
+        // 3. Sort by created_at descending (newest first)
+        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        // 4. Apply final limit
+        if let Some(limit) = query.limit {
+            results.truncate(limit);
+        }
+
+        results
     }
 }

@@ -182,6 +182,50 @@ impl DaemonClient {
     pub async fn shutdown(&mut self) -> Result<Response> {
         self.request(&Request::Shutdown).await
     }
+
+    /// Query memory entries
+    pub async fn query_memory(
+        &mut self,
+        text: Option<String>,
+        scope: Option<String>,
+        memory_type: Option<String>,
+        tags: Vec<String>,
+        since: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Response> {
+        self.request(&Request::QueryMemory {
+            text,
+            scope,
+            memory_type,
+            tags,
+            since,
+            limit,
+        })
+        .await
+    }
+
+    /// Get a specific memory entry
+    pub async fn get_memory(&mut self, id: String) -> Result<Response> {
+        self.request(&Request::GetMemory { id }).await
+    }
+
+    /// Store a memory entry
+    pub async fn store_memory(
+        &mut self,
+        entry: crate::memory::MemoryEntry,
+        scope: crate::memory::MemoryScope,
+    ) -> Result<Response> {
+        self.request(&Request::StoreMemory { entry, scope }).await
+    }
+
+    /// Prune old memory entries
+    pub async fn prune_memory(&mut self, older_than_days: u32, dry_run: bool) -> Result<Response> {
+        self.request(&Request::PruneMemory {
+            older_than_days,
+            dry_run,
+        })
+        .await
+    }
 }
 
 /// Check if daemon is running
