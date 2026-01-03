@@ -19,7 +19,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
-use crate::task::{CheckpointStore, Task, TaskConfig, TaskRegistry, TaskScheduler, TaskStatus};
+use crate::task::{
+    CheckpointStore, CriteriaAction, CriteriaContext, Task, TaskConfig, TaskRegistry,
+    TaskScheduler, TaskStatus,
+};
 
 use protocol::{Request, Response, TaskInfo};
 
@@ -156,7 +159,7 @@ impl Daemon {
             }
         });
 
-        // Start health check loop - updates task status based on agent completion
+        // Start health check loop - updates task status based on agent completion and criteria
         let health_supervisor = Arc::clone(&self.supervisor);
         let health_scheduler = Arc::clone(&self.scheduler);
         let mut health_shutdown_rx = shutdown_tx.subscribe();
@@ -170,9 +173,8 @@ impl Daemon {
 
                         // Get all agents and update corresponding task statuses
                         let agents = sup.list_all().await;
-                        drop(sup);
 
-                        for agent in agents {
+                        for agent in &agents {
                             // Find tasks assigned to this agent
                             let tasks = health_scheduler.registry().get_by_agent(agent.id);
 
@@ -180,6 +182,57 @@ impl Daemon {
                                 // Skip if task is already in a terminal state
                                 if matches!(task.status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled) {
                                     continue;
+                                }
+
+                                // Check criteria if agent is still running
+                                if agent.status == "running" && (!task.config.success_criteria.is_empty() || !task.config.abort_criteria.is_empty()) {
+                                    // Build criteria context
+                                    let output_lines = sup.get_output_lines(agent.id);
+                                    let working_dir = sup.get_working_dir(agent.id);
+
+                                    let ctx = CriteriaContext {
+                                        output_lines,
+                                        working_dir,
+                                        modified_files: Vec::new(), // TODO: track modified files
+                                        iteration: task.iterations,
+                                        last_change_iteration: task.iterations, // TODO: track last change
+                                    };
+
+                                    // Evaluate criteria
+                                    match task.evaluate_criteria(&ctx) {
+                                        CriteriaAction::Complete { criterion, details } => {
+                                            tracing::info!(
+                                                "Task {} auto-completed: {} ({})",
+                                                task.id, criterion, details
+                                            );
+                                            // Kill the agent since task is done
+                                            if let Err(e) = sup.kill(agent.id, false).await {
+                                                tracing::warn!("Failed to stop agent {}: {}", agent.id, e);
+                                            }
+                                            if let Err(e) = health_scheduler.registry().complete_task(task.id) {
+                                                tracing::error!("Failed to complete task {}: {}", task.id, e);
+                                            }
+                                            continue;
+                                        }
+                                        CriteriaAction::Abort { criterion, details } => {
+                                            tracing::warn!(
+                                                "Task {} auto-aborted: {} ({})",
+                                                task.id, criterion, details
+                                            );
+                                            // Kill the agent
+                                            if let Err(e) = sup.kill(agent.id, false).await {
+                                                tracing::warn!("Failed to stop agent {}: {}", agent.id, e);
+                                            }
+                                            let error_msg = format!("{}: {}", criterion, details);
+                                            if let Err(e) = health_scheduler.registry().fail_task(task.id, Some(&error_msg)) {
+                                                tracing::error!("Failed to fail task {}: {}", task.id, e);
+                                            }
+                                            continue;
+                                        }
+                                        CriteriaAction::Continue => {
+                                            // Keep running
+                                        }
+                                    }
                                 }
 
                                 // Update task status based on agent status
@@ -200,11 +253,13 @@ impl Daemon {
                                         }
                                     }
                                     _ => {
-                                        // Agent still running, nothing to do
+                                        // Agent still running, criteria checked above
                                     }
                                 }
                             }
                         }
+
+                        drop(sup);
                     }
                     _ = health_shutdown_rx.recv() => {
                         break;

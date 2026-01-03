@@ -430,6 +430,21 @@ impl Supervisor {
         Ok(agent.output_tx.subscribe())
     }
 
+    /// Get agent output as text lines (for criteria checking)
+    pub fn get_output_lines(&self, id: AgentId) -> Vec<String> {
+        self.agents
+            .get(&id)
+            .map(|a| a.output_history.iter().map(|l| l.text.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Get agent working directory
+    pub fn get_working_dir(&self, id: AgentId) -> Option<std::path::PathBuf> {
+        self.agents
+            .get(&id)
+            .map(|a| a.info.working_dir.clone())
+    }
+
     /// Pause an agent (send SIGSTOP)
     pub async fn pause(&mut self, id: AgentId) -> Result<()> {
         let agent = self

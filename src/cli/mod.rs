@@ -173,6 +173,18 @@ pub enum TaskCommands {
         /// Depends on another task (can specify multiple times)
         #[arg(long)]
         depends_on: Vec<String>,
+
+        /// Success criteria (auto-complete when met, can specify multiple)
+        /// Formats: pattern:REGEX, file-exists:PATH, file-contains:PATH:PATTERN,
+        /// command:CMD, tests-pass
+        #[arg(long = "success-on")]
+        success_on: Vec<String>,
+
+        /// Abort criteria (auto-abort when met, can specify multiple)
+        /// Formats: error-count:MAX:PATTERN, repeated-output:MIN:WINDOW,
+        /// output-contains:PHRASE1,PHRASE2, no-progress:ITERATIONS
+        #[arg(long = "abort-on")]
+        abort_on: Vec<String>,
     },
     /// List tasks
     List {

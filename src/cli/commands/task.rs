@@ -1,13 +1,14 @@
 //! Task command implementations
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use ulid::Ulid;
 
 use crate::cli::{CheckpointCommands, TaskCommands};
 use crate::config;
-use crate::task::{ApprovalLevel, CheckpointStore, Task, TaskConfig, TaskId, TaskRegistry, TaskStatus};
+use crate::task::{ApprovalLevel, CheckpointStore, Criterion, Task, TaskConfig, TaskId, TaskRegistry, TaskStatus};
 
 pub async fn run(cmd: TaskCommands) -> Result<()> {
     match cmd {
@@ -20,6 +21,8 @@ pub async fn run(cmd: TaskCommands) -> Result<()> {
             approval,
             priority,
             depends_on,
+            success_on,
+            abort_on,
         } => {
             add_task(
                 goal,
@@ -30,6 +33,8 @@ pub async fn run(cmd: TaskCommands) -> Result<()> {
                 approval,
                 priority,
                 depends_on,
+                success_on,
+                abort_on,
             )
             .await
         }
@@ -93,6 +98,118 @@ fn parse_status(s: &str) -> Result<TaskStatus> {
     }
 }
 
+/// Parse a success criterion from string
+/// Formats:
+///   pattern:REGEX              - Match regex in output
+///   file-exists:PATH           - Check if file exists
+///   file-contains:PATH:PATTERN - Check if file contains pattern
+///   command:CMD                - Run command and check exit code
+///   tests-pass                 - Run tests and check they pass
+fn parse_success_criterion(s: &str) -> Result<Criterion> {
+    let lower = s.to_lowercase();
+
+    if lower == "tests-pass" {
+        return Ok(Criterion::TestsPass);
+    }
+
+    if let Some(rest) = s.strip_prefix("pattern:") {
+        return Ok(Criterion::PatternMatch {
+            pattern: rest.to_string(),
+            last_n_lines: 0,
+        });
+    }
+
+    if let Some(rest) = s.strip_prefix("file-exists:") {
+        return Ok(Criterion::FileExists {
+            path: PathBuf::from(rest),
+        });
+    }
+
+    if let Some(rest) = s.strip_prefix("file-contains:") {
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("file-contains format: file-contains:PATH:PATTERN");
+        }
+        return Ok(Criterion::FileContains {
+            path: PathBuf::from(parts[0]),
+            pattern: parts[1].to_string(),
+        });
+    }
+
+    if let Some(rest) = s.strip_prefix("command:") {
+        return Ok(Criterion::CommandSucceeds {
+            command: rest.to_string(),
+            working_dir: None,
+        });
+    }
+
+    anyhow::bail!(
+        "Unknown success criterion: {}. Use: pattern:REGEX, file-exists:PATH, \
+        file-contains:PATH:PATTERN, command:CMD, tests-pass",
+        s
+    )
+}
+
+/// Parse an abort criterion from string
+/// Formats:
+///   error-count:MAX:PATTERN        - Abort if pattern appears MAX times
+///   repeated-output:MIN:WINDOW     - Abort if same output repeats MIN times in WINDOW lines
+///   output-contains:PHRASE1,PHRASE2 - Abort if any phrase appears in output
+///   no-progress:ITERATIONS         - Abort if no file changes for N iterations
+fn parse_abort_criterion(s: &str) -> Result<Criterion> {
+    if let Some(rest) = s.strip_prefix("error-count:") {
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("error-count format: error-count:MAX:PATTERN");
+        }
+        let max_count: usize = parts[0]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid max count: {}", parts[0]))?;
+        return Ok(Criterion::ErrorCount {
+            pattern: parts[1].to_string(),
+            max_count,
+        });
+    }
+
+    if let Some(rest) = s.strip_prefix("repeated-output:") {
+        let parts: Vec<&str> = rest.splitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("repeated-output format: repeated-output:MIN_REPEATS:WINDOW_SIZE");
+        }
+        let min_repeats: usize = parts[0]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid min repeats: {}", parts[0]))?;
+        let window_size: usize = parts[1]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid window size: {}", parts[1]))?;
+        return Ok(Criterion::RepeatedOutput {
+            min_repeats,
+            window_size,
+        });
+    }
+
+    if let Some(rest) = s.strip_prefix("output-contains:") {
+        let phrases: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).collect();
+        if phrases.is_empty() {
+            anyhow::bail!("output-contains requires at least one phrase");
+        }
+        return Ok(Criterion::OutputContains { phrases });
+    }
+
+    if let Some(rest) = s.strip_prefix("no-progress:") {
+        let iterations: u32 = rest
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid iteration count: {}", rest))?;
+        return Ok(Criterion::NoProgress { iterations });
+    }
+
+    anyhow::bail!(
+        "Unknown abort criterion: {}. Use: error-count:MAX:PATTERN, \
+        repeated-output:MIN:WINDOW, output-contains:PHRASE1,PHRASE2, no-progress:ITERATIONS",
+        s
+    )
+}
+
 /// Add a new task
 async fn add_task(
     goal: String,
@@ -103,6 +220,8 @@ async fn add_task(
     approval: String,
     priority: u8,
     depends_on: Vec<String>,
+    success_on: Vec<String>,
+    abort_on: Vec<String>,
 ) -> Result<()> {
     let registry = get_registry()?;
 
@@ -118,13 +237,27 @@ async fn add_task(
         dependencies.push(task_id);
     }
 
+    // Parse success criteria
+    let mut success_criteria = Vec::new();
+    for criterion_str in &success_on {
+        let criterion = parse_success_criterion(criterion_str)?;
+        success_criteria.push(criterion);
+    }
+
+    // Parse abort criteria
+    let mut abort_criteria = Vec::new();
+    for criterion_str in &abort_on {
+        let criterion = parse_abort_criterion(criterion_str)?;
+        abort_criteria.push(criterion);
+    }
+
     // Create task config
     let config = TaskConfig {
         max_iterations,
         checkpoint_every,
         approval: approval_level,
-        success_criteria: vec![],
-        abort_criteria: vec![],
+        success_criteria,
+        abort_criteria,
     };
 
     // Create task
@@ -149,6 +282,14 @@ async fn add_task(
     println!("Goal: {}", goal);
     println!("Max iterations: {}", max_iterations);
     println!("Approval: {}", approval);
+
+    if !success_on.is_empty() {
+        println!("Success criteria: {}", success_on.join(", "));
+    }
+
+    if !abort_on.is_empty() {
+        println!("Abort criteria: {}", abort_on.join(", "));
+    }
 
     Ok(())
 }
@@ -268,6 +409,24 @@ async fn show_task(id: String) -> Result<()> {
     if !task.depends_on.is_empty() {
         let deps: Vec<String> = task.depends_on.iter().map(|d| d.to_string()).collect();
         println!("Dependencies: {}", deps.join(", "));
+    }
+
+    if !task.config.success_criteria.is_empty() {
+        println!();
+        println!("Success Criteria");
+        println!("{}", "─".repeat(50));
+        for criterion in &task.config.success_criteria {
+            println!("  - {:?}", criterion);
+        }
+    }
+
+    if !task.config.abort_criteria.is_empty() {
+        println!();
+        println!("Abort Criteria");
+        println!("{}", "─".repeat(50));
+        for criterion in &task.config.abort_criteria {
+            println!("  - {:?}", criterion);
+        }
     }
 
     if let Some(ref guidance) = task.guidance {
