@@ -1628,6 +1628,9 @@ impl Dashboard {
             let end_idx = total_lines.saturating_sub(self.output.scroll);
             let start_idx = end_idx.saturating_sub(inner_height);
 
+            // Calculate max width for text (panel width minus borders)
+            let max_width = area.width.saturating_sub(2) as usize;
+
             let visible_lines: Vec<Line> = self.output.lines[start_idx..end_idx]
                 .iter()
                 .map(|line| {
@@ -1637,7 +1640,14 @@ impl Dashboard {
                         Style::default().fg(theme::TEXT)
                     };
 
-                    Line::from(Span::styled(&line.text, text_style))
+                    // Truncate line to fit panel width
+                    let display_text = if line.text.len() > max_width {
+                        format!("{}…", &line.text[..max_width.saturating_sub(1)])
+                    } else {
+                        line.text.clone()
+                    };
+
+                    Line::from(Span::styled(display_text, text_style))
                 })
                 .collect();
 
@@ -1734,6 +1744,10 @@ impl Dashboard {
         let is_focused = self.focus == Panel::Logs;
         let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
 
+        // Calculate available width for message (panel width minus borders and prefix)
+        // Prefix: "HH:MM:SS ℹ [source] " = timestamp(8) + space(1) + level(2) + source(~10) = ~21 chars
+        let max_msg_width = area.width.saturating_sub(2).saturating_sub(21) as usize;
+
         let visible_logs: Vec<ListItem> = self.logs.entries
             .iter()
             .skip(self.logs.scroll)
@@ -1758,7 +1772,7 @@ impl Dashboard {
                     Span::styled(format!("{} ", entry.timestamp), Style::default().fg(theme::DIM)),
                     Span::styled(format!("{} ", level_char), level_style),
                     Span::styled(format!("[{}] ", entry.source), Style::default().fg(theme::LIGHT_PURPLE)),
-                    Span::styled(truncate(&entry.message, 30), Style::default().fg(theme::TEXT)),
+                    Span::styled(truncate(&entry.message, max_msg_width.max(10)), Style::default().fg(theme::TEXT)),
                 ]))
             })
             .collect();
