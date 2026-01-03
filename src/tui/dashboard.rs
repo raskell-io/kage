@@ -39,8 +39,22 @@ enum DataUpdate {
         version: Option<String>,
         uptime_secs: Option<u64>,
     },
+    /// Agent output lines
+    AgentOutput {
+        agent_id: String,
+        lines: Vec<OutputLineDisplay>,
+        has_more: bool,
+    },
     /// Log message
     Log(LogEntry),
+}
+
+/// Output line for display
+#[derive(Debug, Clone)]
+struct OutputLineDisplay {
+    text: String,
+    is_error: bool,
+    timestamp: i64,
 }
 
 /// Purple theme colors matching the mascot
@@ -67,6 +81,8 @@ pub struct Dashboard {
     focus: Panel,
     /// Agent list state
     agents: AgentListState,
+    /// Agent output state
+    output: OutputState,
     /// Task list state
     tasks: TaskListState,
     /// Log entries
@@ -91,12 +107,15 @@ pub struct Dashboard {
     should_quit: bool,
     /// Data update receiver
     data_rx: Option<mpsc::Receiver<DataUpdate>>,
+    /// Channel to request output for specific agent
+    output_request_tx: Option<mpsc::Sender<String>>,
 }
 
 /// Which panel is focused
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Panel {
     Agents,
+    Output,
     Tasks,
     Logs,
 }
@@ -104,7 +123,8 @@ enum Panel {
 impl Panel {
     fn next(&self) -> Self {
         match self {
-            Self::Agents => Self::Tasks,
+            Self::Agents => Self::Output,
+            Self::Output => Self::Tasks,
             Self::Tasks => Self::Logs,
             Self::Logs => Self::Agents,
         }
@@ -113,7 +133,8 @@ impl Panel {
     fn prev(&self) -> Self {
         match self {
             Self::Agents => Self::Logs,
-            Self::Tasks => Self::Agents,
+            Self::Output => Self::Agents,
+            Self::Tasks => Self::Output,
             Self::Logs => Self::Tasks,
         }
     }
@@ -375,6 +396,73 @@ struct LogState {
     max_entries: usize,
 }
 
+/// Agent output state
+struct OutputState {
+    /// Current agent ID being viewed
+    agent_id: Option<String>,
+    /// Output lines
+    lines: Vec<OutputLineDisplay>,
+    /// Scroll position (from bottom, 0 = at bottom)
+    scroll: usize,
+    /// Whether there's more output available
+    has_more: bool,
+    /// Auto-scroll to bottom
+    auto_scroll: bool,
+}
+
+impl OutputState {
+    fn new() -> Self {
+        Self {
+            agent_id: None,
+            lines: Vec::new(),
+            scroll: 0,
+            has_more: false,
+            auto_scroll: true,
+        }
+    }
+
+    fn set_agent(&mut self, agent_id: Option<String>) {
+        if self.agent_id != agent_id {
+            self.agent_id = agent_id;
+            self.lines.clear();
+            self.scroll = 0;
+            self.auto_scroll = true;
+        }
+    }
+
+    fn update(&mut self, agent_id: String, lines: Vec<OutputLineDisplay>, has_more: bool) {
+        if Some(&agent_id) == self.agent_id.as_ref() {
+            self.lines = lines;
+            self.has_more = has_more;
+            if self.auto_scroll {
+                self.scroll = 0;
+            }
+        }
+    }
+
+    fn scroll_up(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_add(amount).min(self.lines.len().saturating_sub(1));
+        self.auto_scroll = false;
+    }
+
+    fn scroll_down(&mut self, amount: usize) {
+        self.scroll = self.scroll.saturating_sub(amount);
+        if self.scroll == 0 {
+            self.auto_scroll = true;
+        }
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = 0;
+        self.auto_scroll = true;
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.scroll = self.lines.len().saturating_sub(1);
+        self.auto_scroll = false;
+    }
+}
+
 impl LogState {
     fn new() -> Self {
         Self {
@@ -427,6 +515,7 @@ impl Dashboard {
         Self {
             focus: Panel::Agents,
             agents: AgentListState::new(),
+            output: OutputState::new(),
             tasks: TaskListState::new(),
             logs: LogState::new(),
             daemon_status: DaemonStatus::Disconnected,
@@ -439,12 +528,14 @@ impl Dashboard {
             last_refresh: Instant::now(),
             should_quit: false,
             data_rx: None,
+            output_request_tx: None,
         }
     }
 
     /// Create dashboard with data channel
-    pub fn with_data_channel(mut self, rx: mpsc::Receiver<DataUpdate>) -> Self {
+    pub fn with_data_channel(mut self, rx: mpsc::Receiver<DataUpdate>, output_tx: mpsc::Sender<String>) -> Self {
         self.data_rx = Some(rx);
+        self.output_request_tx = Some(output_tx);
         self
     }
 
@@ -542,23 +633,25 @@ impl Dashboard {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('1') => self.focus = Panel::Agents,
-            KeyCode::Char('2') => self.focus = Panel::Tasks,
-            KeyCode::Char('3') => self.focus = Panel::Logs,
+            KeyCode::Char('2') => self.focus = Panel::Output,
+            KeyCode::Char('3') => self.focus = Panel::Tasks,
+            KeyCode::Char('4') => self.focus = Panel::Logs,
 
             // Panel-specific
             KeyCode::Up | KeyCode::Char('k') => self.handle_up(),
             KeyCode::Down | KeyCode::Char('j') => self.handle_down(),
             KeyCode::Enter => self.handle_enter(),
+            KeyCode::Char('g') => self.handle_scroll_top(),
+            KeyCode::Char('G') => self.handle_scroll_bottom(),
+            KeyCode::PageUp => self.handle_page_up(),
+            KeyCode::PageDown => self.handle_page_down(),
 
-            // Actions
+            // Actions (Ctrl+key must come before plain key matches)
             KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+N: New agent
             }
             KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+T: New task
-            }
-            KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+K: Kill agent
             }
             KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
                 // Ctrl+P: Pause/resume
@@ -578,6 +671,7 @@ impl Dashboard {
     fn handle_up(&mut self) {
         match self.focus {
             Panel::Agents => self.agents.previous(),
+            Panel::Output => self.output.scroll_up(1),
             Panel::Tasks => self.tasks.previous(),
             Panel::Logs => self.logs.scroll_up(),
         }
@@ -586,6 +680,7 @@ impl Dashboard {
     fn handle_down(&mut self) {
         match self.focus {
             Panel::Agents => self.agents.next(),
+            Panel::Output => self.output.scroll_down(1),
             Panel::Tasks => self.tasks.next(),
             Panel::Logs => self.logs.scroll_down(),
         }
@@ -598,12 +693,43 @@ impl Dashboard {
                     self.show_agent_details = true;
                 }
             }
+            Panel::Output => {
+                // Toggle auto-scroll
+                self.output.auto_scroll = !self.output.auto_scroll;
+                if self.output.auto_scroll {
+                    self.output.scroll_to_bottom();
+                }
+            }
             Panel::Tasks => {
                 if self.tasks.selected().is_some() {
                     self.show_task_details = true;
                 }
             }
             Panel::Logs => {}
+        }
+    }
+
+    fn handle_scroll_top(&mut self) {
+        if self.focus == Panel::Output {
+            self.output.scroll_to_top();
+        }
+    }
+
+    fn handle_scroll_bottom(&mut self) {
+        if self.focus == Panel::Output {
+            self.output.scroll_to_bottom();
+        }
+    }
+
+    fn handle_page_up(&mut self) {
+        if self.focus == Panel::Output {
+            self.output.scroll_up(20);
+        }
+    }
+
+    fn handle_page_down(&mut self) {
+        if self.focus == Panel::Output {
+            self.output.scroll_down(20);
         }
     }
 
@@ -618,12 +744,23 @@ impl Dashboard {
     }
 
     fn process_data_updates(&mut self) {
+        // Track if we need to request output for a different agent
+        let mut request_output_for: Option<String> = None;
+
         if let Some(ref rx) = self.data_rx {
             // Process all available updates (non-blocking)
             while let Ok(update) = rx.try_recv() {
                 match update {
                     DataUpdate::Agents(agents) => {
+                        let prev_selected = self.agents.selected().map(|a| a.id.clone());
                         self.agents.update_from_daemon(agents);
+                        let new_selected = self.agents.selected().map(|a| a.id.clone());
+
+                        // If selection changed, update output panel
+                        if prev_selected != new_selected {
+                            self.output.set_agent(new_selected.clone());
+                            request_output_for = new_selected;
+                        }
                     }
                     DataUpdate::Tasks(tasks) => {
                         self.tasks.update_from_daemon(tasks);
@@ -637,10 +774,20 @@ impl Dashboard {
                         self.daemon_version = version;
                         self.daemon_uptime = uptime_secs;
                     }
+                    DataUpdate::AgentOutput { agent_id, lines, has_more } => {
+                        self.output.update(agent_id, lines, has_more);
+                    }
                     DataUpdate::Log(entry) => {
                         self.logs.add(entry);
                     }
                 }
+            }
+        }
+
+        // Request output for newly selected agent
+        if let Some(agent_id) = request_output_for {
+            if let Some(ref tx) = self.output_request_tx {
+                let _ = tx.send(agent_id);
             }
         }
     }
@@ -734,18 +881,37 @@ impl Dashboard {
 
     /// Render the main content area
     fn render_main(&self, f: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        // Split into top and bottom rows
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(35), // Agents
-                Constraint::Percentage(35), // Tasks
-                Constraint::Percentage(30), // Logs
+                Constraint::Percentage(55), // Top: Agents + Output
+                Constraint::Percentage(45), // Bottom: Tasks + Logs
             ])
             .split(area);
 
-        self.render_agents_panel(f, chunks[0]);
-        self.render_tasks_panel(f, chunks[1]);
-        self.render_logs_panel(f, chunks[2]);
+        // Top row: Agents (left) + Output (right)
+        let top_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(35), // Agents
+                Constraint::Percentage(65), // Output
+            ])
+            .split(rows[0]);
+
+        // Bottom row: Tasks (left) + Logs (right)
+        let bottom_cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50), // Tasks
+                Constraint::Percentage(50), // Logs
+            ])
+            .split(rows[1]);
+
+        self.render_agents_panel(f, top_cols[0]);
+        self.render_output_panel(f, top_cols[1]);
+        self.render_tasks_panel(f, bottom_cols[0]);
+        self.render_logs_panel(f, bottom_cols[1]);
     }
 
     /// Render the agents panel
@@ -800,6 +966,100 @@ impl Dashboard {
             .highlight_symbol("▸ ");
 
         f.render_stateful_widget(list, area, &mut self.agents.state.clone());
+    }
+
+    /// Render the output panel
+    fn render_output_panel(&self, f: &mut Frame, area: Rect) {
+        let is_focused = self.focus == Panel::Output;
+        let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
+
+        let title = if let Some(ref agent_id) = self.output.agent_id {
+            let short_id = if agent_id.len() > 8 {
+                &agent_id[..8]
+            } else {
+                agent_id
+            };
+            format!(" Output [2] - {} ", short_id)
+        } else {
+            " Output [2] ".to_string()
+        };
+
+        let inner_height = area.height.saturating_sub(2) as usize;
+
+        if self.output.lines.is_empty() {
+            // Empty state
+            let empty_msg = if self.output.agent_id.is_some() {
+                "No output yet..."
+            } else {
+                "Select an agent to view output"
+            };
+
+            let content = Paragraph::new(Line::from(Span::styled(
+                empty_msg,
+                Style::default().fg(theme::DIM),
+            )))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        &title,
+                        Style::default()
+                            .fg(if is_focused { theme::PURPLE } else { theme::DIM })
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(border_color)),
+            );
+
+            f.render_widget(content, area);
+        } else {
+            // Calculate visible range (scroll is from bottom, 0 = at bottom)
+            let total_lines = self.output.lines.len();
+            let end_idx = total_lines.saturating_sub(self.output.scroll);
+            let start_idx = end_idx.saturating_sub(inner_height);
+
+            let visible_lines: Vec<Line> = self.output.lines[start_idx..end_idx]
+                .iter()
+                .map(|line| {
+                    let text_style = if line.is_error {
+                        Style::default().fg(theme::ERROR)
+                    } else {
+                        Style::default().fg(theme::TEXT)
+                    };
+
+                    Line::from(Span::styled(&line.text, text_style))
+                })
+                .collect();
+
+            // Scroll indicator
+            let scroll_info = if self.output.scroll > 0 {
+                format!(" ↑{} ", self.output.scroll)
+            } else if self.output.has_more {
+                " ... ".to_string()
+            } else {
+                String::new()
+            };
+
+            let content = Paragraph::new(visible_lines)
+                .block(
+                    Block::default()
+                        .title(Span::styled(
+                            &title,
+                            Style::default()
+                                .fg(if is_focused { theme::PURPLE } else { theme::DIM })
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                        .title_bottom(Line::from(Span::styled(
+                            &scroll_info,
+                            Style::default().fg(theme::DIM),
+                        )).alignment(Alignment::Right))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border_color)),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false });
+
+            f.render_widget(content, area);
+        }
     }
 
     /// Render the tasks panel
@@ -909,11 +1169,17 @@ impl Dashboard {
 
     /// Render the footer
     fn render_footer(&self, f: &mut Frame, area: Rect) {
+        let panel_hint = match self.focus {
+            Panel::Agents => "1:Agents",
+            Panel::Output => "2:Output",
+            Panel::Tasks => "3:Tasks",
+            Panel::Logs => "4:Logs",
+        };
         let hints = vec![
-            ("Tab", "Switch panel"),
-            ("↑↓", "Navigate"),
-            ("Enter", "Details"),
-            ("r", "Refresh"),
+            ("Tab", "Panel"),
+            (panel_hint, ""),
+            ("↑↓/jk", "Scroll"),
+            ("Enter", "Select"),
             ("?", "Help"),
             ("q", "Quit"),
         ];
@@ -945,7 +1211,7 @@ impl Dashboard {
                 Span::styled("Switch between panels", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  1 / 2 / 3        ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("  1 / 2 / 3 / 4    ", Style::default().fg(theme::LIGHT_PURPLE)),
                 Span::styled("Jump to panel", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
@@ -954,7 +1220,18 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  Enter            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("View details", Style::default().fg(theme::TEXT)),
+                Span::styled("View details / toggle auto-scroll", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Output Panel", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  g / G            ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Scroll to top / bottom", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  PgUp / PgDn      ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Page up / down", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
             Line::from(Span::styled("Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
@@ -1201,11 +1478,23 @@ fn format_duration_ago(timestamp: i64) -> String {
 }
 
 /// Background task that fetches data from the daemon
-async fn data_fetcher(tx: mpsc::Sender<DataUpdate>, socket_path: std::path::PathBuf) {
+async fn data_fetcher(
+    tx: mpsc::Sender<DataUpdate>,
+    output_rx: mpsc::Receiver<String>,
+    socket_path: std::path::PathBuf,
+) {
     use crate::daemon::client::DaemonClient;
     use crate::daemon::protocol::Response;
 
+    // Track which agent we should fetch output for
+    let mut current_agent_id: Option<String> = None;
+
     loop {
+        // Check for output request (non-blocking)
+        while let Ok(agent_id) = output_rx.try_recv() {
+            current_agent_id = Some(agent_id);
+        }
+
         // Try to connect and fetch data
         match DaemonClient::connect(&socket_path).await {
             Ok(mut client) => {
@@ -1219,9 +1508,37 @@ async fn data_fetcher(tx: mpsc::Sender<DataUpdate>, socket_path: std::path::Path
                 // Fetch agents
                 match client.list_agents(None, true).await {
                     Ok(Response::AgentList { agents }) => {
+                        // If no agent selected yet, select the first one
+                        if current_agent_id.is_none() && !agents.is_empty() {
+                            current_agent_id = Some(agents[0].id.to_string());
+                        }
                         let _ = tx.send(DataUpdate::Agents(agents));
                     }
                     _ => {}
+                }
+
+                // Fetch output for current agent
+                if let Some(ref agent_id) = current_agent_id {
+                    if let Ok(id) = agent_id.parse::<crate::agent::AgentId>() {
+                        match client.get_output(id, 500).await {
+                            Ok(Response::AgentOutput { lines, has_more }) => {
+                                let display_lines: Vec<OutputLineDisplay> = lines
+                                    .into_iter()
+                                    .map(|l| OutputLineDisplay {
+                                        text: l.text,
+                                        is_error: l.is_error,
+                                        timestamp: l.timestamp,
+                                    })
+                                    .collect();
+                                let _ = tx.send(DataUpdate::AgentOutput {
+                                    agent_id: agent_id.clone(),
+                                    lines: display_lines,
+                                    has_more,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                 }
 
                 // Fetch tasks
@@ -1264,17 +1581,20 @@ pub async fn run() -> Result<()> {
     // Create channel for data updates
     let (tx, rx) = mpsc::channel();
 
+    // Create channel for output requests
+    let (output_tx, output_rx) = mpsc::channel();
+
     // Get socket path
     let socket_path = crate::daemon::client::default_socket_path();
 
     // Spawn background data fetcher
     let fetch_tx = tx.clone();
     tokio::spawn(async move {
-        data_fetcher(fetch_tx, socket_path).await;
+        data_fetcher(fetch_tx, output_rx, socket_path).await;
     });
 
     // Create dashboard with data channel
-    let mut dashboard = Dashboard::new().with_data_channel(rx);
+    let mut dashboard = Dashboard::new().with_data_channel(rx, output_tx);
 
     // Add initial log
     dashboard.logs.add_info("dashboard", "Starting dashboard...");
@@ -1289,12 +1609,14 @@ mod tests {
 
     #[test]
     fn test_panel_navigation() {
-        assert_eq!(Panel::Agents.next(), Panel::Tasks);
+        assert_eq!(Panel::Agents.next(), Panel::Output);
+        assert_eq!(Panel::Output.next(), Panel::Tasks);
         assert_eq!(Panel::Tasks.next(), Panel::Logs);
         assert_eq!(Panel::Logs.next(), Panel::Agents);
 
         assert_eq!(Panel::Agents.prev(), Panel::Logs);
-        assert_eq!(Panel::Tasks.prev(), Panel::Agents);
+        assert_eq!(Panel::Output.prev(), Panel::Agents);
+        assert_eq!(Panel::Tasks.prev(), Panel::Output);
         assert_eq!(Panel::Logs.prev(), Panel::Tasks);
     }
 
