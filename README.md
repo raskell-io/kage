@@ -18,6 +18,9 @@
   <a href="https://www.anthropic.com/claude-code">
     <img alt="Claude Code" src="https://img.shields.io/badge/Claude%20Code-Native-e07b53?style=for-the-badge">
   </a>
+  <a href="#enterprise-ready">
+    <img alt="Enterprise Ready" src="https://img.shields.io/badge/Enterprise-Ready-10b981?style=for-the-badge">
+  </a>
   <a href="LICENSE">
     <img alt="License" src="https://img.shields.io/badge/License-Apache--2.0-a78bfa?style=for-the-badge">
   </a>
@@ -101,6 +104,20 @@ Kage solves these problems with a supervisor architecture:
 │  └───────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────┘
 ```
+
+## Enterprise Ready
+
+Kage is built with enterprise requirements in mind while staying true to local-first principles:
+
+| Capability | Description |
+|------------|-------------|
+| **Multi-User Tenancy** | gRPC server mode enables team-wide deployments with isolated namespaces |
+| **Credential Management** | Secure storage via OS keychain (macOS Keychain, Linux Secret Service, Windows Credential Manager) |
+| **Cloud Storage** | Optional cloud backends for memory and context history (S3, GCS, Azure Blob) |
+| **Audit Trails** | Immutable event logs for compliance and debugging |
+| **Access Control** | Namespace-level permissions and API key scoping |
+
+Local-first by default, cloud-enabled when you need it.
 
 ## Configuration
 
