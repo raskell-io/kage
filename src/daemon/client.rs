@@ -143,6 +143,11 @@ impl DaemonClient {
         Ok(Some(response))
     }
 
+    /// List tasks
+    pub async fn list_tasks(&mut self, status: Option<String>) -> Result<Response> {
+        self.request(&Request::ListTasks { status }).await
+    }
+
     /// Shutdown the daemon
     pub async fn shutdown(&mut self) -> Result<Response> {
         self.request(&Request::Shutdown).await

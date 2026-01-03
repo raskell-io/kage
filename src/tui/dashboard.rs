@@ -7,6 +7,7 @@
 //! - Real-time logs
 
 use std::io::{self, Stdout};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -20,9 +21,27 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Gauge, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+
+use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, TaskInfo as DaemonTaskInfo};
+
+/// Message from background data fetcher
+enum DataUpdate {
+    /// Updated agent list
+    Agents(Vec<DaemonAgentInfo>),
+    /// Updated task list
+    Tasks(Vec<DaemonTaskInfo>),
+    /// Daemon status
+    Status {
+        connected: bool,
+        version: Option<String>,
+        uptime_secs: Option<u64>,
+    },
+    /// Log message
+    Log(LogEntry),
+}
 
 /// Purple theme colors matching the mascot
 mod theme {
@@ -54,6 +73,10 @@ pub struct Dashboard {
     logs: LogState,
     /// Daemon connection status
     daemon_status: DaemonStatus,
+    /// Daemon version
+    daemon_version: Option<String>,
+    /// Daemon uptime
+    daemon_uptime: Option<u64>,
     /// Show help overlay
     show_help: bool,
     /// Show agent details popup
@@ -62,8 +85,12 @@ pub struct Dashboard {
     show_task_details: bool,
     /// Last tick time (for animations)
     last_tick: Instant,
+    /// Last data refresh
+    last_refresh: Instant,
     /// Should quit
     should_quit: bool,
+    /// Data update receiver
+    data_rx: Option<mpsc::Receiver<DataUpdate>>,
 }
 
 /// Which panel is focused
@@ -133,47 +160,51 @@ impl AgentListState {
         let mut state = ListState::default();
         state.select(Some(0));
         Self {
-            items: Self::mock_agents(),
+            items: Vec::new(),
             state,
         }
     }
 
-    fn mock_agents() -> Vec<AgentInfo> {
-        vec![
+    fn update_from_daemon(&mut self, agents: Vec<DaemonAgentInfo>) {
+        let selected_id = self.selected().map(|a| a.id.clone());
+
+        self.items = agents.into_iter().map(|a| {
+            let status = match a.status.as_str() {
+                "running" => AgentDisplayStatus::Running,
+                "paused" => AgentDisplayStatus::Paused,
+                "completed" | "stopped" => AgentDisplayStatus::Idle,
+                _ => AgentDisplayStatus::Error,
+            };
+
+            let started_ago = format_duration_ago(a.started_at);
+            let repo_name = a.working_dir.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+
             AgentInfo {
-                id: "01HQXK...".into(),
-                name: "shadow-1".into(),
-                status: AgentDisplayStatus::Running,
-                namespace: "backend".into(),
-                repository: "api-service".into(),
-                iterations: 3,
-                max_iterations: 10,
-                current_action: "Implementing user auth endpoint".into(),
-                started_at: "2m ago".into(),
-            },
-            AgentInfo {
-                id: "01HQXJ...".into(),
-                name: "shadow-2".into(),
-                status: AgentDisplayStatus::Idle,
-                namespace: "frontend".into(),
-                repository: "web-app".into(),
-                iterations: 0,
-                max_iterations: 10,
-                current_action: "Waiting for task".into(),
-                started_at: "15m ago".into(),
-            },
-            AgentInfo {
-                id: "01HQXI...".into(),
-                name: "shadow-3".into(),
-                status: AgentDisplayStatus::Paused,
-                namespace: "backend".into(),
-                repository: "payment-service".into(),
-                iterations: 7,
-                max_iterations: 10,
-                current_action: "Awaiting approval: git commit".into(),
-                started_at: "1h ago".into(),
-            },
-        ]
+                id: a.id.to_string(),
+                name: a.name,
+                status,
+                namespace: a.namespace.unwrap_or_else(|| "default".to_string()),
+                repository: repo_name,
+                iterations: a.iteration,
+                max_iterations: a.max_iterations,
+                current_action: format!("Iteration {}/{}", a.iteration, a.max_iterations),
+                started_at: started_ago,
+            }
+        }).collect();
+
+        // Preserve selection if possible
+        if let Some(id) = selected_id {
+            if let Some(idx) = self.items.iter().position(|a| a.id == id) {
+                self.state.select(Some(idx));
+            } else if !self.items.is_empty() {
+                self.state.select(Some(0));
+            }
+        } else if !self.items.is_empty() && self.state.selected().is_none() {
+            self.state.select(Some(0));
+        }
     }
 
     fn next(&mut self) {
@@ -242,64 +273,48 @@ impl TaskListState {
         let mut state = ListState::default();
         state.select(Some(0));
         Self {
-            items: Self::mock_tasks(),
+            items: Vec::new(),
             state,
         }
     }
 
-    fn mock_tasks() -> Vec<TaskInfo> {
-        vec![
+    fn update_from_daemon(&mut self, tasks: Vec<DaemonTaskInfo>) {
+        let selected_id = self.selected().map(|t| t.id.clone());
+
+        self.items = tasks.into_iter().map(|t| {
+            let status = match t.status.as_str() {
+                "pending" => TaskDisplayStatus::Pending,
+                "running" => TaskDisplayStatus::Running,
+                "paused" => TaskDisplayStatus::Paused,
+                "completed" => TaskDisplayStatus::Completed,
+                "failed" => TaskDisplayStatus::Failed,
+                _ => TaskDisplayStatus::Pending,
+            };
+
+            let created_ago = format_duration_ago(t.created_at);
+
             TaskInfo {
-                id: "01HQX1...".into(),
-                goal: "Implement user authentication with JWT".into(),
-                status: TaskDisplayStatus::Running,
-                namespace: Some("backend".into()),
-                agent: Some("shadow-1".into()),
-                iterations: 3,
-                max_iterations: 10,
-                created: "5m ago".into(),
-            },
-            TaskInfo {
-                id: "01HQX2...".into(),
-                goal: "Fix payment webhook handling".into(),
-                status: TaskDisplayStatus::Paused,
-                namespace: Some("backend".into()),
-                agent: Some("shadow-3".into()),
-                iterations: 7,
-                max_iterations: 10,
-                created: "1h ago".into(),
-            },
-            TaskInfo {
-                id: "01HQX3...".into(),
-                goal: "Add dark mode toggle to settings".into(),
-                status: TaskDisplayStatus::Pending,
-                namespace: Some("frontend".into()),
-                agent: None,
-                iterations: 0,
-                max_iterations: 10,
-                created: "2h ago".into(),
-            },
-            TaskInfo {
-                id: "01HQX4...".into(),
-                goal: "Write unit tests for auth module".into(),
-                status: TaskDisplayStatus::Completed,
-                namespace: Some("backend".into()),
-                agent: None,
-                iterations: 5,
-                max_iterations: 10,
-                created: "3h ago".into(),
-            },
-            TaskInfo {
-                id: "01HQX5...".into(),
-                goal: "Update dependencies to latest".into(),
-                status: TaskDisplayStatus::Failed,
-                namespace: None,
-                agent: None,
-                iterations: 2,
-                max_iterations: 10,
-                created: "4h ago".into(),
-            },
-        ]
+                id: t.id.to_string(),
+                goal: t.goal,
+                status,
+                namespace: t.namespace,
+                agent: t.agent.map(|a| a.to_string()),
+                iterations: t.iterations,
+                max_iterations: t.max_iterations,
+                created: created_ago,
+            }
+        }).collect();
+
+        // Preserve selection if possible
+        if let Some(id) = selected_id {
+            if let Some(idx) = self.items.iter().position(|t| t.id == id) {
+                self.state.select(Some(idx));
+            } else if !self.items.is_empty() {
+                self.state.select(Some(0));
+            }
+        } else if !self.items.is_empty() && self.state.selected().is_none() {
+            self.state.select(Some(0));
+        }
     }
 
     fn next(&mut self) {
@@ -357,79 +372,36 @@ enum LogLevel {
 struct LogState {
     entries: Vec<LogEntry>,
     scroll: usize,
+    max_entries: usize,
 }
 
 impl LogState {
     fn new() -> Self {
         Self {
-            entries: Self::mock_logs(),
+            entries: Vec::new(),
             scroll: 0,
+            max_entries: 100,
         }
     }
 
-    fn mock_logs() -> Vec<LogEntry> {
-        vec![
-            LogEntry {
-                timestamp: "10:45:32".into(),
-                level: LogLevel::Info,
-                source: "shadow-1".into(),
-                message: "Starting task: Implement user authentication".into(),
-            },
-            LogEntry {
-                timestamp: "10:45:35".into(),
-                level: LogLevel::Debug,
-                source: "shadow-1".into(),
-                message: "Reading file: src/auth/mod.rs".into(),
-            },
-            LogEntry {
-                timestamp: "10:45:38".into(),
-                level: LogLevel::Success,
-                source: "memory".into(),
-                message: "Pattern learned: JWT token validation".into(),
-            },
-            LogEntry {
-                timestamp: "10:46:12".into(),
-                level: LogLevel::Info,
-                source: "shadow-1".into(),
-                message: "Created file: src/auth/jwt.rs".into(),
-            },
-            LogEntry {
-                timestamp: "10:46:45".into(),
-                level: LogLevel::Warning,
-                source: "shadow-3".into(),
-                message: "Iteration limit approaching (7/10)".into(),
-            },
-            LogEntry {
-                timestamp: "10:47:01".into(),
-                level: LogLevel::Info,
-                source: "shadow-3".into(),
-                message: "Checkpoint saved at iteration 7".into(),
-            },
-            LogEntry {
-                timestamp: "10:47:15".into(),
-                level: LogLevel::Warning,
-                source: "shadow-3".into(),
-                message: "Awaiting approval for: git commit".into(),
-            },
-            LogEntry {
-                timestamp: "10:48:22".into(),
-                level: LogLevel::Error,
-                source: "shadow-2".into(),
-                message: "Task failed: dependency not found".into(),
-            },
-            LogEntry {
-                timestamp: "10:49:01".into(),
-                level: LogLevel::Success,
-                source: "context".into(),
-                message: "Memory shared: Error resolution for shadow-2".into(),
-            },
-            LogEntry {
-                timestamp: "10:49:33".into(),
-                level: LogLevel::Info,
-                source: "daemon".into(),
-                message: "Agent shadow-2 reassigned to new task".into(),
-            },
-        ]
+    fn add(&mut self, entry: LogEntry) {
+        self.entries.push(entry);
+        if self.entries.len() > self.max_entries {
+            self.entries.remove(0);
+        }
+        // Auto-scroll to bottom
+        if self.entries.len() > 1 {
+            self.scroll = self.entries.len().saturating_sub(1);
+        }
+    }
+
+    fn add_info(&mut self, source: &str, message: &str) {
+        self.add(LogEntry {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level: LogLevel::Info,
+            source: source.to_string(),
+            message: message.to_string(),
+        });
     }
 
     fn scroll_down(&mut self) {
@@ -457,13 +429,23 @@ impl Dashboard {
             agents: AgentListState::new(),
             tasks: TaskListState::new(),
             logs: LogState::new(),
-            daemon_status: DaemonStatus::Connected,
+            daemon_status: DaemonStatus::Disconnected,
+            daemon_version: None,
+            daemon_uptime: None,
             show_help: false,
             show_agent_details: false,
             show_task_details: false,
             last_tick: Instant::now(),
+            last_refresh: Instant::now(),
             should_quit: false,
+            data_rx: None,
         }
+    }
+
+    /// Create dashboard with data channel
+    pub fn with_data_channel(mut self, rx: mpsc::Receiver<DataUpdate>) -> Self {
+        self.data_rx = Some(rx);
+        self
     }
 
     /// Run the dashboard
@@ -626,14 +608,41 @@ impl Dashboard {
     }
 
     fn refresh(&mut self) {
-        // TODO: Refresh data from daemon
-        self.agents.items = AgentListState::mock_agents();
-        self.tasks.items = TaskListState::mock_tasks();
-        self.logs.entries = LogState::mock_logs();
+        // Data is refreshed via the data channel in process_data_updates
+        self.logs.add_info("dashboard", "Refreshing...");
     }
 
     fn on_tick(&mut self) {
-        // TODO: Update data, animations, etc.
+        // Process any pending data updates
+        self.process_data_updates();
+    }
+
+    fn process_data_updates(&mut self) {
+        if let Some(ref rx) = self.data_rx {
+            // Process all available updates (non-blocking)
+            while let Ok(update) = rx.try_recv() {
+                match update {
+                    DataUpdate::Agents(agents) => {
+                        self.agents.update_from_daemon(agents);
+                    }
+                    DataUpdate::Tasks(tasks) => {
+                        self.tasks.update_from_daemon(tasks);
+                    }
+                    DataUpdate::Status { connected, version, uptime_secs } => {
+                        self.daemon_status = if connected {
+                            DaemonStatus::Connected
+                        } else {
+                            DaemonStatus::Disconnected
+                        };
+                        self.daemon_version = version;
+                        self.daemon_uptime = uptime_secs;
+                    }
+                    DataUpdate::Log(entry) => {
+                        self.logs.add(entry);
+                    }
+                }
+            }
+        }
     }
 
     /// Render the dashboard
@@ -1175,9 +1184,101 @@ fn truncate(s: &str, max_len: usize) -> String {
     }
 }
 
+/// Format a unix timestamp as "Xm ago" or "Xh ago"
+fn format_duration_ago(timestamp: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let diff = now - timestamp;
+
+    if diff < 60 {
+        format!("{}s ago", diff)
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86400)
+    }
+}
+
+/// Background task that fetches data from the daemon
+async fn data_fetcher(tx: mpsc::Sender<DataUpdate>, socket_path: std::path::PathBuf) {
+    use crate::daemon::client::DaemonClient;
+    use crate::daemon::protocol::Response;
+
+    loop {
+        // Try to connect and fetch data
+        match DaemonClient::connect(&socket_path).await {
+            Ok(mut client) => {
+                // Send connected status
+                let _ = tx.send(DataUpdate::Status {
+                    connected: true,
+                    version: None,
+                    uptime_secs: None,
+                });
+
+                // Fetch agents
+                match client.list_agents(None, true).await {
+                    Ok(Response::AgentList { agents }) => {
+                        let _ = tx.send(DataUpdate::Agents(agents));
+                    }
+                    _ => {}
+                }
+
+                // Fetch tasks
+                match client.list_tasks(None).await {
+                    Ok(Response::TaskList { tasks }) => {
+                        let _ = tx.send(DataUpdate::Tasks(tasks));
+                    }
+                    _ => {}
+                }
+
+                // Get status for version/uptime
+                match client.status().await {
+                    Ok(Response::Status { version, uptime_secs, .. }) => {
+                        let _ = tx.send(DataUpdate::Status {
+                            connected: true,
+                            version: Some(version),
+                            uptime_secs: Some(uptime_secs),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Err(_) => {
+                // Send disconnected status
+                let _ = tx.send(DataUpdate::Status {
+                    connected: false,
+                    version: None,
+                    uptime_secs: None,
+                });
+            }
+        }
+
+        // Wait before next fetch
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Run the interactive dashboard (public entry point)
 pub async fn run() -> Result<()> {
-    let mut dashboard = Dashboard::new();
+    // Create channel for data updates
+    let (tx, rx) = mpsc::channel();
+
+    // Get socket path
+    let socket_path = crate::daemon::client::default_socket_path();
+
+    // Spawn background data fetcher
+    let fetch_tx = tx.clone();
+    tokio::spawn(async move {
+        data_fetcher(fetch_tx, socket_path).await;
+    });
+
+    // Create dashboard with data channel
+    let mut dashboard = Dashboard::new().with_data_channel(rx);
+
+    // Add initial log
+    dashboard.logs.add_info("dashboard", "Starting dashboard...");
+
     // Run synchronously since TUI is blocking
     tokio::task::spawn_blocking(move || dashboard.run()).await?
 }

@@ -8,6 +8,10 @@ pub mod commands;
 /// Top-level CLI commands
 #[derive(Subcommand)]
 pub enum Commands {
+    /// Launch interactive dashboard (TUI)
+    #[cfg(feature = "tui")]
+    Dashboard,
+
     /// Daemon management
     Daemon {
         #[command(subcommand)]
@@ -525,6 +529,9 @@ pub enum ServerCommands {
 /// Execute a CLI command
 pub async fn run(cmd: Commands) -> Result<()> {
     match cmd {
+        #[cfg(feature = "tui")]
+        Commands::Dashboard => crate::tui::dashboard::run().await,
+
         Commands::Daemon { command } => commands::daemon::run(command).await,
         Commands::Agent { command } => commands::agent::run(command).await,
         Commands::Task { command } => commands::task::run(command).await,
