@@ -1046,45 +1046,54 @@ impl Dashboard {
         // Track if we need to request output for a different agent
         let mut request_output_for: Option<String> = None;
 
-        if let Some(ref rx) = self.data_rx {
-            // Process all available updates (non-blocking)
+        // Collect all updates first to avoid borrow conflicts
+        let updates: Vec<DataUpdate> = if let Some(ref rx) = self.data_rx {
+            let mut updates = Vec::new();
             while let Ok(update) = rx.try_recv() {
-                match update {
-                    DataUpdate::Agents(agents) => {
-                        let prev_selected = self.agents.selected().map(|a| a.id.clone());
-                        self.agents.update_from_daemon(agents);
-                        let new_selected = self.agents.selected().map(|a| a.id.clone());
+                updates.push(update);
+            }
+            updates
+        } else {
+            Vec::new()
+        };
 
-                        // If selection changed, update output panel
-                        if prev_selected != new_selected {
-                            self.output.set_agent(new_selected.clone());
-                            request_output_for = new_selected;
-                        }
+        // Process collected updates
+        for update in updates {
+            match update {
+                DataUpdate::Agents(agents) => {
+                    let prev_selected = self.agents.selected().map(|a| a.id.clone());
+                    self.agents.update_from_daemon(agents);
+                    let new_selected = self.agents.selected().map(|a| a.id.clone());
+
+                    // If selection changed, update output panel
+                    if prev_selected != new_selected {
+                        self.output.set_agent(new_selected.clone());
+                        request_output_for = new_selected;
                     }
-                    DataUpdate::Tasks(tasks) => {
-                        self.tasks.update_from_daemon(tasks);
-                    }
-                    DataUpdate::Status { connected, version, uptime_secs } => {
-                        self.daemon_status = if connected {
-                            DaemonStatus::Connected
-                        } else {
-                            DaemonStatus::Disconnected
-                        };
-                        self.daemon_version = version;
-                        self.daemon_uptime = uptime_secs;
-                    }
-                    DataUpdate::AgentOutput { agent_id, lines, has_more } => {
-                        self.output.update(agent_id, lines, has_more);
-                    }
-                    DataUpdate::Approvals(approvals) => {
-                        self.approvals.update_from_daemon(approvals);
-                    }
-                    DataUpdate::Log(entry) => {
-                        self.logs.add(entry);
-                    }
-                    DataUpdate::Event(event) => {
-                        self.handle_daemon_event(event);
-                    }
+                }
+                DataUpdate::Tasks(tasks) => {
+                    self.tasks.update_from_daemon(tasks);
+                }
+                DataUpdate::Status { connected, version, uptime_secs } => {
+                    self.daemon_status = if connected {
+                        DaemonStatus::Connected
+                    } else {
+                        DaemonStatus::Disconnected
+                    };
+                    self.daemon_version = version;
+                    self.daemon_uptime = uptime_secs;
+                }
+                DataUpdate::AgentOutput { agent_id, lines, has_more } => {
+                    self.output.update(agent_id, lines, has_more);
+                }
+                DataUpdate::Approvals(approvals) => {
+                    self.approvals.update_from_daemon(approvals);
+                }
+                DataUpdate::Log(entry) => {
+                    self.logs.add(entry);
+                }
+                DataUpdate::Event(event) => {
+                    self.handle_daemon_event(event);
                 }
             }
         }
@@ -1109,9 +1118,15 @@ impl Dashboard {
                     "Agent {} status: {} → {}",
                     &id.to_string()[..8], old_status, new_status
                 ));
-                // Update agent in list if present
-                if let Some(agent) = self.agents.agents.iter_mut().find(|a| a.id == id.to_string()) {
-                    agent.status = new_status;
+                // Update agent status in list if present
+                let id_str = id.to_string();
+                if let Some(agent) = self.agents.items.iter_mut().find(|a| a.id == id_str) {
+                    agent.status = match new_status.as_str() {
+                        "running" => AgentDisplayStatus::Running,
+                        "paused" => AgentDisplayStatus::Paused,
+                        "completed" | "stopped" => AgentDisplayStatus::Idle,
+                        _ => AgentDisplayStatus::Error,
+                    };
                 }
             }
             DaemonEvent::AgentStopped { id, reason } => {
@@ -1122,17 +1137,16 @@ impl Dashboard {
             }
             DaemonEvent::AgentOutput { id, line } => {
                 // Add output line if this is the current agent
-                if let Some(current_agent) = &self.output.agent_id {
-                    if current_agent == &id.to_string() {
-                        self.output.lines.push(OutputLineDisplay {
-                            text: line.text,
-                            is_error: line.is_error,
-                            timestamp: line.timestamp,
-                        });
-                        // Auto-scroll to bottom
-                        if !self.output.lines.is_empty() {
-                            self.output.scroll = self.output.lines.len().saturating_sub(1);
-                        }
+                let id_str = id.to_string();
+                if self.output.agent_id.as_ref() == Some(&id_str) {
+                    self.output.lines.push(OutputLineDisplay {
+                        text: line.text,
+                        is_error: line.is_error,
+                        timestamp: line.timestamp,
+                    });
+                    // Auto-scroll to bottom if enabled
+                    if self.output.auto_scroll {
+                        self.output.scroll = 0;
                     }
                 }
             }
@@ -1157,18 +1171,20 @@ impl Dashboard {
                 ));
             }
             DaemonEvent::ApprovalCreated { approval } => {
-                self.logs.add_warning("event", &format!(
-                    "Approval needed: {}",
-                    truncate(&approval.summary, 40)
-                ));
+                // Log as warning (using add directly since add_warning doesn't exist)
+                self.logs.add(LogEntry {
+                    timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                    level: LogLevel::Warning,
+                    source: "event".to_string(),
+                    message: format!("Approval needed: {}", truncate(&approval.summary, 40)),
+                });
                 // Add to approvals list for popup
-                self.approvals.items.push(ApprovalItem {
+                self.approvals.items.push(ApprovalDisplayInfo {
                     id: approval.id.to_string(),
                     agent_id: approval.agent_id.to_string(),
                     summary: approval.summary,
-                    action_type: format!("{:?}", approval.action),
-                    created_at: approval.created_at,
                     context: approval.context,
+                    created: "just now".to_string(),
                 });
             }
             DaemonEvent::ApprovalResolved { id, approved } => {
@@ -1178,7 +1194,8 @@ impl Dashboard {
                     &id.to_string()[..8], status
                 ));
                 // Remove from approvals list
-                self.approvals.items.retain(|a| a.id != id.to_string());
+                let id_str = id.to_string();
+                self.approvals.items.retain(|a| a.id != id_str);
             }
             DaemonEvent::Heartbeat { timestamp: _ } => {
                 // Keep-alive, no action needed
@@ -2182,6 +2199,10 @@ async fn event_stream_listener(
 ) {
     use crate::daemon::client::DaemonClient;
 
+    fn now_str() -> String {
+        chrono::Local::now().format("%H:%M:%S").to_string()
+    }
+
     loop {
         // Try to connect and subscribe
         match DaemonClient::connect(&socket_path).await {
@@ -2189,7 +2210,7 @@ async fn event_stream_listener(
                 // Subscribe to all events
                 if client.subscribe(vec![]).await.is_ok() {
                     let _ = tx.send(DataUpdate::Log(LogEntry {
-                        timestamp: Instant::now(),
+                        timestamp: now_str(),
                         level: LogLevel::Info,
                         source: "events".to_string(),
                         message: "Connected to real-time event stream".to_string(),
@@ -2208,7 +2229,7 @@ async fn event_stream_listener(
                             Ok(None) => {
                                 // Connection closed
                                 let _ = tx.send(DataUpdate::Log(LogEntry {
-                                    timestamp: Instant::now(),
+                                    timestamp: now_str(),
                                     level: LogLevel::Warning,
                                     source: "events".to_string(),
                                     message: "Event stream disconnected".to_string(),
@@ -2217,7 +2238,7 @@ async fn event_stream_listener(
                             }
                             Err(e) => {
                                 let _ = tx.send(DataUpdate::Log(LogEntry {
-                                    timestamp: Instant::now(),
+                                    timestamp: now_str(),
                                     level: LogLevel::Error,
                                     source: "events".to_string(),
                                     message: format!("Event stream error: {}", e),

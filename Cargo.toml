@@ -11,8 +11,8 @@ keywords = ["cli", "ai", "agents", "claude", "orchestrator"]
 categories = ["command-line-utilities", "development-tools"]
 
 [features]
-default = []
-# Enable TUI onboarding and dashboard
+default = ["tui"]
+# Enable TUI onboarding and dashboard (included by default)
 tui = ["ratatui", "crossterm"]
 # Enable gRPC for remote/multi-user mode
 server = ["tonic", "prost", "prost-types", "tokio-stream", "tonic-build"]
