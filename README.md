@@ -38,11 +38,14 @@ Kage enables **Claude Code** agents to work autonomously while you're away, shar
 ## Quick Start
 
 ```bash
-# Install
+# Install via script
 curl -fsSL https://kage.raskell.io/install.sh | sh
 
 # Or via Cargo
 cargo install kage
+
+# Or via Docker
+docker pull ghcr.io/raskell-io/kage:latest
 
 # Run
 kage daemon start
