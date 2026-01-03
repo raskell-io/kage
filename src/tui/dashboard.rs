@@ -26,6 +26,7 @@ use ratatui::{
 };
 
 use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
+use crate::secrets::{self, ClaudeCodeAuth};
 use super::theme::{Theme, ColorPalette, StatusSymbols};
 
 /// Message from background data fetcher
@@ -124,10 +125,18 @@ struct SetupWizardState {
     error: Option<String>,
     /// Whether setup completed successfully
     setup_complete: bool,
+    /// Detected Claude Code authentication (if any)
+    detected_auth: Option<ClaudeCodeAuth>,
+    /// Whether to use detected auth
+    use_detected_auth: bool,
 }
 
 impl SetupWizardState {
     fn new() -> Self {
+        // Try to detect existing Claude Code authentication
+        let detected_auth = secrets::detect_claude_code_auth();
+        let use_detected = detected_auth.is_some();
+
         Self {
             step: SetupStep::Welcome,
             needs_setup: false,
@@ -138,6 +147,8 @@ impl SetupWizardState {
             focus: 1, // Start on API key field
             error: None,
             setup_complete: false,
+            detected_auth,
+            use_detected_auth: use_detected,
         }
     }
 
@@ -194,7 +205,21 @@ impl SetupWizardState {
     }
 
     fn is_valid(&self) -> bool {
-        !self.sub_name.trim().is_empty() && !self.api_key.trim().is_empty()
+        if self.use_detected_auth && self.detected_auth.is_some() {
+            !self.sub_name.trim().is_empty()
+        } else {
+            !self.sub_name.trim().is_empty() && !self.api_key.trim().is_empty()
+        }
+    }
+
+    fn get_api_key(&self) -> Option<String> {
+        if self.use_detected_auth {
+            self.detected_auth.as_ref().map(|a| a.access_token.clone())
+        } else if !self.api_key.trim().is_empty() {
+            Some(self.api_key.trim().to_string())
+        } else {
+            None
+        }
     }
 }
 
@@ -1137,6 +1162,10 @@ impl Dashboard {
                             self.setup_wizard.cursor = self.setup_wizard.current_field().len();
                         }
                         KeyCode::Backspace => {
+                            if self.setup_wizard.use_detected_auth {
+                                // Switch to manual mode when deleting
+                                self.setup_wizard.use_detected_auth = false;
+                            }
                             self.setup_wizard.delete_char();
                         }
                         KeyCode::Left => {
@@ -1148,7 +1177,19 @@ impl Dashboard {
                                 self.setup_wizard.cursor += 1;
                             }
                         }
+                        KeyCode::Char('d') if self.setup_wizard.detected_auth.is_some() && self.setup_wizard.focus == 1 => {
+                            // Toggle between detected and manual API key
+                            self.setup_wizard.use_detected_auth = !self.setup_wizard.use_detected_auth;
+                            if self.setup_wizard.use_detected_auth {
+                                self.setup_wizard.api_key.clear();
+                            }
+                            self.setup_wizard.cursor = 0;
+                        }
                         KeyCode::Char(c) => {
+                            // Typing in API key field disables detected auth
+                            if self.setup_wizard.use_detected_auth && self.setup_wizard.focus == 1 {
+                                self.setup_wizard.use_detected_auth = false;
+                            }
                             self.setup_wizard.insert_char(c);
                         }
                         _ => {}
@@ -1422,7 +1463,13 @@ impl Dashboard {
     /// Handle add subscription from setup wizard
     fn handle_add_subscription(&mut self) {
         let name = self.setup_wizard.sub_name.trim().to_string();
-        let api_key = self.setup_wizard.api_key.trim().to_string();
+        let api_key = match self.setup_wizard.get_api_key() {
+            Some(key) => key,
+            None => {
+                self.setup_wizard.error = Some("No API key provided".to_string());
+                return;
+            }
+        };
 
         self.logs.add_info("setup", &format!("Adding subscription '{}'...", name));
         self.send_action(Action::AddSubscription { name, api_key });
@@ -2661,25 +2708,39 @@ impl Dashboard {
                     format!("  {}", self.setup_wizard.sub_name)
                 };
 
-                // Show API key masked with cursor if focused
-                let masked_key: String = "*".repeat(self.setup_wizard.api_key.len());
-                let key_display = if key_focused {
-                    let cursor = self.setup_wizard.cursor;
-                    if cursor < masked_key.len() {
-                        format!("  {}│{}", &masked_key[..cursor], &masked_key[cursor..])
+                // Show API key - either detected or manual entry
+                let (key_display, key_display_style) = if self.setup_wizard.use_detected_auth {
+                    if let Some(ref auth) = self.setup_wizard.detected_auth {
+                        let masked = secrets::mask_token(&auth.access_token);
+                        let account_info = auth.email.as_deref().unwrap_or("Claude Code");
+                        (
+                            format!("  ✓ {} ({})", masked, account_info),
+                            Style::default().fg(self.c().success),
+                        )
                     } else {
-                        format!("  {}│", masked_key)
+                        ("  (no detected credentials)".to_string(), Style::default().fg(self.c().text_muted))
                     }
-                } else if masked_key.is_empty() {
-                    "  (paste your API key)".to_string()
                 } else {
-                    format!("  {}", masked_key)
-                };
-
-                let key_display_style = if self.setup_wizard.api_key.is_empty() && !key_focused {
-                    Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
-                } else {
-                    key_value_style
+                    // Manual entry mode
+                    let masked_key: String = "*".repeat(self.setup_wizard.api_key.len());
+                    let display = if key_focused {
+                        let cursor = self.setup_wizard.cursor;
+                        if cursor < masked_key.len() {
+                            format!("  {}│{}", &masked_key[..cursor], &masked_key[cursor..])
+                        } else {
+                            format!("  {}│", masked_key)
+                        }
+                    } else if masked_key.is_empty() {
+                        "  (paste your API key)".to_string()
+                    } else {
+                        format!("  {}", masked_key)
+                    };
+                    let style = if self.setup_wizard.api_key.is_empty() && !key_focused {
+                        Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
+                    } else {
+                        key_value_style
+                    };
+                    (display, style)
                 };
 
                 let can_submit = self.setup_wizard.is_valid();
@@ -2689,12 +2750,21 @@ impl Dashboard {
                     Style::default().fg(self.c().text_muted).bg(self.c().bg_highlight)
                 };
 
+                // Build title based on whether we detected auth
+                let title = if self.setup_wizard.detected_auth.is_some() {
+                    "  ✓ Claude Code Detected"
+                } else {
+                    "  Add Claude Subscription"
+                };
+                let title_style = if self.setup_wizard.detected_auth.is_some() {
+                    Style::default().fg(self.c().success).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)
+                };
+
                 let mut lines = vec![
                     Line::from(""),
-                    Line::from(Span::styled(
-                        "  Add Claude Subscription",
-                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
-                    )),
+                    Line::from(Span::styled(title, title_style)),
                     Line::from(""),
                     Line::from(Span::styled(
                         "  Your API key will be stored securely in your OS keychain.",
@@ -2706,7 +2776,11 @@ impl Dashboard {
                     Line::from(""),
                     Line::from(vec![
                         Span::styled("  API Key: ", key_style),
-                        Span::styled("*", Style::default().fg(self.c().error)),
+                        if !self.setup_wizard.use_detected_auth {
+                            Span::styled("*", Style::default().fg(self.c().error))
+                        } else {
+                            Span::raw("")
+                        },
                     ]),
                     Line::from(Span::styled(key_display, key_display_style)),
                     Line::from(""),
@@ -2721,14 +2795,30 @@ impl Dashboard {
                 }
 
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
+
+                // Build footer with toggle option if detected auth available
+                let mut footer_spans = vec![
                     Span::styled(" Tab ", Style::default().fg(self.c().bg).bg(self.c().accent)),
                     Span::styled(" Switch field  ", Style::default().fg(self.c().text_muted)),
+                ];
+
+                if self.setup_wizard.detected_auth.is_some() {
+                    footer_spans.push(Span::styled(" d ", Style::default().fg(self.c().bg).bg(self.c().accent)));
+                    if self.setup_wizard.use_detected_auth {
+                        footer_spans.push(Span::styled(" Enter manually  ", Style::default().fg(self.c().text_muted)));
+                    } else {
+                        footer_spans.push(Span::styled(" Use detected  ", Style::default().fg(self.c().text_muted)));
+                    }
+                }
+
+                footer_spans.extend([
                     Span::styled(" Enter ", submit_style),
                     Span::styled(" Save  ", Style::default().fg(self.c().text_muted)),
                     Span::styled(" Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
                     Span::styled(" Skip", Style::default().fg(self.c().text_muted)),
-                ]));
+                ]);
+
+                lines.push(Line::from(footer_spans));
 
                 lines
             }
