@@ -26,6 +26,8 @@ use ratatui::{
 };
 
 use crate::secrets::{self, ClaudeCodeAuth, SecretScope};
+use crate::subscription::{ProviderType, Subscription};
+use crate::subscription::registry::SubscriptionRegistry;
 
 /// Purple theme colors matching the mascot
 mod theme {
@@ -315,11 +317,7 @@ impl OnboardingWizard {
                 // If using detected auth and no manual input, use detected token
                 if self.use_detected_auth && self.api_key_input.is_empty() {
                     if let Some(ref auth) = self.detected_auth {
-                        match secrets::set(
-                            "ANTHROPIC_API_KEY",
-                            &auth.access_token,
-                            &SecretScope::Global,
-                        ) {
+                        match self.add_subscription_to_pool("claude-code", &auth.access_token) {
                             Ok(()) => {
                                 self.success_message = Some("Claude Code credential added to pool!".into());
                                 self.current_step = WizardStep::Namespace;
@@ -335,11 +333,7 @@ impl OnboardingWizard {
                     self.error_message = Some("API key seems too short.".into());
                 } else {
                     // Try to store the manually entered API key
-                    match secrets::set(
-                        "ANTHROPIC_API_KEY",
-                        &self.api_key_input,
-                        &SecretScope::Global,
-                    ) {
+                    match self.add_subscription_to_pool("anthropic-api", &self.api_key_input) {
                         Ok(()) => {
                             self.success_message = Some("API key saved securely!".into());
                             self.current_step = WizardStep::Namespace;
@@ -460,6 +454,35 @@ impl OnboardingWizard {
             KeyCode::Char('n') | KeyCode::Esc => InputResult::Quit,
             _ => InputResult::Continue,
         }
+    }
+
+    /// Add a subscription to the pool (keychain + database)
+    fn add_subscription_to_pool(&self, name: &str, api_key: &str) -> anyhow::Result<()> {
+        // Store API key in keychain
+        let key_ref = format!("subscription:{}", name);
+        secrets::set(&key_ref, api_key, &SecretScope::Global)?;
+
+        // Open subscription registry and add record
+        let config = crate::config::load()?;
+        let db_path = config.daemon.state_dir.join("subscriptions.redb");
+
+        // Ensure state directory exists
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let registry = SubscriptionRegistry::open(db_path)?;
+        let provider = if name == "claude-code" {
+            ProviderType::ClaudeCode
+        } else {
+            ProviderType::AnthropicApi
+        };
+
+        let subscription = Subscription::new(name, &key_ref).with_provider(provider);
+        registry.add(subscription)?;
+
+        tracing::info!("Added subscription '{}' to pool", name);
+        Ok(())
     }
 
     /// Save configuration from wizard

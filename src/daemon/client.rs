@@ -323,26 +323,57 @@ pub async fn ensure_running() -> Result<()> {
 
     tracing::info!("Starting daemon in background...");
 
-    // Load config
-    let cfg = crate::config::load()?;
+    // Spawn daemon as a separate background process (not a tokio task)
+    // This ensures the daemon survives when the TUI/CLI exits
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
 
-    // Spawn daemon in background task
-    let daemon_cfg = cfg.clone();
-    tokio::spawn(async move {
-        match super::Daemon::new(daemon_cfg) {
-            Ok(mut d) => {
-                if let Err(e) = d.run().await {
-                    tracing::error!("Daemon error: {}", e);
+        // Get the current executable path
+        let exe = std::env::current_exe()?;
+
+        // Spawn the daemon process
+        let mut cmd = Command::new(&exe);
+        cmd.args(["daemon", "start", "--foreground"]);
+
+        // Detach from terminal
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+
+        // Create new process group so daemon survives parent exit
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+
+        cmd.spawn()?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        // On non-Unix platforms, fall back to in-process daemon
+        let cfg = crate::config::load()?;
+        let daemon_cfg = cfg.clone();
+        tokio::spawn(async move {
+            match super::Daemon::new(daemon_cfg) {
+                Ok(mut d) => {
+                    if let Err(e) = d.run().await {
+                        tracing::error!("Daemon error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create daemon: {}", e);
                 }
             }
-            Err(e) => {
-                tracing::error!("Failed to create daemon: {}", e);
-            }
-        }
-    });
+        });
+    }
 
     // Wait briefly for daemon to start
-    for _ in 0..10 {
+    for _ in 0..20 {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         if is_daemon_running(&socket_path).await {
             tracing::info!("Daemon started successfully");

@@ -193,13 +193,44 @@ fi
 description = "Run kage"
 run = "cargo run --"
 
-[tasks."run:daemon"]
-description = "Start the daemon"
-run = "cargo run -- daemon start --foreground"
-
 [tasks."run:help"]
 description = "Show help"
 run = "cargo run -- --help"
+
+# =============================================================================
+# Daemon Tasks
+# =============================================================================
+
+[tasks."daemon:start"]
+description = "Start the daemon in background"
+run = "./target/release/kage daemon start"
+
+[tasks."daemon:foreground"]
+description = "Start the daemon in foreground"
+run = "./target/release/kage daemon start --foreground"
+
+[tasks."daemon:stop"]
+description = "Stop the daemon"
+run = "./target/release/kage daemon stop"
+
+[tasks."daemon:kill"]
+description = "Force kill the daemon"
+run = """
+pkill -f "kage daemon" 2>/dev/null && echo "Daemon killed" || echo "No daemon running"
+rm -f /tmp/kage.sock
+"""
+
+[tasks."daemon:status"]
+description = "Show daemon status"
+run = "./target/release/kage daemon status"
+
+[tasks."daemon:restart"]
+description = "Restart the daemon"
+depends = ["daemon:kill"]
+run = """
+sleep 0.5
+./target/release/kage daemon start
+"""
 
 # =============================================================================
 # CI Tasks

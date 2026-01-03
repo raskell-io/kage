@@ -93,12 +93,22 @@ impl Supervisor {
     }
 
     /// Initialize subscription pool from config
+    ///
+    /// Note: We intentionally do NOT auto-detect Claude Code credentials here.
+    /// Keychain access should only happen during onboarding/setup wizard to avoid
+    /// macOS keychain password prompts on every daemon start.
     pub fn init_subscription_pool(&mut self) -> Result<()> {
         let db_path = self.config.daemon.state_dir.join("subscriptions.redb");
         let registry = Arc::new(SubscriptionRegistry::open(db_path)?);
         let pool = Arc::new(SubscriptionPool::new(registry));
-        self.subscription_pool = Some(pool);
-        tracing::info!("Subscription pool initialized");
+        self.subscription_pool = Some(pool.clone());
+
+        let count = pool.subscription_count();
+        if count == 0 {
+            tracing::info!("No subscriptions in pool. Add credentials via 'kage subscription add' or the setup wizard.");
+        } else {
+            tracing::info!("Subscription pool initialized with {} subscription(s)", count);
+        }
         Ok(())
     }
 

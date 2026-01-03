@@ -6,6 +6,8 @@ use anyhow::Result;
 
 use crate::cli::SubscriptionCommands;
 use crate::config;
+use crate::daemon::{client, DaemonClient};
+use crate::daemon::protocol::Response;
 use crate::subscription::registry::SubscriptionRegistry;
 use crate::subscription::usage::{UsagePeriod, UsageTracker};
 use crate::subscription::{ProviderType, Subscription, SubscriptionStatus};
@@ -107,8 +109,60 @@ async fn add_subscription(
     Ok(())
 }
 
-/// List subscriptions
+/// List subscriptions - queries the daemon if running, otherwise opens DB directly
 async fn list_subscriptions(status: Option<String>, json: bool) -> Result<()> {
+    let socket_path = client::default_socket_path();
+
+    // Try to query daemon first (preferred - avoids DB lock issues)
+    if client::is_daemon_running(&socket_path).await {
+        let mut daemon_client = DaemonClient::connect(&socket_path).await?;
+        match daemon_client.list_subscriptions().await? {
+            Response::SubscriptionList { subscriptions } => {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&subscriptions)?);
+                    return Ok(());
+                }
+
+                if subscriptions.is_empty() {
+                    println!("No subscriptions registered");
+                    println!("");
+                    println!("Add a subscription with: kage subscription add --name <name>");
+                    return Ok(());
+                }
+
+                println!("{:<20} {:<15} {:<12}", "NAME", "PROVIDER", "STATUS");
+                println!("{}", "─".repeat(50));
+
+                for sub in subscriptions {
+                    let status_str = match sub.status.as_str() {
+                        "active" => "\x1b[32mactive\x1b[0m".to_string(),
+                        "disabled" => "\x1b[90mdisabled\x1b[0m".to_string(),
+                        s if s.starts_with("rate") => "\x1b[33mrate-limited\x1b[0m".to_string(),
+                        s if s.starts_with("exhaust") => "\x1b[31mexhausted\x1b[0m".to_string(),
+                        s if s.starts_with("unhealthy") => "\x1b[31munhealthy\x1b[0m".to_string(),
+                        other => other.to_string(),
+                    };
+
+                    let name_display = if sub.name.len() > 18 {
+                        format!("{}...", &sub.name[..15])
+                    } else {
+                        sub.name.clone()
+                    };
+
+                    println!("{:<20} {:<15} {}", name_display, sub.provider, status_str);
+                }
+                return Ok(());
+            }
+            Response::Error { message } => {
+                anyhow::bail!("Daemon error: {}", message);
+            }
+            _ => {
+                anyhow::bail!("Unexpected response from daemon");
+            }
+        }
+    }
+
+    // Fallback: open database directly (only works if daemon is not running)
     let registry = get_registry()?;
 
     let subscriptions = if let Some(status_filter) = status {

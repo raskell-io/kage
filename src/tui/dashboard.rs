@@ -1132,7 +1132,12 @@ impl Dashboard {
                 SetupStep::Welcome => {
                     match key {
                         KeyCode::Enter => {
-                            self.setup_wizard.next_step();
+                            // If Claude Code is detected, add subscription directly
+                            if self.setup_wizard.detected_auth.is_some() && self.setup_wizard.use_detected_auth {
+                                self.handle_add_subscription();
+                            } else {
+                                self.setup_wizard.next_step();
+                            }
                         }
                         KeyCode::Esc | KeyCode::Char('s') => {
                             // Skip setup
@@ -1661,9 +1666,12 @@ impl Dashboard {
                     self.handle_daemon_event(event);
                 }
                 DataUpdate::SubscriptionCount(count) => {
-                    // Show setup wizard if no subscriptions
+                    // Log if no subscriptions, but don't show wizard automatically
+                    // The daemon auto-detects Claude Code credentials on startup
+                    // Users can also add subscriptions via CLI: kage subscription add
                     if count == 0 && !self.setup_wizard.setup_complete {
-                        self.setup_wizard.needs_setup = true;
+                        self.logs.add_info("subscriptions", "No subscriptions found. Checking for Claude Code credentials...");
+                        self.setup_wizard.setup_complete = true; // Don't repeat this message
                     }
                 }
                 DataUpdate::SubscriptionAdded { success, error } => {
@@ -2627,47 +2635,88 @@ impl Dashboard {
 
         let content = match self.setup_wizard.step {
             SetupStep::Welcome => {
-                vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  Welcome to Kage!",
-                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  影 Shadow agents for autonomous code work",
-                        Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC),
-                    )),
-                    Line::from(""),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  Before you can spawn agents, you need to configure",
-                        Style::default().fg(self.c().text),
-                    )),
-                    Line::from(Span::styled(
-                        "  your Claude Code API credentials.",
-                        Style::default().fg(self.c().text),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  This wizard will help you set up:",
-                        Style::default().fg(self.c().text),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "    • Claude API subscription",
-                        Style::default().fg(self.c().accent_bright),
-                    )),
-                    Line::from(""),
-                    Line::from(""),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled(" Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
-                        Span::styled(" Continue  ", Style::default().fg(self.c().text_muted)),
-                        Span::styled(" s/Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
-                        Span::styled(" Skip setup", Style::default().fg(self.c().text_muted)),
-                    ]),
-                ]
+                // If Claude Code is detected, show a simpler message
+                if let Some(ref auth) = self.setup_wizard.detected_auth {
+                    let email = auth.email.as_deref().unwrap_or("your account");
+                    let masked = secrets::mask_token(&auth.access_token);
+                    vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  ✓ Claude Code Detected!",
+                            Style::default().fg(self.c().success).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Found existing Claude Code authentication:",
+                            Style::default().fg(self.c().text),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("    Account:  ", Style::default().fg(self.c().text_muted)),
+                            Span::styled(email, Style::default().fg(self.c().accent)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("    Token:    ", Style::default().fg(self.c().text_muted)),
+                            Span::styled(masked, Style::default().fg(self.c().text)),
+                        ]),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Press Enter to add this credential to Kage's subscription pool.",
+                            Style::default().fg(self.c().text),
+                        )),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(" Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
+                            Span::styled(" Add credential  ", Style::default().fg(self.c().text_muted)),
+                            Span::styled(" s/Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
+                            Span::styled(" Skip", Style::default().fg(self.c().text_muted)),
+                        ]),
+                    ]
+                } else {
+                    vec![
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Welcome to Kage!",
+                            Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  影 Shadow agents for autonomous code work",
+                            Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC),
+                        )),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  Before you can spawn agents, you need to configure",
+                            Style::default().fg(self.c().text),
+                        )),
+                        Line::from(Span::styled(
+                            "  your Claude Code API credentials.",
+                            Style::default().fg(self.c().text),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "  This wizard will help you set up:",
+                            Style::default().fg(self.c().text),
+                        )),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "    • Claude API subscription",
+                            Style::default().fg(self.c().accent_bright),
+                        )),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled(" Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
+                            Span::styled(" Continue  ", Style::default().fg(self.c().text_muted)),
+                            Span::styled(" s/Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
+                            Span::styled(" Skip setup", Style::default().fg(self.c().text_muted)),
+                        ]),
+                    ]
+                }
             }
             SetupStep::AddApiKey => {
                 let name_focused = self.setup_wizard.focus == 0;
@@ -2855,8 +2904,14 @@ impl Dashboard {
         };
 
         let title = match self.setup_wizard.step {
-            SetupStep::Welcome => " First-Time Setup ",
-            SetupStep::AddApiKey => " Step 1: API Key ",
+            SetupStep::Welcome => {
+                if self.setup_wizard.detected_auth.is_some() {
+                    " Claude Code Detected "
+                } else {
+                    " First-Time Setup "
+                }
+            }
+            SetupStep::AddApiKey => " Add API Key ",
             SetupStep::Complete => " Setup Complete ",
         };
 
