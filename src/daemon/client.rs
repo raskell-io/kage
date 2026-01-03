@@ -148,6 +148,21 @@ impl DaemonClient {
         self.request(&Request::ListTasks { status }).await
     }
 
+    /// Pause an agent
+    pub async fn pause_agent(&mut self, id: crate::agent::AgentId) -> Result<Response> {
+        self.request(&Request::PauseAgent { id }).await
+    }
+
+    /// Resume an agent
+    pub async fn resume_agent(&mut self, id: crate::agent::AgentId) -> Result<Response> {
+        self.request(&Request::ResumeAgent { id }).await
+    }
+
+    /// Cancel a task
+    pub async fn cancel_task(&mut self, id: crate::task::TaskId) -> Result<Response> {
+        self.request(&Request::CancelTask { id }).await
+    }
+
     /// Shutdown the daemon
     pub async fn shutdown(&mut self) -> Result<Response> {
         self.request(&Request::Shutdown).await

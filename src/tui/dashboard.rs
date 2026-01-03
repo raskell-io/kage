@@ -57,6 +57,21 @@ struct OutputLineDisplay {
     timestamp: i64,
 }
 
+/// Action request from TUI to daemon
+#[derive(Debug, Clone)]
+enum Action {
+    /// Kill an agent
+    KillAgent { id: String },
+    /// Pause an agent
+    PauseAgent { id: String },
+    /// Resume an agent
+    ResumeAgent { id: String },
+    /// Cancel a task
+    CancelTask { id: String },
+    /// Request output for a specific agent
+    RequestOutput { id: String },
+}
+
 /// Purple theme colors matching the mascot
 mod theme {
     use ratatui::style::Color;
@@ -107,8 +122,8 @@ pub struct Dashboard {
     should_quit: bool,
     /// Data update receiver
     data_rx: Option<mpsc::Receiver<DataUpdate>>,
-    /// Channel to request output for specific agent
-    output_request_tx: Option<mpsc::Sender<String>>,
+    /// Channel to send actions to daemon
+    action_tx: Option<mpsc::Sender<Action>>,
 }
 
 /// Which panel is focused
@@ -528,15 +543,22 @@ impl Dashboard {
             last_refresh: Instant::now(),
             should_quit: false,
             data_rx: None,
-            output_request_tx: None,
+            action_tx: None,
         }
     }
 
     /// Create dashboard with data channel
-    pub fn with_data_channel(mut self, rx: mpsc::Receiver<DataUpdate>, output_tx: mpsc::Sender<String>) -> Self {
+    pub fn with_data_channel(mut self, rx: mpsc::Receiver<DataUpdate>, action_tx: mpsc::Sender<Action>) -> Self {
         self.data_rx = Some(rx);
-        self.output_request_tx = Some(output_tx);
+        self.action_tx = Some(action_tx);
         self
+    }
+
+    /// Send an action to the daemon
+    fn send_action(&self, action: Action) {
+        if let Some(ref tx) = self.action_tx {
+            let _ = tx.send(action);
+        }
     }
 
     /// Run the dashboard
@@ -626,10 +648,35 @@ impl Dashboard {
             return;
         }
 
-        // Global keys
+        // Global keys - Ctrl combinations first (they need priority)
+        match (key, modifiers.contains(KeyModifiers::CONTROL)) {
+            // Ctrl+C or Ctrl+Q to quit
+            (KeyCode::Char('c'), true) | (KeyCode::Char('q'), true) => {
+                self.should_quit = true;
+                return;
+            }
+            // Ctrl+K: Kill selected agent
+            (KeyCode::Char('k'), true) => {
+                self.handle_kill_agent();
+                return;
+            }
+            // Ctrl+P: Pause/resume agent
+            (KeyCode::Char('p'), true) => {
+                self.handle_pause_resume_agent();
+                return;
+            }
+            _ => {}
+        }
+
+        // Regular keys
         match key {
+            // Quit
             KeyCode::Char('q') => self.should_quit = true,
+
+            // Help
             KeyCode::Char('?') => self.show_help = true,
+
+            // Panel navigation
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('1') => self.focus = Panel::Agents,
@@ -637,35 +684,51 @@ impl Dashboard {
             KeyCode::Char('3') => self.focus = Panel::Tasks,
             KeyCode::Char('4') => self.focus = Panel::Logs,
 
-            // Panel-specific
+            // Horizontal panel navigation (vim-style)
+            KeyCode::Char('h') | KeyCode::Left => self.handle_left(),
+            KeyCode::Char('l') | KeyCode::Right => self.handle_right(),
+
+            // Vertical navigation
             KeyCode::Up | KeyCode::Char('k') => self.handle_up(),
             KeyCode::Down | KeyCode::Char('j') => self.handle_down(),
+
+            // Selection/details
             KeyCode::Enter => self.handle_enter(),
+
+            // Output panel scrolling
             KeyCode::Char('g') => self.handle_scroll_top(),
             KeyCode::Char('G') => self.handle_scroll_bottom(),
             KeyCode::PageUp => self.handle_page_up(),
             KeyCode::PageDown => self.handle_page_down(),
 
-            // Actions (Ctrl+key must come before plain key matches)
-            KeyCode::Char('n') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+N: New agent
-            }
-            KeyCode::Char('t') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+T: New task
-            }
-            KeyCode::Char('p') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+P: Pause/resume
-            }
-            KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                // Ctrl+A: Approve action
-            }
-            KeyCode::Char('r') => {
-                // Refresh
-                self.refresh();
-            }
+            // Actions
+            KeyCode::Char(' ') => self.handle_space(),         // Pause/resume or toggle
+            KeyCode::Char('x') | KeyCode::Delete => self.handle_delete(), // Kill/cancel
+            KeyCode::Backspace => self.handle_delete(),        // Kill/cancel
+            KeyCode::Char('c') => self.handle_cancel(),        // Cancel task
+            KeyCode::Char('r') => self.refresh(),              // Refresh
+            KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
             _ => {}
         }
+    }
+
+    /// Handle left arrow / h key
+    fn handle_left(&mut self) {
+        self.focus = match self.focus {
+            Panel::Output => Panel::Agents,
+            Panel::Logs => Panel::Tasks,
+            _ => self.focus,
+        };
+    }
+
+    /// Handle right arrow / l key
+    fn handle_right(&mut self) {
+        self.focus = match self.focus {
+            Panel::Agents => Panel::Output,
+            Panel::Tasks => Panel::Logs,
+            _ => self.focus,
+        };
     }
 
     fn handle_up(&mut self) {
@@ -733,6 +796,83 @@ impl Dashboard {
         }
     }
 
+    /// Handle Ctrl+K - kill selected agent
+    fn handle_kill_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let id = agent.id.clone();
+            self.logs.add_info("dashboard", &format!("Killing agent {}...", &id[..8.min(id.len())]));
+            self.send_action(Action::KillAgent { id });
+        }
+    }
+
+    /// Handle Ctrl+P - pause/resume selected agent
+    fn handle_pause_resume_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let id = agent.id.clone();
+            match agent.status {
+                AgentDisplayStatus::Running => {
+                    self.logs.add_info("dashboard", &format!("Pausing agent {}...", &id[..8.min(id.len())]));
+                    self.send_action(Action::PauseAgent { id });
+                }
+                AgentDisplayStatus::Paused => {
+                    self.logs.add_info("dashboard", &format!("Resuming agent {}...", &id[..8.min(id.len())]));
+                    self.send_action(Action::ResumeAgent { id });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Handle Space - context-sensitive action
+    fn handle_space(&mut self) {
+        match self.focus {
+            Panel::Agents => self.handle_pause_resume_agent(),
+            Panel::Output => {
+                // Toggle auto-scroll
+                self.output.auto_scroll = !self.output.auto_scroll;
+                if self.output.auto_scroll {
+                    self.output.scroll_to_bottom();
+                }
+            }
+            Panel::Tasks => {
+                // Could be used to toggle task priority or start task
+            }
+            Panel::Logs => {}
+        }
+    }
+
+    /// Handle Delete/Backspace/x - kill agent or cancel task
+    fn handle_delete(&mut self) {
+        match self.focus {
+            Panel::Agents => self.handle_kill_agent(),
+            Panel::Tasks => self.handle_cancel(),
+            _ => {}
+        }
+    }
+
+    /// Handle c - cancel selected task
+    fn handle_cancel(&mut self) {
+        if self.focus == Panel::Tasks || self.focus == Panel::Agents {
+            if let Some(task) = self.tasks.selected() {
+                let id = task.id.clone();
+                self.logs.add_info("dashboard", &format!("Cancelling task {}...", &id[..8.min(id.len())]));
+                self.send_action(Action::CancelTask { id });
+            }
+        }
+    }
+
+    /// Handle Escape - close popups or clear selection
+    fn handle_escape(&mut self) {
+        if self.show_help {
+            self.show_help = false;
+        } else if self.show_agent_details {
+            self.show_agent_details = false;
+        } else if self.show_task_details {
+            self.show_task_details = false;
+        }
+        // Could also deselect items if needed
+    }
+
     fn refresh(&mut self) {
         // Data is refreshed via the data channel in process_data_updates
         self.logs.add_info("dashboard", "Refreshing...");
@@ -786,9 +926,7 @@ impl Dashboard {
 
         // Request output for newly selected agent
         if let Some(agent_id) = request_output_for {
-            if let Some(ref tx) = self.output_request_tx {
-                let _ = tx.send(agent_id);
-            }
+            self.send_action(Action::RequestOutput { id: agent_id });
         }
     }
 
@@ -1216,63 +1354,70 @@ impl Dashboard {
             ]),
             Line::from(vec![
                 Span::styled("  ↑/k  ↓/j         ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Navigate list items", Style::default().fg(theme::TEXT)),
+                Span::styled("Navigate up/down", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  ←/h  →/l         ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Navigate left/right", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
                 Span::styled("  Enter            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("View details / toggle auto-scroll", Style::default().fg(theme::TEXT)),
+                Span::styled("View details", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Esc              ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Close popup", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Agent Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Ctrl+K / x / Del ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Kill agent", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Ctrl+P / Space   ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Pause/resume agent", Style::default().fg(theme::TEXT)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Task Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  c / x / Del      ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Cancel task", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
             Line::from(Span::styled("Output Panel", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  g / G            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Scroll to top / bottom", Style::default().fg(theme::TEXT)),
+                Span::styled("Scroll to top/bottom", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
                 Span::styled("  PgUp / PgDn      ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Page up / down", Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled("Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("  Ctrl+N           ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Spawn new agent", Style::default().fg(theme::TEXT)),
+                Span::styled("Page up/down", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+T           ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Add new task", Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+K           ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Kill selected agent", Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+P           ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Pause/resume agent", Style::default().fg(theme::TEXT)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Ctrl+A           ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Approve pending action", Style::default().fg(theme::TEXT)),
+                Span::styled("  Space            ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Toggle auto-scroll", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
             Line::from(Span::styled("General", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  r                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Refresh data", Style::default().fg(theme::TEXT)),
+                Span::styled("Refresh", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
                 Span::styled("  ?                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Toggle this help", Style::default().fg(theme::TEXT)),
+                Span::styled("Help", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(vec![
-                Span::styled("  q                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Quit dashboard", Style::default().fg(theme::TEXT)),
+                Span::styled("  q / Ctrl+C       ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("Quit", Style::default().fg(theme::TEXT)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Press any key to close", Style::default().fg(theme::DIM))),
+            Line::from(Span::styled("Press Esc or ? to close", Style::default().fg(theme::DIM))),
         ];
 
         let help = Paragraph::new(help_text)
@@ -1480,7 +1625,7 @@ fn format_duration_ago(timestamp: i64) -> String {
 /// Background task that fetches data from the daemon
 async fn data_fetcher(
     tx: mpsc::Sender<DataUpdate>,
-    output_rx: mpsc::Receiver<String>,
+    action_rx: mpsc::Receiver<Action>,
     socket_path: std::path::PathBuf,
 ) {
     use crate::daemon::client::DaemonClient;
@@ -1489,10 +1634,20 @@ async fn data_fetcher(
     // Track which agent we should fetch output for
     let mut current_agent_id: Option<String> = None;
 
+    // Pending actions to process
+    let mut pending_actions: Vec<Action> = Vec::new();
+
     loop {
-        // Check for output request (non-blocking)
-        while let Ok(agent_id) = output_rx.try_recv() {
-            current_agent_id = Some(agent_id);
+        // Collect all pending actions (non-blocking)
+        while let Ok(action) = action_rx.try_recv() {
+            match &action {
+                Action::RequestOutput { id } => {
+                    current_agent_id = Some(id.clone());
+                }
+                _ => {
+                    pending_actions.push(action);
+                }
+            }
         }
 
         // Try to connect and fetch data
@@ -1504,6 +1659,35 @@ async fn data_fetcher(
                     version: None,
                     uptime_secs: None,
                 });
+
+                // Process pending actions
+                for action in pending_actions.drain(..) {
+                    match action {
+                        Action::KillAgent { id } => {
+                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
+                                let _ = client.kill_agent(agent_id, false).await;
+                            }
+                        }
+                        Action::PauseAgent { id } => {
+                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
+                                let _ = client.pause_agent(agent_id).await;
+                            }
+                        }
+                        Action::ResumeAgent { id } => {
+                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
+                                let _ = client.resume_agent(agent_id).await;
+                            }
+                        }
+                        Action::CancelTask { id } => {
+                            if let Ok(task_id) = id.parse::<crate::task::TaskId>() {
+                                let _ = client.cancel_task(task_id).await;
+                            }
+                        }
+                        Action::RequestOutput { .. } => {
+                            // Already handled above
+                        }
+                    }
+                }
 
                 // Fetch agents
                 match client.list_agents(None, true).await {
@@ -1581,8 +1765,8 @@ pub async fn run() -> Result<()> {
     // Create channel for data updates
     let (tx, rx) = mpsc::channel();
 
-    // Create channel for output requests
-    let (output_tx, output_rx) = mpsc::channel();
+    // Create channel for actions
+    let (action_tx, action_rx) = mpsc::channel();
 
     // Get socket path
     let socket_path = crate::daemon::client::default_socket_path();
@@ -1590,11 +1774,11 @@ pub async fn run() -> Result<()> {
     // Spawn background data fetcher
     let fetch_tx = tx.clone();
     tokio::spawn(async move {
-        data_fetcher(fetch_tx, output_rx, socket_path).await;
+        data_fetcher(fetch_tx, action_rx, socket_path).await;
     });
 
     // Create dashboard with data channel
-    let mut dashboard = Dashboard::new().with_data_channel(rx, output_tx);
+    let mut dashboard = Dashboard::new().with_data_channel(rx, action_tx);
 
     // Add initial log
     dashboard.logs.add_info("dashboard", "Starting dashboard...");
