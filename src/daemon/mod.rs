@@ -91,29 +91,120 @@ impl Daemon {
         let shutdown_tx = self.shutdown_tx.take().unwrap();
         let mut shutdown_rx = shutdown_tx.subscribe();
 
-        // Start task scheduler in background
-        let scheduler_shutdown_rx = shutdown_tx.subscribe();
-        let scheduler = Arc::clone(&self.scheduler);
-        let scheduler_handle = tokio::spawn(async move {
-            scheduler.run(scheduler_shutdown_rx).await;
-        });
-        tracing::info!("Task scheduler started");
+        // Start task orchestrator - spawns agents for pending tasks
+        let orch_supervisor = Arc::clone(&self.supervisor);
+        let orch_scheduler = Arc::clone(&self.scheduler);
+        let orch_config = self.config.clone();
+        let mut orch_shutdown_rx = shutdown_tx.subscribe();
+        let orchestrator_handle = tokio::spawn(async move {
+            tracing::info!("Task orchestrator started");
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                        // Get pending tasks that are ready to run
+                        let ready_tasks = orch_scheduler.registry().get_ready_tasks();
 
-        // Start health check loop
+                        for task in ready_tasks.into_iter().take(orch_config.daemon.max_agents) {
+                            // Check if we're at capacity
+                            let sup = orch_supervisor.read().await;
+                            let running_count = sup.list_all().await.iter()
+                                .filter(|a| a.status == "running")
+                                .count();
+                            drop(sup);
+
+                            if running_count >= orch_config.daemon.max_agents {
+                                tracing::debug!("At agent capacity ({}/{}), waiting...",
+                                    running_count, orch_config.daemon.max_agents);
+                                break;
+                            }
+
+                            // Spawn agent for this task
+                            let working_dir = task.repository.clone()
+                                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+                            tracing::info!("Spawning agent for task '{}' ({})", task.goal, task.id);
+
+                            let mut sup = orch_supervisor.write().await;
+                            match sup.spawn(
+                                working_dir,
+                                task.namespace.clone(),
+                                Some(task.goal.clone()),
+                                None, // Use default model
+                                Some(task.config.max_iterations),
+                            ).await {
+                                Ok(agent_id) => {
+                                    // Assign task to agent
+                                    if let Err(e) = orch_scheduler.registry().assign_to_agent(task.id, agent_id) {
+                                        tracing::error!("Failed to assign task {} to agent {}: {}", task.id, agent_id, e);
+                                    } else {
+                                        tracing::info!("Task {} assigned to agent {}", task.id, agent_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to spawn agent for task {}: {}", task.id, e);
+                                    // Mark task as failed
+                                    let _ = orch_scheduler.registry().fail_task(task.id, Some(&e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    _ = orch_shutdown_rx.recv() => {
+                        tracing::info!("Task orchestrator shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Start health check loop - updates task status based on agent completion
         let health_supervisor = Arc::clone(&self.supervisor);
         let health_scheduler = Arc::clone(&self.scheduler);
         let mut health_shutdown_rx = shutdown_tx.subscribe();
         let health_handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(3)) => {
                         // Run health check on supervisor
                         let mut sup = health_supervisor.write().await;
                         sup.health_check().await;
+
+                        // Get all agents and update corresponding task statuses
+                        let agents = sup.list_all().await;
                         drop(sup);
 
-                        // Check for completed tasks and update scheduler
-                        // (In the future, this would update task status based on agent completion)
+                        for agent in agents {
+                            // Find tasks assigned to this agent
+                            let tasks = health_scheduler.registry().get_by_agent(agent.id);
+
+                            for task in tasks {
+                                // Skip if task is already in a terminal state
+                                if matches!(task.status, TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled) {
+                                    continue;
+                                }
+
+                                // Update task status based on agent status
+                                match agent.status.as_str() {
+                                    "completed" => {
+                                        if let Err(e) = health_scheduler.registry().complete_task(task.id) {
+                                            tracing::error!("Failed to complete task {}: {}", task.id, e);
+                                        } else {
+                                            tracing::info!("Task {} completed (agent {} finished)", task.id, agent.id);
+                                        }
+                                    }
+                                    "failed" | "stopped" => {
+                                        let error_msg = format!("Agent {} {}", agent.id, agent.status);
+                                        if let Err(e) = health_scheduler.registry().fail_task(task.id, Some(&error_msg)) {
+                                            tracing::error!("Failed to fail task {}: {}", task.id, e);
+                                        } else {
+                                            tracing::info!("Task {} failed (agent {} {})", task.id, agent.id, agent.status);
+                                        }
+                                    }
+                                    _ => {
+                                        // Agent still running, nothing to do
+                                    }
+                                }
+                            }
+                        }
                     }
                     _ = health_shutdown_rx.recv() => {
                         break;
@@ -165,7 +256,7 @@ impl Daemon {
 
         // Wait for background tasks to stop
         tracing::info!("Stopping background tasks...");
-        let _ = scheduler_handle.await;
+        let _ = orchestrator_handle.await;
         let _ = health_handle.await;
 
         // Graceful shutdown: kill all agents
