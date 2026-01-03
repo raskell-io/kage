@@ -1,10 +1,10 @@
 //! Interactive dashboard for monitoring agents
 //!
 //! Shows:
-//! - Active agents and their status
-//! - Recent memory/context events
-//! - Task queue and progress
-//! - Real-time logs
+//! - Active agents with status filtering (working/idle/waiting)
+//! - Real-time stream output from selected agent
+//! - Task queue and logs (collapsible)
+//! - Themeable styling (Catppuccin, Dracula, etc.)
 
 use std::io::{self, Stdout};
 use std::sync::mpsc;
@@ -19,13 +19,14 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
 
 use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
+use super::theme::{Theme, ColorPalette, StatusSymbols};
 
 /// Message from background data fetcher
 enum DataUpdate {
@@ -51,6 +52,10 @@ enum DataUpdate {
     Log(LogEntry),
     /// Real-time daemon event
     Event(crate::daemon::protocol::DaemonEvent),
+    /// Subscription count (for setup wizard)
+    SubscriptionCount(usize),
+    /// Subscription added result
+    SubscriptionAdded { success: bool, error: Option<String> },
 }
 
 /// Output line for display
@@ -84,34 +89,143 @@ enum Action {
     Approve { id: String },
     /// Reject an action
     Reject { id: String },
+    /// Add a subscription
+    AddSubscription {
+        name: String,
+        api_key: String,
+    },
 }
 
-/// Purple theme colors matching the mascot
-mod theme {
-    use ratatui::style::Color;
+/// Setup wizard step
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStep {
+    Welcome,
+    AddApiKey,
+    Complete,
+}
 
-    pub const PURPLE: Color = Color::Rgb(167, 139, 250);
-    pub const DARK_PURPLE: Color = Color::Rgb(139, 92, 246);
-    pub const LIGHT_PURPLE: Color = Color::Rgb(196, 181, 253);
-    pub const BG: Color = Color::Rgb(24, 24, 27);
-    pub const BG_HIGHLIGHT: Color = Color::Rgb(39, 39, 42);
-    pub const BORDER: Color = Color::Rgb(63, 63, 70);
-    pub const DIM: Color = Color::Rgb(113, 113, 122);
-    pub const TEXT: Color = Color::Rgb(244, 244, 245);
-    pub const SUCCESS: Color = Color::Rgb(134, 239, 172);
-    pub const WARNING: Color = Color::Rgb(253, 224, 71);
-    pub const ERROR: Color = Color::Rgb(252, 165, 165);
-    pub const INFO: Color = Color::Rgb(147, 197, 253);
+/// Setup wizard state for first-time configuration
+struct SetupWizardState {
+    /// Current step
+    step: SetupStep,
+    /// Whether setup is needed
+    needs_setup: bool,
+    /// Whether user dismissed the wizard
+    dismissed: bool,
+    /// Subscription name input
+    sub_name: String,
+    /// API key input (masked)
+    api_key: String,
+    /// Cursor position
+    cursor: usize,
+    /// Which field is focused (0 = name, 1 = api_key)
+    focus: usize,
+    /// Error message to display
+    error: Option<String>,
+    /// Whether setup completed successfully
+    setup_complete: bool,
+}
+
+impl SetupWizardState {
+    fn new() -> Self {
+        Self {
+            step: SetupStep::Welcome,
+            needs_setup: false,
+            dismissed: false,
+            sub_name: "claude".to_string(),
+            api_key: String::new(),
+            cursor: 0,
+            focus: 1, // Start on API key field
+            error: None,
+            setup_complete: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.step = SetupStep::Welcome;
+        self.sub_name = "claude".to_string();
+        self.api_key.clear();
+        self.cursor = 0;
+        self.focus = 1;
+        self.error = None;
+    }
+
+    fn next_step(&mut self) {
+        self.step = match self.step {
+            SetupStep::Welcome => SetupStep::AddApiKey,
+            SetupStep::AddApiKey => SetupStep::Complete,
+            SetupStep::Complete => SetupStep::Complete,
+        };
+        self.cursor = 0;
+    }
+
+    fn current_field(&self) -> &str {
+        match self.focus {
+            0 => &self.sub_name,
+            _ => &self.api_key,
+        }
+    }
+
+    fn current_field_mut(&mut self) -> &mut String {
+        match self.focus {
+            0 => &mut self.sub_name,
+            _ => &mut self.api_key,
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let cursor = self.cursor;
+        let field = self.current_field_mut();
+        if cursor <= field.len() {
+            field.insert(cursor, c);
+            self.cursor += 1;
+        }
+    }
+
+    fn delete_char(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let cursor = self.cursor;
+            let field = self.current_field_mut();
+            if !field.is_empty() && cursor < field.len() {
+                field.remove(cursor);
+            }
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.sub_name.trim().is_empty() && !self.api_key.trim().is_empty()
+    }
+}
+
+/// Agent status filter
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentFilter {
+    /// Show all agents
+    #[default]
+    All,
+    /// Only working/running agents
+    Working,
+    /// Only idle/completed agents
+    Idle,
+    /// Only agents waiting for user input
+    Waiting,
 }
 
 /// Dashboard application state
 pub struct Dashboard {
+    /// Theme configuration
+    theme: Theme,
     /// Currently focused panel
     focus: Panel,
     /// Agent list state
     agents: AgentListState,
-    /// Agent output state
-    output: OutputState,
+    /// Agent filter (all/working/idle/waiting)
+    agent_filter: AgentFilter,
+    /// Agent stream output state (renamed from output)
+    stream: OutputState,
+    /// Stream scroll position
+    stream_scroll: usize,
     /// Task list state
     tasks: TaskListState,
     /// Log entries
@@ -134,12 +248,22 @@ pub struct Dashboard {
     show_approvals: bool,
     /// Show spawn agent dialog
     show_spawn_dialog: bool,
+    /// Fullscreen stream mode (no panels, just agent output)
+    fullscreen_stream: bool,
+    /// Tasks panel collapsed
+    tasks_collapsed: bool,
+    /// Logs panel collapsed
+    logs_collapsed: bool,
     /// Spawn dialog state
     spawn_dialog: SpawnDialogState,
+    /// Setup wizard state
+    setup_wizard: SetupWizardState,
     /// Last tick time (for animations)
     last_tick: Instant,
     /// Last data refresh
     last_refresh: Instant,
+    /// Spinner animation frame
+    spinner_frame: usize,
     /// Should quit
     should_quit: bool,
     /// Data update receiver
@@ -152,7 +276,7 @@ pub struct Dashboard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Panel {
     Agents,
-    Output,
+    Stream,
     Tasks,
     Logs,
 }
@@ -160,8 +284,8 @@ enum Panel {
 impl Panel {
     fn next(&self) -> Self {
         match self {
-            Self::Agents => Self::Output,
-            Self::Output => Self::Tasks,
+            Self::Agents => Self::Stream,
+            Self::Stream => Self::Tasks,
             Self::Tasks => Self::Logs,
             Self::Logs => Self::Agents,
         }
@@ -170,8 +294,8 @@ impl Panel {
     fn prev(&self) -> Self {
         match self {
             Self::Agents => Self::Logs,
-            Self::Output => Self::Agents,
-            Self::Tasks => Self::Output,
+            Self::Stream => Self::Agents,
+            Self::Tasks => Self::Stream,
             Self::Logs => Self::Tasks,
         }
     }
@@ -201,9 +325,15 @@ struct AgentInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentDisplayStatus {
-    Running,
+    /// Agent is actively working
+    Working,
+    /// Agent is idle/completed
     Idle,
+    /// Agent is waiting for user input
+    Waiting,
+    /// Agent is paused
     Paused,
+    /// Agent encountered an error
     Error,
 }
 
@@ -228,9 +358,10 @@ impl AgentListState {
 
         self.items = agents.into_iter().map(|a| {
             let status = match a.status.as_str() {
-                "running" => AgentDisplayStatus::Running,
+                "running" => AgentDisplayStatus::Working,
+                "waiting" | "awaiting_input" => AgentDisplayStatus::Waiting,
                 "paused" => AgentDisplayStatus::Paused,
-                "completed" | "stopped" => AgentDisplayStatus::Idle,
+                "completed" | "stopped" | "idle" => AgentDisplayStatus::Idle,
                 _ => AgentDisplayStatus::Error,
             };
 
@@ -726,6 +857,15 @@ impl LogState {
         });
     }
 
+    fn add_success(&mut self, source: &str, message: &str) {
+        self.add(LogEntry {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level: LogLevel::Success,
+            source: source.to_string(),
+            message: message.to_string(),
+        });
+    }
+
     fn scroll_down(&mut self) {
         if self.scroll < self.entries.len().saturating_sub(1) {
             self.scroll += 1;
@@ -744,12 +884,20 @@ impl Default for Dashboard {
 }
 
 impl Dashboard {
-    /// Create a new dashboard
+    /// Create a new dashboard with default theme
     pub fn new() -> Self {
+        Self::with_theme(Theme::default())
+    }
+
+    /// Create a dashboard with a specific theme
+    pub fn with_theme(theme: Theme) -> Self {
         Self {
+            theme,
             focus: Panel::Agents,
             agents: AgentListState::new(),
-            output: OutputState::new(),
+            agent_filter: AgentFilter::default(),
+            stream: OutputState::new(),
+            stream_scroll: 0,
             tasks: TaskListState::new(),
             logs: LogState::new(),
             approvals: ApprovalListState::new(),
@@ -761,13 +909,28 @@ impl Dashboard {
             show_task_details: false,
             show_approvals: false,
             show_spawn_dialog: false,
+            fullscreen_stream: false,
+            tasks_collapsed: true,  // Collapsed by default
+            logs_collapsed: true,   // Collapsed by default
             spawn_dialog: SpawnDialogState::new(),
+            setup_wizard: SetupWizardState::new(),
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
+            spinner_frame: 0,
             should_quit: false,
             data_rx: None,
             action_tx: None,
         }
+    }
+
+    /// Set the theme
+    pub fn set_theme(&mut self, theme: Theme) {
+        self.theme = theme;
+    }
+
+    /// Get available theme names
+    pub fn available_themes() -> Vec<&'static str> {
+        Theme::available()
     }
 
     /// Create dashboard with data channel
@@ -782,6 +945,75 @@ impl Dashboard {
         if let Some(ref tx) = self.action_tx {
             let _ = tx.send(action);
         }
+    }
+
+    /// Get color palette shorthand
+    #[inline]
+    fn c(&self) -> &ColorPalette {
+        &self.theme.colors
+    }
+
+    /// Get symbols shorthand
+    #[inline]
+    fn s(&self) -> &StatusSymbols {
+        &self.theme.symbols
+    }
+
+    /// Get status color for an agent
+    fn agent_status_color(&self, status: AgentDisplayStatus) -> ratatui::style::Color {
+        match status {
+            AgentDisplayStatus::Working => self.c().status_working,
+            AgentDisplayStatus::Idle => self.c().status_idle,
+            AgentDisplayStatus::Waiting => self.c().status_waiting,
+            AgentDisplayStatus::Paused => self.c().status_paused,
+            AgentDisplayStatus::Error => self.c().status_error,
+        }
+    }
+
+    /// Get status symbol for an agent
+    fn agent_status_symbol(&self, status: AgentDisplayStatus) -> &'static str {
+        match status {
+            AgentDisplayStatus::Working => self.s().working,
+            AgentDisplayStatus::Idle => self.s().idle,
+            AgentDisplayStatus::Waiting => self.s().waiting,
+            AgentDisplayStatus::Paused => self.s().paused,
+            AgentDisplayStatus::Error => self.s().error,
+        }
+    }
+
+    /// Check if agent matches current filter
+    fn agent_matches_filter(&self, agent: &AgentInfo) -> bool {
+        match self.agent_filter {
+            AgentFilter::All => true,
+            AgentFilter::Working => agent.status == AgentDisplayStatus::Working,
+            AgentFilter::Idle => agent.status == AgentDisplayStatus::Idle,
+            AgentFilter::Waiting => agent.status == AgentDisplayStatus::Waiting,
+        }
+    }
+
+    /// Get filtered agents
+    fn filtered_agents(&self) -> Vec<&AgentInfo> {
+        self.agents.items.iter()
+            .filter(|a| self.agent_matches_filter(a))
+            .collect()
+    }
+
+    /// Count agents by status
+    fn agent_counts(&self) -> (usize, usize, usize) {
+        let working = self.agents.items.iter().filter(|a| a.status == AgentDisplayStatus::Working).count();
+        let idle = self.agents.items.iter().filter(|a| a.status == AgentDisplayStatus::Idle).count();
+        let waiting = self.agents.items.iter().filter(|a| a.status == AgentDisplayStatus::Waiting).count();
+        (working, idle, waiting)
+    }
+
+    /// Cycle to next filter
+    fn next_filter(&mut self) {
+        self.agent_filter = match self.agent_filter {
+            AgentFilter::All => AgentFilter::Working,
+            AgentFilter::Working => AgentFilter::Idle,
+            AgentFilter::Idle => AgentFilter::Waiting,
+            AgentFilter::Waiting => AgentFilter::All,
+        };
     }
 
     /// Run the dashboard
@@ -840,6 +1072,24 @@ impl Dashboard {
 
     /// Handle keyboard input
     fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) {
+        // Fullscreen mode - Esc or 'f' to exit
+        if self.fullscreen_stream {
+            match key {
+                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => {
+                    self.fullscreen_stream = false;
+                }
+                // Allow scrolling in fullscreen
+                KeyCode::Up | KeyCode::Char('k') => self.stream.scroll_up(1),
+                KeyCode::Down | KeyCode::Char('j') => self.stream.scroll_down(1),
+                KeyCode::Char('g') => self.stream.scroll_to_top(),
+                KeyCode::Char('G') => self.stream.scroll_to_bottom(),
+                KeyCode::PageUp => self.stream.scroll_up(20),
+                KeyCode::PageDown => self.stream.scroll_down(20),
+                _ => {}
+            }
+            return;
+        }
+
         // Close popups first
         if self.show_help {
             match key {
@@ -847,6 +1097,72 @@ impl Dashboard {
                     self.show_help = false;
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        // Setup wizard takes priority
+        if self.setup_wizard.needs_setup && !self.setup_wizard.dismissed {
+            match self.setup_wizard.step {
+                SetupStep::Welcome => {
+                    match key {
+                        KeyCode::Enter => {
+                            self.setup_wizard.next_step();
+                        }
+                        KeyCode::Esc | KeyCode::Char('s') => {
+                            // Skip setup
+                            self.setup_wizard.dismissed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                SetupStep::AddApiKey => {
+                    match key {
+                        KeyCode::Esc => {
+                            // Skip setup
+                            self.setup_wizard.dismissed = true;
+                        }
+                        KeyCode::Enter => {
+                            if self.setup_wizard.is_valid() {
+                                // Submit the subscription
+                                self.handle_add_subscription();
+                            }
+                        }
+                        KeyCode::Tab => {
+                            self.setup_wizard.focus = if self.setup_wizard.focus == 0 { 1 } else { 0 };
+                            self.setup_wizard.cursor = self.setup_wizard.current_field().len();
+                        }
+                        KeyCode::BackTab => {
+                            self.setup_wizard.focus = if self.setup_wizard.focus == 0 { 1 } else { 0 };
+                            self.setup_wizard.cursor = self.setup_wizard.current_field().len();
+                        }
+                        KeyCode::Backspace => {
+                            self.setup_wizard.delete_char();
+                        }
+                        KeyCode::Left => {
+                            self.setup_wizard.cursor = self.setup_wizard.cursor.saturating_sub(1);
+                        }
+                        KeyCode::Right => {
+                            let len = self.setup_wizard.current_field().len();
+                            if self.setup_wizard.cursor < len {
+                                self.setup_wizard.cursor += 1;
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            self.setup_wizard.insert_char(c);
+                        }
+                        _ => {}
+                    }
+                }
+                SetupStep::Complete => {
+                    match key {
+                        KeyCode::Enter | KeyCode::Esc => {
+                            self.setup_wizard.dismissed = true;
+                            self.setup_wizard.needs_setup = false;
+                        }
+                        _ => {}
+                    }
+                }
             }
             return;
         }
@@ -973,7 +1289,7 @@ impl Dashboard {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('1') => self.focus = Panel::Agents,
-            KeyCode::Char('2') => self.focus = Panel::Output,
+            KeyCode::Char('2') => self.focus = Panel::Stream,
             KeyCode::Char('3') => self.focus = Panel::Tasks,
             KeyCode::Char('4') => self.focus = Panel::Logs,
 
@@ -1004,6 +1320,18 @@ impl Dashboard {
             KeyCode::Char('r') => self.refresh(),              // Refresh
             KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
+            // Fullscreen toggle (when on Stream panel)
+            KeyCode::Char('f') if self.focus == Panel::Stream => {
+                self.fullscreen_stream = true;
+            }
+
+            // Agent filter cycling
+            KeyCode::Char('F') => self.next_filter(),
+
+            // Panel collapse toggles
+            KeyCode::Char('t') => self.tasks_collapsed = !self.tasks_collapsed,
+            KeyCode::Char('L') => self.logs_collapsed = !self.logs_collapsed,
+
             _ => {}
         }
     }
@@ -1011,7 +1339,7 @@ impl Dashboard {
     /// Handle left arrow / h key
     fn handle_left(&mut self) {
         self.focus = match self.focus {
-            Panel::Output => Panel::Agents,
+            Panel::Stream => Panel::Agents,
             Panel::Logs => Panel::Tasks,
             _ => self.focus,
         };
@@ -1020,7 +1348,7 @@ impl Dashboard {
     /// Handle right arrow / l key
     fn handle_right(&mut self) {
         self.focus = match self.focus {
-            Panel::Agents => Panel::Output,
+            Panel::Agents => Panel::Stream,
             Panel::Tasks => Panel::Logs,
             _ => self.focus,
         };
@@ -1029,7 +1357,7 @@ impl Dashboard {
     fn handle_up(&mut self) {
         match self.focus {
             Panel::Agents => self.agents.previous(),
-            Panel::Output => self.output.scroll_up(1),
+            Panel::Stream => self.stream.scroll_up(1),
             Panel::Tasks => self.tasks.previous(),
             Panel::Logs => self.logs.scroll_up(),
         }
@@ -1038,7 +1366,7 @@ impl Dashboard {
     fn handle_down(&mut self) {
         match self.focus {
             Panel::Agents => self.agents.next(),
-            Panel::Output => self.output.scroll_down(1),
+            Panel::Stream => self.stream.scroll_down(1),
             Panel::Tasks => self.tasks.next(),
             Panel::Logs => self.logs.scroll_down(),
         }
@@ -1051,11 +1379,11 @@ impl Dashboard {
                     self.show_agent_details = true;
                 }
             }
-            Panel::Output => {
+            Panel::Stream => {
                 // Toggle auto-scroll
-                self.output.auto_scroll = !self.output.auto_scroll;
-                if self.output.auto_scroll {
-                    self.output.scroll_to_bottom();
+                self.stream.auto_scroll = !self.stream.auto_scroll;
+                if self.stream.auto_scroll {
+                    self.stream.scroll_to_bottom();
                 }
             }
             Panel::Tasks => {
@@ -1068,27 +1396,36 @@ impl Dashboard {
     }
 
     fn handle_scroll_top(&mut self) {
-        if self.focus == Panel::Output {
-            self.output.scroll_to_top();
+        if self.focus == Panel::Stream {
+            self.stream.scroll_to_top();
         }
     }
 
     fn handle_scroll_bottom(&mut self) {
-        if self.focus == Panel::Output {
-            self.output.scroll_to_bottom();
+        if self.focus == Panel::Stream {
+            self.stream.scroll_to_bottom();
         }
     }
 
     fn handle_page_up(&mut self) {
-        if self.focus == Panel::Output {
-            self.output.scroll_up(20);
+        if self.focus == Panel::Stream {
+            self.stream.scroll_up(20);
         }
     }
 
     fn handle_page_down(&mut self) {
-        if self.focus == Panel::Output {
-            self.output.scroll_down(20);
+        if self.focus == Panel::Stream {
+            self.stream.scroll_down(20);
         }
+    }
+
+    /// Handle add subscription from setup wizard
+    fn handle_add_subscription(&mut self) {
+        let name = self.setup_wizard.sub_name.trim().to_string();
+        let api_key = self.setup_wizard.api_key.trim().to_string();
+
+        self.logs.add_info("setup", &format!("Adding subscription '{}'...", name));
+        self.send_action(Action::AddSubscription { name, api_key });
     }
 
     /// Handle spawn agent from dialog
@@ -1119,7 +1456,7 @@ impl Dashboard {
         if let Some(agent) = self.agents.selected() {
             let id = agent.id.clone();
             match agent.status {
-                AgentDisplayStatus::Running => {
+                AgentDisplayStatus::Working => {
                     self.logs.add_info("dashboard", &format!("Pausing agent {}...", &id[..8.min(id.len())]));
                     self.send_action(Action::PauseAgent { id });
                 }
@@ -1136,11 +1473,11 @@ impl Dashboard {
     fn handle_space(&mut self) {
         match self.focus {
             Panel::Agents => self.handle_pause_resume_agent(),
-            Panel::Output => {
+            Panel::Stream => {
                 // Toggle auto-scroll
-                self.output.auto_scroll = !self.output.auto_scroll;
-                if self.output.auto_scroll {
-                    self.output.scroll_to_bottom();
+                self.stream.auto_scroll = !self.stream.auto_scroll;
+                if self.stream.auto_scroll {
+                    self.stream.scroll_to_bottom();
                 }
             }
             Panel::Tasks => {
@@ -1248,7 +1585,7 @@ impl Dashboard {
 
                     // If selection changed, update output panel
                     if prev_selected != new_selected {
-                        self.output.set_agent(new_selected.clone());
+                        self.stream.set_agent(new_selected.clone());
                         request_output_for = new_selected;
                     }
                 }
@@ -1265,7 +1602,7 @@ impl Dashboard {
                     self.daemon_uptime = uptime_secs;
                 }
                 DataUpdate::AgentOutput { agent_id, lines, has_more } => {
-                    self.output.update(agent_id, lines, has_more);
+                    self.stream.update(agent_id, lines, has_more);
                 }
                 DataUpdate::Approvals(approvals) => {
                     self.approvals.update_from_daemon(approvals);
@@ -1275,6 +1612,22 @@ impl Dashboard {
                 }
                 DataUpdate::Event(event) => {
                     self.handle_daemon_event(event);
+                }
+                DataUpdate::SubscriptionCount(count) => {
+                    // Show setup wizard if no subscriptions
+                    if count == 0 && !self.setup_wizard.setup_complete {
+                        self.setup_wizard.needs_setup = true;
+                    }
+                }
+                DataUpdate::SubscriptionAdded { success, error } => {
+                    if success {
+                        self.setup_wizard.error = None;
+                        self.setup_wizard.next_step(); // Move to Complete step
+                        self.setup_wizard.setup_complete = true;
+                        self.logs.add_success("setup", "Subscription added successfully!");
+                    } else {
+                        self.setup_wizard.error = error;
+                    }
                 }
             }
         }
@@ -1303,7 +1656,7 @@ impl Dashboard {
                 let id_str = id.to_string();
                 if let Some(agent) = self.agents.items.iter_mut().find(|a| a.id == id_str) {
                     agent.status = match new_status.as_str() {
-                        "running" => AgentDisplayStatus::Running,
+                        "running" => AgentDisplayStatus::Working,
                         "paused" => AgentDisplayStatus::Paused,
                         "completed" | "stopped" => AgentDisplayStatus::Idle,
                         _ => AgentDisplayStatus::Error,
@@ -1319,15 +1672,15 @@ impl Dashboard {
             DaemonEvent::AgentOutput { id, line } => {
                 // Add output line if this is the current agent
                 let id_str = id.to_string();
-                if self.output.agent_id.as_ref() == Some(&id_str) {
-                    self.output.lines.push(OutputLineDisplay {
+                if self.stream.agent_id.as_ref() == Some(&id_str) {
+                    self.stream.lines.push(OutputLineDisplay {
                         text: line.text,
                         is_error: line.is_error,
                         timestamp: line.timestamp,
                     });
                     // Auto-scroll to bottom if enabled
-                    if self.output.auto_scroll {
-                        self.output.scroll = 0;
+                    if self.stream.auto_scroll {
+                        self.stream.scroll = 0;
                     }
                 }
             }
@@ -1389,8 +1742,14 @@ impl Dashboard {
         let area = f.size();
 
         // Main background
-        let bg = Block::default().style(Style::default().bg(theme::BG));
+        let bg = Block::default().style(Style::default().bg(self.c().bg));
         f.render_widget(bg, area);
+
+        // Fullscreen stream mode - no decorations
+        if self.fullscreen_stream {
+            self.render_fullscreen_stream(f, area);
+            return;
+        }
 
         // Main layout
         let chunks = Layout::default()
@@ -1422,6 +1781,11 @@ impl Dashboard {
         if self.show_spawn_dialog {
             self.render_spawn_dialog(f, area);
         }
+
+        // Setup wizard renders on top of everything
+        if self.setup_wizard.needs_setup && !self.setup_wizard.dismissed {
+            self.render_setup_wizard(f, area);
+        }
     }
 
     /// Render the header
@@ -1437,17 +1801,17 @@ impl Dashboard {
 
         // Logo
         let logo = Paragraph::new(Line::from(vec![
-            Span::styled("  影 ", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)),
-            Span::styled("KAGE", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)),
+            Span::styled("  影 ", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+            Span::styled("KAGE", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
         ]))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::BORDER)));
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
         f.render_widget(logo, chunks[0]);
 
         // Daemon status
         let status_color = match self.daemon_status {
-            DaemonStatus::Connected => theme::SUCCESS,
-            DaemonStatus::Disconnected => theme::ERROR,
-            DaemonStatus::Connecting => theme::WARNING,
+            DaemonStatus::Connected => self.c().success,
+            DaemonStatus::Disconnected => self.c().error,
+            DaemonStatus::Connecting => self.c().warning,
         };
         let status_text = match self.daemon_status {
             DaemonStatus::Connected => "● Connected",
@@ -1456,191 +1820,251 @@ impl Dashboard {
         };
 
         let status = Paragraph::new(Line::from(vec![
-            Span::styled("Daemon: ", Style::default().fg(theme::DIM)),
+            Span::styled("Daemon: ", Style::default().fg(self.c().text_muted)),
             Span::styled(status_text, Style::default().fg(status_color)),
         ]))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::BORDER)));
+        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
         f.render_widget(status, chunks[1]);
 
-        // Stats
-        let running_agents = self.agents.items.iter().filter(|a| a.status == AgentDisplayStatus::Running).count();
+        // Stats - Show agent counts by status
+        let (working, idle, waiting) = self.agent_counts();
         let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
         let pending_approvals = self.approvals.items.len();
 
         let mut stats_spans = vec![
-            Span::styled(format!("{}", running_agents), Style::default().fg(theme::SUCCESS)),
-            Span::styled(" running  ", Style::default().fg(theme::DIM)),
-            Span::styled(format!("{}", pending_tasks), Style::default().fg(theme::WARNING)),
-            Span::styled(" pending", Style::default().fg(theme::DIM)),
+            // Working agents
+            Span::styled(self.s().working, Style::default().fg(self.c().status_working)),
+            Span::styled(format!("{}", working), Style::default().fg(self.c().status_working)),
+            Span::styled(" ", Style::default()),
+            // Idle agents
+            Span::styled(self.s().idle, Style::default().fg(self.c().status_idle)),
+            Span::styled(format!("{}", idle), Style::default().fg(self.c().status_idle)),
+            Span::styled(" ", Style::default()),
+            // Waiting agents (highlight if any)
+            Span::styled(self.s().waiting, Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
+            Span::styled(format!("{}", waiting), Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
         ];
+
+        // Add pending tasks
+        if pending_tasks > 0 {
+            stats_spans.push(Span::styled("  ", Style::default()));
+            stats_spans.push(Span::styled(
+                format!("󰄬 {}", pending_tasks),
+                Style::default().fg(self.c().info),
+            ));
+        }
 
         // Add approvals indicator if there are pending approvals
         if pending_approvals > 0 {
             stats_spans.push(Span::styled("  ", Style::default()));
             stats_spans.push(Span::styled(
-                format!("⚠ {} approval{}", pending_approvals, if pending_approvals == 1 { "" } else { "s" }),
-                Style::default().fg(theme::ERROR).add_modifier(Modifier::BOLD),
+                format!("⚠ {}", pending_approvals),
+                Style::default().fg(self.c().error).add_modifier(Modifier::BOLD),
             ));
         }
 
         let stats = Paragraph::new(Line::from(stats_spans))
             .alignment(Alignment::Right)
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(theme::BORDER)));
+            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
         f.render_widget(stats, chunks[2]);
     }
 
     /// Render the main content area
     fn render_main(&self, f: &mut Frame, area: Rect) {
-        // Split into top and bottom rows
+        // Determine bottom row height based on collapse state
+        let both_collapsed = self.tasks_collapsed && self.logs_collapsed;
+        let bottom_height = if both_collapsed { 2 } else { 45 };  // 2 lines when collapsed (just header)
+
+        // Split into top and bottom rows with horizontal separator
         let rows = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(55), // Top: Agents + Output
-                Constraint::Percentage(45), // Bottom: Tasks + Logs
+                Constraint::Percentage(100 - bottom_height), // Top: Agents + Stream
+                Constraint::Length(1),                        // Horizontal separator
+                Constraint::Percentage(bottom_height),        // Bottom: Tasks + Logs
             ])
             .split(area);
 
-        // Top row: Agents (left) + Output (right)
+        // Top row: Agents (left) + separator + Stream (right)
         let top_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(35), // Agents
-                Constraint::Percentage(65), // Output
+                Constraint::Percentage(30), // Agents
+                Constraint::Length(1),      // Vertical separator
+                Constraint::Percentage(70), // Stream
             ])
             .split(rows[0]);
 
-        // Bottom row: Tasks (left) + Logs (right)
+        // Bottom row: Tasks (left) + separator + Logs (right)
         let bottom_cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Percentage(50), // Tasks
+                Constraint::Length(1),      // Vertical separator
                 Constraint::Percentage(50), // Logs
             ])
-            .split(rows[1]);
+            .split(rows[2]);
 
+        // Render panels
         self.render_agents_panel(f, top_cols[0]);
-        self.render_output_panel(f, top_cols[1]);
+        self.render_stream_panel(f, top_cols[2]);
         self.render_tasks_panel(f, bottom_cols[0]);
-        self.render_logs_panel(f, bottom_cols[1]);
+        self.render_logs_panel(f, bottom_cols[2]);
+
+        // Draw separators
+        self.render_vertical_separator(f, top_cols[1]);
+        self.render_horizontal_separator(f, rows[1]);
+        self.render_vertical_separator(f, bottom_cols[1]);
+    }
+
+    /// Render a vertical separator line
+    fn render_vertical_separator(&self, f: &mut Frame, area: Rect) {
+        let sep: String = (0..area.height).map(|_| "│\n").collect();
+        let widget = Paragraph::new(sep.trim_end())
+            .style(Style::default().fg(self.c().border));
+        f.render_widget(widget, area);
+    }
+
+    /// Render a horizontal separator line
+    fn render_horizontal_separator(&self, f: &mut Frame, area: Rect) {
+        let sep: String = (0..area.width).map(|_| "─").collect();
+        let widget = Paragraph::new(sep)
+            .style(Style::default().fg(self.c().border));
+        f.render_widget(widget, area);
     }
 
     /// Render the agents panel
     fn render_agents_panel(&self, f: &mut Frame, area: Rect) {
         let is_focused = self.focus == Panel::Agents;
-        let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
 
-        let items: Vec<ListItem> = self.agents.items.iter().map(|agent| {
-            let status_style = match agent.status {
-                AgentDisplayStatus::Running => Style::default().fg(theme::SUCCESS),
-                AgentDisplayStatus::Idle => Style::default().fg(theme::DIM),
-                AgentDisplayStatus::Paused => Style::default().fg(theme::WARNING),
-                AgentDisplayStatus::Error => Style::default().fg(theme::ERROR),
-            };
-            let status_icon = match agent.status {
-                AgentDisplayStatus::Running => "▶",
-                AgentDisplayStatus::Idle => "◯",
-                AgentDisplayStatus::Paused => "⏸",
-                AgentDisplayStatus::Error => "✗",
-            };
+        // Build filter info for title
+        let filter_text = match self.agent_filter {
+            AgentFilter::All => "all",
+            AgentFilter::Working => "working",
+            AgentFilter::Idle => "idle",
+            AgentFilter::Waiting => "waiting",
+        };
+
+        // Filter agents
+        let filtered: Vec<&AgentInfo> = self.filtered_agents();
+
+        let items: Vec<ListItem> = filtered.iter().map(|agent| {
+            let status_color = self.agent_status_color(agent.status);
+            let status_symbol = self.agent_status_symbol(agent.status);
 
             let line = Line::from(vec![
-                Span::styled(format!("{} ", status_icon), status_style),
-                Span::styled(&agent.name, Style::default().fg(theme::TEXT)),
-                Span::styled(format!(" ({})", agent.namespace), Style::default().fg(theme::DIM)),
+                Span::styled(format!("{} ", status_symbol), Style::default().fg(status_color)),
+                Span::styled(&agent.name, Style::default().fg(self.c().text)),
+                Span::styled(format!(" ({})", agent.namespace), Style::default().fg(self.c().text_muted)),
             ]);
 
             ListItem::new(vec![
                 line,
                 Line::from(Span::styled(
-                    format!("  {} [{}/{}]", truncate(&agent.current_action, 25), agent.iterations, agent.max_iterations),
-                    Style::default().fg(theme::DIM),
+                    format!("  {} • {}", truncate(&agent.repository, 20), agent.started_at),
+                    Style::default().fg(self.c().text_muted),
                 )),
             ])
         }).collect();
 
+        // Title shows filter and counts
+        let (working, idle, waiting) = self.agent_counts();
+        let title = format!(
+            "Agents [1] {} {}{} {}{} {}{}",
+            filter_text,
+            self.s().working, working,
+            self.s().idle, idle,
+            self.s().waiting, waiting
+        );
+
+        // Render title line
+        let title_area = Rect { height: 1, ..area };
+        let title_widget = Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(title_widget, title_area);
+
+        // Render list below title
+        let list_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " Agents [1] ",
-                        Style::default().fg(if is_focused { theme::PURPLE } else { theme::DIM }).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
-            )
             .highlight_style(
                 Style::default()
-                    .bg(theme::BG_HIGHLIGHT)
+                    .bg(self.c().bg_highlight)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▸ ");
 
-        f.render_stateful_widget(list, area, &mut self.agents.state.clone());
+        f.render_stateful_widget(list, list_area, &mut self.agents.state.clone());
     }
 
-    /// Render the output panel
-    fn render_output_panel(&self, f: &mut Frame, area: Rect) {
-        let is_focused = self.focus == Panel::Output;
-        let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
+    /// Render the stream panel (agent output)
+    fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
+        let is_focused = self.focus == Panel::Stream;
 
-        let title = if let Some(ref agent_id) = self.output.agent_id {
+        let title = if let Some(ref agent_id) = self.stream.agent_id {
             let short_id = if agent_id.len() > 8 {
                 &agent_id[..8]
             } else {
                 agent_id
             };
-            format!(" Output [2] - {} ", short_id)
+            if is_focused {
+                format!("Stream [2] {} │ f: fullscreen", short_id)
+            } else {
+                format!("Stream [2] {}", short_id)
+            }
         } else {
-            " Output [2] ".to_string()
+            "Stream [2]".to_string()
         };
 
-        let inner_height = area.height.saturating_sub(2) as usize;
+        // Render title line
+        let title_area = Rect { height: 1, ..area };
+        let scroll_info = if self.stream.scroll > 0 {
+            format!(" ↑{}", self.stream.scroll)
+        } else {
+            String::new()
+        };
+        let title_line = Line::from(vec![
+            Span::styled(
+                title,
+                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(scroll_info, Style::default().fg(self.c().text_muted)),
+        ]);
+        f.render_widget(Paragraph::new(title_line), title_area);
 
-        if self.output.lines.is_empty() {
-            // Empty state
-            let empty_msg = if self.output.agent_id.is_some() {
+        // Content area below title
+        let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+        let inner_height = content_area.height as usize;
+
+        if self.stream.lines.is_empty() {
+            let empty_msg = if self.stream.agent_id.is_some() {
                 "No output yet..."
             } else {
                 "Select an agent to view output"
             };
-
             let content = Paragraph::new(Line::from(Span::styled(
                 empty_msg,
-                Style::default().fg(theme::DIM),
-            )))
-            .alignment(Alignment::Center)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        &title,
-                        Style::default()
-                            .fg(if is_focused { theme::PURPLE } else { theme::DIM })
-                            .add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
-            );
-
-            f.render_widget(content, area);
+                Style::default().fg(self.c().text_muted),
+            )));
+            f.render_widget(content, content_area);
         } else {
             // Calculate visible range (scroll is from bottom, 0 = at bottom)
-            let total_lines = self.output.lines.len();
-            let end_idx = total_lines.saturating_sub(self.output.scroll);
+            let total_lines = self.stream.lines.len();
+            let end_idx = total_lines.saturating_sub(self.stream.scroll);
             let start_idx = end_idx.saturating_sub(inner_height);
 
-            // Calculate max width for text (panel width minus borders)
-            let max_width = area.width.saturating_sub(2) as usize;
+            let max_width = content_area.width as usize;
 
-            let visible_lines: Vec<Line> = self.output.lines[start_idx..end_idx]
+            let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
                 .map(|line| {
                     let text_style = if line.is_error {
-                        Style::default().fg(theme::ERROR)
+                        Style::default().fg(self.c().error)
                     } else {
-                        Style::default().fg(theme::TEXT)
+                        Style::default().fg(self.c().text)
                     };
 
-                    // Truncate line to fit panel width
                     let display_text = if line.text.len() > max_width {
                         format!("{}…", &line.text[..max_width.saturating_sub(1)])
                     } else {
@@ -1651,49 +2075,104 @@ impl Dashboard {
                 })
                 .collect();
 
-            // Scroll indicator
-            let scroll_info = if self.output.scroll > 0 {
-                format!(" ↑{} ", self.output.scroll)
-            } else if self.output.has_more {
-                " ... ".to_string()
-            } else {
-                String::new()
-            };
-
             let content = Paragraph::new(visible_lines)
-                .block(
-                    Block::default()
-                        .title(Span::styled(
-                            &title,
-                            Style::default()
-                                .fg(if is_focused { theme::PURPLE } else { theme::DIM })
-                                .add_modifier(Modifier::BOLD),
-                        ))
-                        .title_bottom(Line::from(Span::styled(
-                            &scroll_info,
-                            Style::default().fg(theme::DIM),
-                        )).alignment(Alignment::Right))
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(border_color)),
-                )
                 .wrap(ratatui::widgets::Wrap { trim: false });
+            f.render_widget(content, content_area);
+        }
+    }
 
+    /// Render fullscreen stream (no decorations, just output)
+    fn render_fullscreen_stream(&self, f: &mut Frame, area: Rect) {
+        let inner_height = area.height as usize;
+
+        if self.stream.lines.is_empty() {
+            let empty_msg = "No output - press Esc or f to exit fullscreen";
+            let content = Paragraph::new(Line::from(Span::styled(
+                empty_msg,
+                Style::default().fg(self.c().text_muted),
+            )))
+            .alignment(Alignment::Center);
             f.render_widget(content, area);
+            return;
+        }
+
+        // Calculate visible range
+        let total_lines = self.stream.lines.len();
+        let end_idx = total_lines.saturating_sub(self.stream.scroll);
+        let start_idx = end_idx.saturating_sub(inner_height);
+
+        let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
+            .iter()
+            .map(|line| {
+                let style = if line.is_error {
+                    Style::default().fg(self.c().error)
+                } else {
+                    Style::default().fg(self.c().text)
+                };
+                Line::from(Span::styled(&line.text, style))
+            })
+            .collect();
+
+        let content = Paragraph::new(visible_lines)
+            .style(Style::default().bg(self.c().bg))
+            .wrap(ratatui::widgets::Wrap { trim: false });
+
+        f.render_widget(content, area);
+
+        // Show minimal status bar at bottom
+        if self.stream.scroll > 0 {
+            let status = format!(" ↑{} lines | Esc/f: exit fullscreen ", self.stream.scroll);
+            let status_area = Rect {
+                x: area.x,
+                y: area.y + area.height - 1,
+                width: area.width,
+                height: 1,
+            };
+            let status_bar = Paragraph::new(Line::from(Span::styled(
+                status,
+                Style::default().fg(self.c().text_muted).bg(self.c().bg_surface),
+            )))
+            .alignment(Alignment::Right);
+            f.render_widget(status_bar, status_area);
         }
     }
 
     /// Render the tasks panel
     fn render_tasks_panel(&self, f: &mut Frame, area: Rect) {
         let is_focused = self.focus == Panel::Tasks;
-        let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
+
+        let pending = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
+        let running = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+
+        // Collapsed title
+        let collapse_symbol = if self.tasks_collapsed { self.s().collapsed } else { self.s().expanded };
+        let title = format!(
+            "{} Tasks [3] ({} pending, {} running)",
+            collapse_symbol,
+            pending,
+            running
+        );
+
+        // Render title line
+        let title_area = Rect { height: 1, ..area };
+        let title_widget = Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(title_widget, title_area);
+
+        // If collapsed, just render the header
+        if self.tasks_collapsed {
+            return;
+        }
 
         let items: Vec<ListItem> = self.tasks.items.iter().map(|task| {
             let status_style = match task.status {
-                TaskDisplayStatus::Pending => Style::default().fg(theme::DIM),
-                TaskDisplayStatus::Running => Style::default().fg(theme::SUCCESS),
-                TaskDisplayStatus::Paused => Style::default().fg(theme::WARNING),
-                TaskDisplayStatus::Completed => Style::default().fg(theme::INFO),
-                TaskDisplayStatus::Failed => Style::default().fg(theme::ERROR),
+                TaskDisplayStatus::Pending => Style::default().fg(self.c().text_muted),
+                TaskDisplayStatus::Running => Style::default().fg(self.c().success),
+                TaskDisplayStatus::Paused => Style::default().fg(self.c().warning),
+                TaskDisplayStatus::Completed => Style::default().fg(self.c().info),
+                TaskDisplayStatus::Failed => Style::default().fg(self.c().error),
             };
             let status_icon = match task.status {
                 TaskDisplayStatus::Pending => "○",
@@ -1707,58 +2186,76 @@ impl Dashboard {
 
             let line = Line::from(vec![
                 Span::styled(format!("{} ", status_icon), status_style),
-                Span::styled(truncate(&task.goal, 30), Style::default().fg(theme::TEXT)),
+                Span::styled(truncate(&task.goal, 30), Style::default().fg(self.c().text)),
             ]);
 
             ListItem::new(vec![
                 line,
                 Line::from(vec![
-                    Span::styled(format!("  [{}/{}]", task.iterations, task.max_iterations), Style::default().fg(theme::DIM)),
-                    Span::styled(agent_info, Style::default().fg(theme::LIGHT_PURPLE)),
+                    Span::styled(format!("  [{}/{}]", task.iterations, task.max_iterations), Style::default().fg(self.c().text_muted)),
+                    Span::styled(agent_info, Style::default().fg(self.c().accent_bright)),
                 ]),
             ])
         }).collect();
 
+        // Render list below title
+        let list_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " Tasks [2] ",
-                        Style::default().fg(if is_focused { theme::PURPLE } else { theme::DIM }).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
-            )
             .highlight_style(
                 Style::default()
-                    .bg(theme::BG_HIGHLIGHT)
+                    .bg(self.c().bg_highlight)
                     .add_modifier(Modifier::BOLD),
             )
             .highlight_symbol("▸ ");
 
-        f.render_stateful_widget(list, area, &mut self.tasks.state.clone());
+        f.render_stateful_widget(list, list_area, &mut self.tasks.state.clone());
     }
 
     /// Render the logs panel
     fn render_logs_panel(&self, f: &mut Frame, area: Rect) {
         let is_focused = self.focus == Panel::Logs;
-        let border_color = if is_focused { theme::PURPLE } else { theme::BORDER };
 
-        // Calculate available width for message (panel width minus borders and prefix)
+        let errors = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Error)).count();
+
+        // Collapsed title
+        let collapse_symbol = if self.logs_collapsed { self.s().collapsed } else { self.s().expanded };
+        let title = if errors > 0 {
+            format!("{} Logs [4] ({} entries, {} errors)", collapse_symbol, self.logs.entries.len(), errors)
+        } else {
+            format!("{} Logs [4] ({} entries)", collapse_symbol, self.logs.entries.len())
+        };
+
+        // Render title line
+        let title_area = Rect { height: 1, ..area };
+        let title_widget = Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(title_widget, title_area);
+
+        // If collapsed, just render the header
+        if self.logs_collapsed {
+            return;
+        }
+
+        // Content area below title
+        let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+
+        // Calculate available width for message
         // Prefix: "HH:MM:SS ℹ [source] " = timestamp(8) + space(1) + level(2) + source(~10) = ~21 chars
-        let max_msg_width = area.width.saturating_sub(2).saturating_sub(21) as usize;
+        let max_msg_width = content_area.width.saturating_sub(21) as usize;
 
         let visible_logs: Vec<ListItem> = self.logs.entries
             .iter()
             .skip(self.logs.scroll)
-            .take(area.height.saturating_sub(2) as usize)
+            .take(content_area.height as usize)
             .map(|entry| {
                 let level_style = match entry.level {
-                    LogLevel::Info => Style::default().fg(theme::INFO),
-                    LogLevel::Success => Style::default().fg(theme::SUCCESS),
-                    LogLevel::Warning => Style::default().fg(theme::WARNING),
-                    LogLevel::Error => Style::default().fg(theme::ERROR),
-                    LogLevel::Debug => Style::default().fg(theme::DIM),
+                    LogLevel::Info => Style::default().fg(self.c().info),
+                    LogLevel::Success => Style::default().fg(self.c().success),
+                    LogLevel::Warning => Style::default().fg(self.c().warning),
+                    LogLevel::Error => Style::default().fg(self.c().error),
+                    LogLevel::Debug => Style::default().fg(self.c().text_muted),
                 };
                 let level_char = match entry.level {
                     LogLevel::Info => "ℹ",
@@ -1769,41 +2266,32 @@ impl Dashboard {
                 };
 
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{} ", entry.timestamp), Style::default().fg(theme::DIM)),
+                    Span::styled(format!("{} ", entry.timestamp), Style::default().fg(self.c().text_muted)),
                     Span::styled(format!("{} ", level_char), level_style),
-                    Span::styled(format!("[{}] ", entry.source), Style::default().fg(theme::LIGHT_PURPLE)),
-                    Span::styled(truncate(&entry.message, max_msg_width.max(10)), Style::default().fg(theme::TEXT)),
+                    Span::styled(format!("[{}] ", entry.source), Style::default().fg(self.c().accent_bright)),
+                    Span::styled(truncate(&entry.message, max_msg_width.max(10)), Style::default().fg(self.c().text)),
                 ]))
             })
             .collect();
 
-        let list = List::new(visible_logs)
-            .block(
-                Block::default()
-                    .title(Span::styled(
-                        " Logs [3] ",
-                        Style::default().fg(if is_focused { theme::PURPLE } else { theme::DIM }).add_modifier(Modifier::BOLD),
-                    ))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(border_color)),
-            );
-
-        f.render_widget(list, area);
+        let list = List::new(visible_logs);
+        f.render_widget(list, content_area);
     }
 
     /// Render the footer
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         let panel_hint = match self.focus {
             Panel::Agents => "1:Agents",
-            Panel::Output => "2:Output",
+            Panel::Stream => "2:Stream",
             Panel::Tasks => "3:Tasks",
             Panel::Logs => "4:Logs",
         };
+
         let hints = vec![
             ("n", "New"),
-            ("Tab", "Panel"),
+            ("F", "Filter"),
+            ("t/L", "Toggle"),
             (panel_hint, ""),
-            ("↑↓", "Nav"),
             ("?", "Help"),
             ("q", "Quit"),
         ];
@@ -1812,8 +2300,8 @@ impl Dashboard {
             .iter()
             .flat_map(|(key, desc)| {
                 vec![
-                    Span::styled(format!(" {} ", key), Style::default().fg(theme::BG).bg(theme::PURPLE)),
-                    Span::styled(format!(" {}  ", desc), Style::default().fg(theme::DIM)),
+                    Span::styled(format!(" {} ", key), Style::default().fg(self.c().bg).bg(self.c().accent)),
+                    Span::styled(format!(" {}  ", desc), Style::default().fg(self.c().text_muted)),
                 ]
             })
             .collect();
@@ -1828,114 +2316,114 @@ impl Dashboard {
 
         let help_text = vec![
             Line::from(""),
-            Line::from(Span::styled("Navigation", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Navigation", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Tab / Shift+Tab  ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Switch between panels", Style::default().fg(theme::TEXT)),
+                Span::styled("  Tab / Shift+Tab  ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Switch between panels", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  1 / 2 / 3 / 4    ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Jump to panel", Style::default().fg(theme::TEXT)),
+                Span::styled("  1 / 2 / 3 / 4    ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Jump to panel", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  ↑/k  ↓/j         ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Navigate up/down", Style::default().fg(theme::TEXT)),
+                Span::styled("  ↑/k  ↓/j         ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Navigate up/down", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  ←/h  →/l         ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Navigate left/right", Style::default().fg(theme::TEXT)),
+                Span::styled("  ←/h  →/l         ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Navigate left/right", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Enter            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("View details", Style::default().fg(theme::TEXT)),
+                Span::styled("  Enter            ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("View details", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Esc              ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Close popup", Style::default().fg(theme::TEXT)),
+                Span::styled("  Esc              ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Close popup", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Agent Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Agent Actions", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  n                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("New agent (spawn dialog)", Style::default().fg(theme::TEXT)),
+                Span::styled("  n                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("New agent (spawn dialog)", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+K / x / Del ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Kill agent", Style::default().fg(theme::TEXT)),
+                Span::styled("  Ctrl+K / x / Del ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Kill agent", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Ctrl+P / Space   ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Pause/resume agent", Style::default().fg(theme::TEXT)),
+                Span::styled("  Ctrl+P / Space   ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Pause/resume agent", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Task Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Task Actions", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  c / x / Del      ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Cancel task", Style::default().fg(theme::TEXT)),
+                Span::styled("  c / x / Del      ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Cancel task", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Output Panel", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Output Panel", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  g / G            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Scroll to top/bottom", Style::default().fg(theme::TEXT)),
+                Span::styled("  g / G            ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Scroll to top/bottom", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  PgUp / PgDn      ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Page up/down", Style::default().fg(theme::TEXT)),
+                Span::styled("  PgUp / PgDn      ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Page up/down", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Space            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Toggle auto-scroll", Style::default().fg(theme::TEXT)),
+                Span::styled("  Space            ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Toggle auto-scroll", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Approvals", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("Approvals", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  a                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Open approvals popup", Style::default().fg(theme::TEXT)),
+                Span::styled("  a                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Open approvals popup", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  y / Enter        ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Approve selected action", Style::default().fg(theme::TEXT)),
+                Span::styled("  y / Enter        ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Approve selected action", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  n / r            ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Reject selected action", Style::default().fg(theme::TEXT)),
+                Span::styled("  n / r            ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Reject selected action", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  Y                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Approve all pending", Style::default().fg(theme::TEXT)),
+                Span::styled("  Y                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Approve all pending", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("General", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("General", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
             Line::from(vec![
-                Span::styled("  r                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Refresh", Style::default().fg(theme::TEXT)),
+                Span::styled("  r                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Refresh", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  ?                ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Help", Style::default().fg(theme::TEXT)),
+                Span::styled("  ?                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Help", Style::default().fg(self.c().text)),
             ]),
             Line::from(vec![
-                Span::styled("  q / Ctrl+C       ", Style::default().fg(theme::LIGHT_PURPLE)),
-                Span::styled("Quit", Style::default().fg(theme::TEXT)),
+                Span::styled("  q / Ctrl+C       ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Quit", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
-            Line::from(Span::styled("Press Esc or ? to close", Style::default().fg(theme::DIM))),
+            Line::from(Span::styled("Press Esc or ? to close", Style::default().fg(self.c().text_muted))),
         ];
 
         let help = Paragraph::new(help_text)
             .block(
                 Block::default()
-                    .title(Span::styled(" Help ", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                    .title(Span::styled(" Help ", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::PURPLE))
-                    .style(Style::default().bg(theme::BG)),
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
             );
 
         f.render_widget(ratatui::widgets::Clear, popup_area);
@@ -1948,14 +2436,16 @@ impl Dashboard {
 
         let content = if let Some(agent) = self.agents.selected() {
             let status_color = match agent.status {
-                AgentDisplayStatus::Running => theme::SUCCESS,
-                AgentDisplayStatus::Idle => theme::DIM,
-                AgentDisplayStatus::Paused => theme::WARNING,
-                AgentDisplayStatus::Error => theme::ERROR,
+                AgentDisplayStatus::Working => self.c().success,
+                AgentDisplayStatus::Idle => self.c().text_muted,
+                AgentDisplayStatus::Waiting => self.c().warning,
+                AgentDisplayStatus::Paused => self.c().info,
+                AgentDisplayStatus::Error => self.c().error,
             };
             let status_text = match agent.status {
-                AgentDisplayStatus::Running => "Running",
+                AgentDisplayStatus::Working => "Working",
                 AgentDisplayStatus::Idle => "Idle",
+                AgentDisplayStatus::Waiting => "Waiting",
                 AgentDisplayStatus::Paused => "Paused",
                 AgentDisplayStatus::Error => "Error",
             };
@@ -1963,51 +2453,51 @@ impl Dashboard {
             vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  Name:       ", Style::default().fg(theme::DIM)),
-                    Span::styled(&agent.name, Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)),
+                    Span::styled("  Name:       ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&agent.name, Style::default().fg(self.c().text).add_modifier(Modifier::BOLD)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  ID:         ", Style::default().fg(theme::DIM)),
-                    Span::styled(&agent.id, Style::default().fg(theme::LIGHT_PURPLE)),
+                    Span::styled("  ID:         ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&agent.id, Style::default().fg(self.c().accent_bright)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Status:     ", Style::default().fg(theme::DIM)),
+                    Span::styled("  Status:     ", Style::default().fg(self.c().text_muted)),
                     Span::styled(status_text, Style::default().fg(status_color)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Namespace:  ", Style::default().fg(theme::DIM)),
-                    Span::styled(&agent.namespace, Style::default().fg(theme::TEXT)),
+                    Span::styled("  Namespace:  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&agent.namespace, Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Repository: ", Style::default().fg(theme::DIM)),
-                    Span::styled(&agent.repository, Style::default().fg(theme::TEXT)),
+                    Span::styled("  Repository: ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&agent.repository, Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Iterations: ", Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{} / {}", agent.iterations, agent.max_iterations), Style::default().fg(theme::TEXT)),
+                    Span::styled("  Iterations: ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(format!("{} / {}", agent.iterations, agent.max_iterations), Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Started:    ", Style::default().fg(theme::DIM)),
-                    Span::styled(&agent.started_at, Style::default().fg(theme::TEXT)),
+                    Span::styled("  Started:    ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&agent.started_at, Style::default().fg(self.c().text)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled("  Current Action:", Style::default().fg(theme::DIM))),
-                Line::from(Span::styled(format!("  {}", agent.current_action), Style::default().fg(theme::LIGHT_PURPLE))),
+                Line::from(Span::styled("  Current Action:", Style::default().fg(self.c().text_muted))),
+                Line::from(Span::styled(format!("  {}", agent.current_action), Style::default().fg(self.c().accent_bright))),
                 Line::from(""),
                 Line::from(""),
-                Line::from(Span::styled("  [Enter/Esc] Close   [k] Kill   [p] Pause   [a] Attach", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  [Enter/Esc] Close   [k] Kill   [p] Pause   [a] Attach", Style::default().fg(self.c().text_muted))),
             ]
         } else {
-            vec![Line::from(Span::styled("No agent selected", Style::default().fg(theme::DIM)))]
+            vec![Line::from(Span::styled("No agent selected", Style::default().fg(self.c().text_muted)))]
         };
 
         let details = Paragraph::new(content)
             .block(
                 Block::default()
-                    .title(Span::styled(" Agent Details ", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                    .title(Span::styled(" Agent Details ", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::PURPLE))
-                    .style(Style::default().bg(theme::BG)),
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
             );
 
         f.render_widget(ratatui::widgets::Clear, popup_area);
@@ -2020,11 +2510,11 @@ impl Dashboard {
 
         let content = if let Some(task) = self.tasks.selected() {
             let status_color = match task.status {
-                TaskDisplayStatus::Pending => theme::DIM,
-                TaskDisplayStatus::Running => theme::SUCCESS,
-                TaskDisplayStatus::Paused => theme::WARNING,
-                TaskDisplayStatus::Completed => theme::INFO,
-                TaskDisplayStatus::Failed => theme::ERROR,
+                TaskDisplayStatus::Pending => self.c().text_muted,
+                TaskDisplayStatus::Running => self.c().success,
+                TaskDisplayStatus::Paused => self.c().warning,
+                TaskDisplayStatus::Completed => self.c().info,
+                TaskDisplayStatus::Failed => self.c().error,
             };
             let status_text = match task.status {
                 TaskDisplayStatus::Pending => "Pending",
@@ -2037,51 +2527,263 @@ impl Dashboard {
             vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  ID:         ", Style::default().fg(theme::DIM)),
-                    Span::styled(&task.id, Style::default().fg(theme::LIGHT_PURPLE)),
+                    Span::styled("  ID:         ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&task.id, Style::default().fg(self.c().accent_bright)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Status:     ", Style::default().fg(theme::DIM)),
+                    Span::styled("  Status:     ", Style::default().fg(self.c().text_muted)),
                     Span::styled(status_text, Style::default().fg(status_color)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Namespace:  ", Style::default().fg(theme::DIM)),
-                    Span::styled(task.namespace.as_deref().unwrap_or("-"), Style::default().fg(theme::TEXT)),
+                    Span::styled("  Namespace:  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(task.namespace.as_deref().unwrap_or("-"), Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Agent:      ", Style::default().fg(theme::DIM)),
-                    Span::styled(task.agent.as_deref().unwrap_or("-"), Style::default().fg(theme::TEXT)),
+                    Span::styled("  Agent:      ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(task.agent.as_deref().unwrap_or("-"), Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Iterations: ", Style::default().fg(theme::DIM)),
-                    Span::styled(format!("{} / {}", task.iterations, task.max_iterations), Style::default().fg(theme::TEXT)),
+                    Span::styled("  Iterations: ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(format!("{} / {}", task.iterations, task.max_iterations), Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Created:    ", Style::default().fg(theme::DIM)),
-                    Span::styled(&task.created, Style::default().fg(theme::TEXT)),
+                    Span::styled("  Created:    ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(&task.created, Style::default().fg(self.c().text)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled("  Goal:", Style::default().fg(theme::DIM))),
-                Line::from(Span::styled(format!("  {}", task.goal), Style::default().fg(theme::LIGHT_PURPLE))),
+                Line::from(Span::styled("  Goal:", Style::default().fg(self.c().text_muted))),
+                Line::from(Span::styled(format!("  {}", task.goal), Style::default().fg(self.c().accent_bright))),
                 Line::from(""),
                 Line::from(""),
-                Line::from(Span::styled("  [Enter/Esc] Close   [r] Resume   [c] Cancel   [v] View Checkpoint", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  [Enter/Esc] Close   [r] Resume   [c] Cancel   [v] View Checkpoint", Style::default().fg(self.c().text_muted))),
             ]
         } else {
-            vec![Line::from(Span::styled("No task selected", Style::default().fg(theme::DIM)))]
+            vec![Line::from(Span::styled("No task selected", Style::default().fg(self.c().text_muted)))]
         };
 
         let details = Paragraph::new(content)
             .block(
                 Block::default()
-                    .title(Span::styled(" Task Details ", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                    .title(Span::styled(" Task Details ", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::PURPLE))
-                    .style(Style::default().bg(theme::BG)),
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
             );
 
         f.render_widget(ratatui::widgets::Clear, popup_area);
         f.render_widget(details, popup_area);
+    }
+
+    /// Render setup wizard
+    fn render_setup_wizard(&self, f: &mut Frame, area: Rect) {
+        let popup_area = centered_rect(60, 60, area);
+
+        let content = match self.setup_wizard.step {
+            SetupStep::Welcome => {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Welcome to Kage!",
+                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  影 Shadow agents for autonomous code work",
+                        Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC),
+                    )),
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Before you can spawn agents, you need to configure",
+                        Style::default().fg(self.c().text),
+                    )),
+                    Line::from(Span::styled(
+                        "  your Claude Code API credentials.",
+                        Style::default().fg(self.c().text),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  This wizard will help you set up:",
+                        Style::default().fg(self.c().text),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "    • Claude API subscription",
+                        Style::default().fg(self.c().accent_bright),
+                    )),
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
+                        Span::styled(" Continue  ", Style::default().fg(self.c().text_muted)),
+                        Span::styled(" s/Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
+                        Span::styled(" Skip setup", Style::default().fg(self.c().text_muted)),
+                    ]),
+                ]
+            }
+            SetupStep::AddApiKey => {
+                let name_focused = self.setup_wizard.focus == 0;
+                let key_focused = self.setup_wizard.focus == 1;
+
+                let name_style = if name_focused {
+                    Style::default().fg(self.c().accent)
+                } else {
+                    Style::default().fg(self.c().text_muted)
+                };
+                let name_value_style = if name_focused {
+                    Style::default().fg(self.c().text).bg(self.c().bg_highlight)
+                } else {
+                    Style::default().fg(self.c().text)
+                };
+
+                let key_style = if key_focused {
+                    Style::default().fg(self.c().accent)
+                } else {
+                    Style::default().fg(self.c().text_muted)
+                };
+                let key_value_style = if key_focused {
+                    Style::default().fg(self.c().text).bg(self.c().bg_highlight)
+                } else {
+                    Style::default().fg(self.c().text)
+                };
+
+                // Show name with cursor if focused
+                let name_display = if name_focused {
+                    let cursor = self.setup_wizard.cursor;
+                    let name = &self.setup_wizard.sub_name;
+                    if cursor < name.len() {
+                        format!("  {}│{}", &name[..cursor], &name[cursor..])
+                    } else {
+                        format!("  {}│", name)
+                    }
+                } else {
+                    format!("  {}", self.setup_wizard.sub_name)
+                };
+
+                // Show API key masked with cursor if focused
+                let masked_key: String = "*".repeat(self.setup_wizard.api_key.len());
+                let key_display = if key_focused {
+                    let cursor = self.setup_wizard.cursor;
+                    if cursor < masked_key.len() {
+                        format!("  {}│{}", &masked_key[..cursor], &masked_key[cursor..])
+                    } else {
+                        format!("  {}│", masked_key)
+                    }
+                } else if masked_key.is_empty() {
+                    "  (paste your API key)".to_string()
+                } else {
+                    format!("  {}", masked_key)
+                };
+
+                let key_display_style = if self.setup_wizard.api_key.is_empty() && !key_focused {
+                    Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
+                } else {
+                    key_value_style
+                };
+
+                let can_submit = self.setup_wizard.is_valid();
+                let submit_style = if can_submit {
+                    Style::default().fg(self.c().bg).bg(self.c().success)
+                } else {
+                    Style::default().fg(self.c().text_muted).bg(self.c().bg_highlight)
+                };
+
+                let mut lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Add Claude Subscription",
+                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Your API key will be stored securely in your OS keychain.",
+                        Style::default().fg(self.c().text_muted),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled("  Name:", name_style)),
+                    Line::from(Span::styled(name_display, name_value_style)),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  API Key: ", key_style),
+                        Span::styled("*", Style::default().fg(self.c().error)),
+                    ]),
+                    Line::from(Span::styled(key_display, key_display_style)),
+                    Line::from(""),
+                ];
+
+                if let Some(ref error) = self.setup_wizard.error {
+                    lines.push(Line::from(Span::styled(
+                        format!("  Error: {}", error),
+                        Style::default().fg(self.c().error),
+                    )));
+                    lines.push(Line::from(""));
+                }
+
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled(" Tab ", Style::default().fg(self.c().bg).bg(self.c().accent)),
+                    Span::styled(" Switch field  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(" Enter ", submit_style),
+                    Span::styled(" Save  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(" Esc ", Style::default().fg(self.c().bg).bg(self.c().warning)),
+                    Span::styled(" Skip", Style::default().fg(self.c().text_muted)),
+                ]));
+
+                lines
+            }
+            SetupStep::Complete => {
+                vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  ✓ Setup Complete!",
+                        Style::default().fg(self.c().success).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Your subscription has been added successfully.",
+                        Style::default().fg(self.c().text),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  You can now spawn agents to work on your code.",
+                        Style::default().fg(self.c().text),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Press 'n' to spawn your first agent!",
+                        Style::default().fg(self.c().accent_bright),
+                    )),
+                    Line::from(""),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(" Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
+                        Span::styled(" Continue to Dashboard", Style::default().fg(self.c().text_muted)),
+                    ]),
+                ]
+            }
+        };
+
+        let title = match self.setup_wizard.step {
+            SetupStep::Welcome => " First-Time Setup ",
+            SetupStep::AddApiKey => " Step 1: API Key ",
+            SetupStep::Complete => " Setup Complete ",
+        };
+
+        let dialog = Paragraph::new(content)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        title,
+                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
+            );
+
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+        f.render_widget(dialog, popup_area);
     }
 
     /// Render spawn agent dialog
@@ -2093,7 +2795,7 @@ impl Dashboard {
             Line::from(""),
             Line::from(Span::styled(
                 "  Spawn a new Claude Code agent to work on a task.",
-                Style::default().fg(theme::DIM),
+                Style::default().fg(self.c().text_muted),
             )),
             Line::from(""),
         ];
@@ -2101,14 +2803,14 @@ impl Dashboard {
         // Repository field
         let repo_focused = self.spawn_dialog.focus == 0;
         let repo_style = if repo_focused {
-            Style::default().fg(theme::PURPLE)
+            Style::default().fg(self.c().accent)
         } else {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(self.c().text_muted)
         };
         let repo_value_style = if repo_focused {
-            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+            Style::default().fg(self.c().text).bg(self.c().bg_highlight)
         } else {
-            Style::default().fg(theme::TEXT)
+            Style::default().fg(self.c().text)
         };
 
         lines.push(Line::from(vec![
@@ -2133,19 +2835,19 @@ impl Dashboard {
         // Prompt field (required)
         let prompt_focused = self.spawn_dialog.focus == 1;
         let prompt_style = if prompt_focused {
-            Style::default().fg(theme::PURPLE)
+            Style::default().fg(self.c().accent)
         } else {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(self.c().text_muted)
         };
         let prompt_value_style = if prompt_focused {
-            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+            Style::default().fg(self.c().text).bg(self.c().bg_highlight)
         } else {
-            Style::default().fg(theme::TEXT)
+            Style::default().fg(self.c().text)
         };
 
         lines.push(Line::from(vec![
             Span::styled("  Prompt: ", prompt_style),
-            Span::styled("*", Style::default().fg(theme::ERROR)),
+            Span::styled("*", Style::default().fg(self.c().error)),
         ]));
 
         // Show prompt value with cursor if focused
@@ -2163,7 +2865,7 @@ impl Dashboard {
             format!("  {}", self.spawn_dialog.prompt)
         };
         let prompt_display_style = if self.spawn_dialog.prompt.is_empty() && !prompt_focused {
-            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+            Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
         } else {
             prompt_value_style
         };
@@ -2173,19 +2875,19 @@ impl Dashboard {
         // Namespace field (optional)
         let ns_focused = self.spawn_dialog.focus == 2;
         let ns_style = if ns_focused {
-            Style::default().fg(theme::PURPLE)
+            Style::default().fg(self.c().accent)
         } else {
-            Style::default().fg(theme::DIM)
+            Style::default().fg(self.c().text_muted)
         };
         let ns_value_style = if ns_focused {
-            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+            Style::default().fg(self.c().text).bg(self.c().bg_highlight)
         } else {
-            Style::default().fg(theme::TEXT)
+            Style::default().fg(self.c().text)
         };
 
         lines.push(Line::from(vec![
             Span::styled("  Namespace: ", ns_style),
-            Span::styled("(optional)", Style::default().fg(theme::DIM)),
+            Span::styled("(optional)", Style::default().fg(self.c().text_muted)),
         ]));
 
         // Show namespace value with cursor if focused
@@ -2203,7 +2905,7 @@ impl Dashboard {
             format!("  {}", self.spawn_dialog.namespace)
         };
         let ns_display_style = if self.spawn_dialog.namespace.is_empty() && !ns_focused {
-            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+            Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
         } else {
             ns_value_style
         };
@@ -2214,18 +2916,18 @@ impl Dashboard {
         // Footer hints
         let can_submit = self.spawn_dialog.is_valid();
         let submit_style = if can_submit {
-            Style::default().fg(theme::BG).bg(theme::SUCCESS)
+            Style::default().fg(self.c().bg).bg(self.c().success)
         } else {
-            Style::default().fg(theme::DIM).bg(theme::BG_HIGHLIGHT)
+            Style::default().fg(self.c().text_muted).bg(self.c().bg_highlight)
         };
 
         lines.push(Line::from(vec![
-            Span::styled(" Tab ", Style::default().fg(theme::BG).bg(theme::PURPLE)),
-            Span::styled(" Next field  ", Style::default().fg(theme::DIM)),
+            Span::styled(" Tab ", Style::default().fg(self.c().bg).bg(self.c().accent)),
+            Span::styled(" Next field  ", Style::default().fg(self.c().text_muted)),
             Span::styled(" Enter ", submit_style),
-            Span::styled(" Spawn  ", Style::default().fg(theme::DIM)),
-            Span::styled(" Esc ", Style::default().fg(theme::BG).bg(theme::ERROR)),
-            Span::styled(" Cancel", Style::default().fg(theme::DIM)),
+            Span::styled(" Spawn  ", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Esc ", Style::default().fg(self.c().bg).bg(self.c().error)),
+            Span::styled(" Cancel", Style::default().fg(self.c().text_muted)),
         ]));
 
         let dialog = Paragraph::new(lines)
@@ -2233,11 +2935,11 @@ impl Dashboard {
                 Block::default()
                     .title(Span::styled(
                         " New Agent ",
-                        Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+                        Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
                     ))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::PURPLE))
-                    .style(Style::default().bg(theme::BG)),
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
             );
 
         f.render_widget(ratatui::widgets::Clear, popup_area);
@@ -2268,13 +2970,13 @@ impl Dashboard {
 
             ListItem::new(vec![
                 Line::from(vec![
-                    Span::styled("⚠ ", Style::default().fg(theme::WARNING)),
-                    Span::styled(truncate(&approval.summary, 50), Style::default().fg(theme::TEXT)),
+                    Span::styled("⚠ ", Style::default().fg(self.c().warning)),
+                    Span::styled(truncate(&approval.summary, 50), Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled(format!("  Agent: {} ", short_agent), Style::default().fg(theme::LIGHT_PURPLE)),
-                    Span::styled(format!("ID: {} ", short_id), Style::default().fg(theme::DIM)),
-                    Span::styled(&approval.created, Style::default().fg(theme::DIM)),
+                    Span::styled(format!("  Agent: {} ", short_agent), Style::default().fg(self.c().accent_bright)),
+                    Span::styled(format!("ID: {} ", short_id), Style::default().fg(self.c().text_muted)),
+                    Span::styled(&approval.created, Style::default().fg(self.c().text_muted)),
                 ]),
             ])
         }).collect();
@@ -2282,20 +2984,20 @@ impl Dashboard {
         if items.is_empty() {
             let content = Paragraph::new(vec![
                 Line::from(""),
-                Line::from(Span::styled("  No pending approvals", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  No pending approvals", Style::default().fg(self.c().text_muted))),
                 Line::from(""),
-                Line::from(Span::styled("  Agents will request approval for file writes, git commits,", Style::default().fg(theme::DIM))),
-                Line::from(Span::styled("  and other sensitive actions based on the approval level.", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  Agents will request approval for file writes, git commits,", Style::default().fg(self.c().text_muted))),
+                Line::from(Span::styled("  and other sensitive actions based on the approval level.", Style::default().fg(self.c().text_muted))),
                 Line::from(""),
                 Line::from(""),
-                Line::from(Span::styled("  [Esc/a] Close", Style::default().fg(theme::DIM))),
+                Line::from(Span::styled("  [Esc/a] Close", Style::default().fg(self.c().text_muted))),
             ])
             .block(
                 Block::default()
-                    .title(Span::styled(&title, Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                    .title(Span::styled(&title, Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)))
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(theme::PURPLE))
-                    .style(Style::default().bg(theme::BG)),
+                    .border_style(Style::default().fg(self.c().accent))
+                    .style(Style::default().bg(self.c().bg)),
             );
 
             f.render_widget(ratatui::widgets::Clear, popup_area);
@@ -2313,30 +3015,30 @@ impl Dashboard {
             let list = List::new(items)
                 .block(
                     Block::default()
-                        .title(Span::styled(&title, Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD)))
+                        .title(Span::styled(&title, Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)))
                         .borders(Borders::ALL)
-                        .border_style(Style::default().fg(theme::PURPLE))
-                        .style(Style::default().bg(theme::BG)),
+                        .border_style(Style::default().fg(self.c().accent))
+                        .style(Style::default().bg(self.c().bg)),
                 )
                 .highlight_style(
                     Style::default()
-                        .bg(theme::BG_HIGHLIGHT)
+                        .bg(self.c().bg_highlight)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("▸ ");
 
             let footer = Paragraph::new(Line::from(vec![
-                Span::styled(" y/Enter ", Style::default().fg(theme::BG).bg(theme::SUCCESS)),
-                Span::styled(" Approve  ", Style::default().fg(theme::DIM)),
-                Span::styled(" n/r ", Style::default().fg(theme::BG).bg(theme::ERROR)),
-                Span::styled(" Reject  ", Style::default().fg(theme::DIM)),
-                Span::styled(" Y ", Style::default().fg(theme::BG).bg(theme::WARNING)),
-                Span::styled(" Approve All  ", Style::default().fg(theme::DIM)),
-                Span::styled(" Esc ", Style::default().fg(theme::BG).bg(theme::PURPLE)),
-                Span::styled(" Close", Style::default().fg(theme::DIM)),
+                Span::styled(" y/Enter ", Style::default().fg(self.c().bg).bg(self.c().success)),
+                Span::styled(" Approve  ", Style::default().fg(self.c().text_muted)),
+                Span::styled(" n/r ", Style::default().fg(self.c().bg).bg(self.c().error)),
+                Span::styled(" Reject  ", Style::default().fg(self.c().text_muted)),
+                Span::styled(" Y ", Style::default().fg(self.c().bg).bg(self.c().warning)),
+                Span::styled(" Approve All  ", Style::default().fg(self.c().text_muted)),
+                Span::styled(" Esc ", Style::default().fg(self.c().bg).bg(self.c().accent)),
+                Span::styled(" Close", Style::default().fg(self.c().text_muted)),
             ]))
             .alignment(Alignment::Center)
-            .block(Block::default().style(Style::default().bg(theme::BG)));
+            .block(Block::default().style(Style::default().bg(self.c().bg)));
 
             f.render_widget(ratatui::widgets::Clear, popup_area);
             f.render_stateful_widget(list, chunks[0], &mut self.approvals.state.clone());
@@ -2413,6 +3115,9 @@ async fn data_fetcher(
     // Pending actions to process
     let mut pending_actions: Vec<Action> = Vec::new();
 
+    // Track if we've checked subscriptions on startup
+    let mut checked_subscriptions = false;
+
     loop {
         // Collect all pending actions (non-blocking)
         while let Ok(action) = action_rx.try_recv() {
@@ -2435,6 +3140,20 @@ async fn data_fetcher(
                     version: None,
                     uptime_secs: None,
                 });
+
+                // Check subscriptions on first connection
+                if !checked_subscriptions {
+                    match client.list_subscriptions().await {
+                        Ok(Response::SubscriptionList { subscriptions }) => {
+                            let _ = tx.send(DataUpdate::SubscriptionCount(subscriptions.len()));
+                        }
+                        _ => {
+                            // Assume no subscriptions if we can't fetch
+                            let _ = tx.send(DataUpdate::SubscriptionCount(0));
+                        }
+                    }
+                    checked_subscriptions = true;
+                }
 
                 // Process pending actions
                 for action in pending_actions.drain(..) {
@@ -2486,6 +3205,22 @@ async fn data_fetcher(
                         Action::Reject { id } => {
                             if let Ok(approval_id) = id.parse::<crate::task::ApprovalId>() {
                                 let _ = client.reject(approval_id, None).await;
+                            }
+                        }
+                        Action::AddSubscription { name, api_key } => {
+                            match client.add_subscription(name.clone(), api_key).await {
+                                Ok(_) => {
+                                    let _ = tx.send(DataUpdate::SubscriptionAdded {
+                                        success: true,
+                                        error: None,
+                                    });
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(DataUpdate::SubscriptionAdded {
+                                        success: false,
+                                        error: Some(e.to_string()),
+                                    });
+                                }
                             }
                         }
                     }
@@ -2670,14 +3405,14 @@ mod tests {
 
     #[test]
     fn test_panel_navigation() {
-        assert_eq!(Panel::Agents.next(), Panel::Output);
-        assert_eq!(Panel::Output.next(), Panel::Tasks);
+        assert_eq!(Panel::Agents.next(), Panel::Stream);
+        assert_eq!(Panel::Stream.next(), Panel::Tasks);
         assert_eq!(Panel::Tasks.next(), Panel::Logs);
         assert_eq!(Panel::Logs.next(), Panel::Agents);
 
         assert_eq!(Panel::Agents.prev(), Panel::Logs);
-        assert_eq!(Panel::Output.prev(), Panel::Agents);
-        assert_eq!(Panel::Tasks.prev(), Panel::Output);
+        assert_eq!(Panel::Stream.prev(), Panel::Agents);
+        assert_eq!(Panel::Tasks.prev(), Panel::Stream);
         assert_eq!(Panel::Logs.prev(), Panel::Tasks);
     }
 

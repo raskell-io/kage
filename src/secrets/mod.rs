@@ -219,6 +219,157 @@ pub fn get_with_fallback(name: &str, repo: Option<&str>, namespace: Option<&str>
     get(name, &SecretScope::Global)
 }
 
+/// Claude Code authentication info
+#[derive(Debug, Clone)]
+pub struct ClaudeCodeAuth {
+    /// OAuth access token (sk-ant-oat01-...)
+    pub access_token: String,
+    /// Account email address
+    pub email: Option<String>,
+    /// Display name
+    pub display_name: Option<String>,
+    /// Organization name
+    pub organization: Option<String>,
+}
+
+/// Detect if Claude Code is already authenticated
+///
+/// Checks the macOS Keychain for "Claude Code-credentials" and
+/// reads account info from ~/.claude.json
+pub fn detect_claude_code_auth() -> Option<ClaudeCodeAuth> {
+    // Try to get token from keychain
+    let token = get_claude_code_token()?;
+
+    // Try to get account info from config
+    let (email, display_name, organization) = get_claude_code_account_info();
+
+    Some(ClaudeCodeAuth {
+        access_token: token,
+        email,
+        display_name,
+        organization,
+    })
+}
+
+/// Get Claude Code OAuth token from system keychain
+fn get_claude_code_token() -> Option<String> {
+    // On macOS, use the security command directly to avoid keychain authorization dialogs
+    // that can block when running in a non-interactive context
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w", // Output just the password
+            ])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            tracing::debug!("Claude Code credentials not found in keychain");
+            return None;
+        }
+
+        let json_str = String::from_utf8(output.stdout).ok()?;
+
+        // Parse JSON to extract access token
+        // Format: {"claudeAiOauth":{"accessToken":"sk-ant-oat01-...",...}}
+        let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+        let token = json
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()?
+            .to_string();
+
+        // Verify it looks like a valid token
+        if token.starts_with("sk-ant-") {
+            tracing::debug!("Found Claude Code OAuth token");
+            Some(token)
+        } else {
+            tracing::debug!("Claude Code token has unexpected format");
+            None
+        }
+    }
+
+    // On other platforms, use the keyring crate
+    #[cfg(not(target_os = "macos"))]
+    {
+        let username = whoami::username();
+
+        let entry = keyring::Entry::new("Claude Code-credentials", &username).ok()?;
+
+        let json_str = match entry.get_password() {
+            Ok(s) => s,
+            Err(keyring::Error::NoEntry) => return None,
+            Err(e) => {
+                tracing::debug!("Keyring error: {:?}", e);
+                return None;
+            }
+        };
+
+        // Parse JSON to extract access token
+        let json: serde_json::Value = serde_json::from_str(&json_str).ok()?;
+        let token = json
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()?
+            .to_string();
+
+        if token.starts_with("sk-ant-") {
+            Some(token)
+        } else {
+            None
+        }
+    }
+}
+
+/// Get Claude Code account info from ~/.claude.json
+fn get_claude_code_account_info() -> (Option<String>, Option<String>, Option<String>) {
+    let home = std::env::var("HOME").ok();
+    let config_path = home.map(|h| std::path::PathBuf::from(h).join(".claude.json"));
+
+    let config_path = match config_path {
+        Some(p) if p.exists() => p,
+        _ => return (None, None, None),
+    };
+
+    let content = std::fs::read_to_string(&config_path).ok();
+    let json: serde_json::Value = content
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let oauth = json.get("oauthAccount");
+
+    let email = oauth
+        .and_then(|o| o.get("emailAddress"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let display_name = oauth
+        .and_then(|o| o.get("displayName"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let organization = oauth
+        .and_then(|o| o.get("organizationName"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    (email, display_name, organization)
+}
+
+/// Mask a token for display (show first and last few chars)
+pub fn mask_token(token: &str) -> String {
+    if token.len() < 20 {
+        return "***".to_string();
+    }
+    let prefix = &token[..12];
+    let suffix = &token[token.len() - 4..];
+    format!("{}...{}", prefix, suffix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

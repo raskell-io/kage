@@ -577,7 +577,11 @@ pub enum ServerCommands {
 pub async fn run(cmd: Commands) -> Result<()> {
     match cmd {
         #[cfg(feature = "tui")]
-        Commands::Dashboard => crate::tui::dashboard::run().await,
+        Commands::Dashboard => {
+            // Ensure daemon is running before launching dashboard
+            crate::daemon::client::ensure_running().await?;
+            crate::tui::dashboard::run().await
+        }
 
         Commands::Daemon { command } => commands::daemon::run(command).await,
         Commands::Agent { command } => commands::agent::run(command).await,

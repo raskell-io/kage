@@ -318,6 +318,21 @@ impl SubscriptionPool {
     pub fn registry(&self) -> &Arc<SubscriptionRegistry> {
         &self.registry
     }
+
+    /// List all subscriptions (delegates to registry)
+    pub fn list_subscriptions(&self) -> Vec<Subscription> {
+        self.registry.list()
+    }
+
+    /// Add a subscription (delegates to registry)
+    pub fn add_subscription(&self, subscription: Subscription) -> Result<SubscriptionId> {
+        self.registry.add(subscription)
+    }
+
+    /// Get subscription count
+    pub fn subscription_count(&self) -> usize {
+        self.registry.count()
+    }
 }
 
 /// Status summary of the subscription pool

@@ -69,6 +69,7 @@ walkdir = "2.4"
 
 # Secrets (OS keychain)
 keyring = "2.3"
+whoami = "1.5"                        # Get username for keychain access
 
 # Regex for pattern matching
 regex = "1.10"

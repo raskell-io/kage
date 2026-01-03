@@ -865,6 +865,31 @@ async fn handle_request(
             Some(Response::Ok)
         }
 
+        Request::ListSubscriptions => {
+            let sup = supervisor.read().await;
+            let subscriptions = sup.list_subscriptions();
+            Some(Response::SubscriptionList {
+                subscriptions: subscriptions
+                    .into_iter()
+                    .map(|s| protocol::SubscriptionInfo {
+                        name: s.name,
+                        provider: format!("{:?}", s.provider),
+                        status: format!("{:?}", s.status),
+                    })
+                    .collect(),
+            })
+        }
+
+        Request::AddSubscription { name, api_key } => {
+            let mut sup = supervisor.write().await;
+            match sup.add_subscription(name.clone(), api_key) {
+                Ok(_) => Some(Response::SubscriptionAdded { name }),
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
         Request::QueryMemory {
             text,
             scope,

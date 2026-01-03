@@ -107,6 +107,38 @@ impl Supervisor {
         self.subscription_pool.as_ref()
     }
 
+    /// List all subscriptions
+    pub fn list_subscriptions(&self) -> Vec<crate::subscription::Subscription> {
+        if let Some(ref pool) = self.subscription_pool {
+            pool.list_subscriptions()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Add a new subscription
+    pub fn add_subscription(&mut self, name: String, api_key: String) -> Result<()> {
+        use crate::subscription::{ProviderType, Subscription};
+        use crate::secrets::{SecretScope, set as set_secret};
+
+        // Store API key in keychain
+        let key_name = format!("subscription:{}", name);
+        set_secret(&key_name, &api_key, &SecretScope::Global)?;
+
+        // Create subscription (name, api_key_ref) then set provider
+        let subscription = Subscription::new(&name, &key_name)
+            .with_provider(ProviderType::ClaudeCode);
+
+        // Add to pool/registry
+        if let Some(ref pool) = self.subscription_pool {
+            pool.add_subscription(subscription)?;
+            tracing::info!("Added subscription: {}", name);
+            Ok(())
+        } else {
+            anyhow::bail!("Subscription pool not initialized")
+        }
+    }
+
     /// Spawn a new agent
     pub async fn spawn(
         &mut self,

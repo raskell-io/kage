@@ -25,7 +25,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::secrets::{self, SecretScope};
+use crate::secrets::{self, ClaudeCodeAuth, SecretScope};
 
 /// Purple theme colors matching the mascot
 mod theme {
@@ -77,6 +77,10 @@ pub struct OnboardingWizard {
     success_message: Option<String>,
     /// Whether wizard completed successfully
     completed: bool,
+    /// Detected Claude Code authentication (if any)
+    detected_auth: Option<ClaudeCodeAuth>,
+    /// Whether user wants to use detected auth
+    use_detected_auth: bool,
 }
 
 /// Wizard steps
@@ -200,6 +204,10 @@ impl Default for OnboardingWizard {
 impl OnboardingWizard {
     /// Create a new onboarding wizard
     pub fn new() -> Self {
+        // Try to detect existing Claude Code authentication
+        let detected_auth = secrets::detect_claude_code_auth();
+        let use_detected = detected_auth.is_some();
+
         Self {
             current_step: WizardStep::Welcome,
             api_key_input: String::new(),
@@ -210,6 +218,8 @@ impl OnboardingWizard {
             error_message: None,
             success_message: None,
             completed: false,
+            detected_auth,
+            use_detected_auth: use_detected,
         }
     }
 
@@ -302,12 +312,29 @@ impl OnboardingWizard {
     fn handle_api_key_input(&mut self, key: KeyCode) -> InputResult {
         match key {
             KeyCode::Enter => {
-                if self.api_key_input.is_empty() {
+                // If using detected auth and no manual input, use detected token
+                if self.use_detected_auth && self.api_key_input.is_empty() {
+                    if let Some(ref auth) = self.detected_auth {
+                        match secrets::set(
+                            "ANTHROPIC_API_KEY",
+                            &auth.access_token,
+                            &SecretScope::Global,
+                        ) {
+                            Ok(()) => {
+                                self.success_message = Some("Claude Code credential added to pool!".into());
+                                self.current_step = WizardStep::Namespace;
+                            }
+                            Err(e) => {
+                                self.error_message = Some(format!("Failed to save: {}", e));
+                            }
+                        }
+                    }
+                } else if self.api_key_input.is_empty() {
                     self.error_message = Some("API key cannot be empty. Press 's' to skip.".into());
                 } else if self.api_key_input.len() < 10 {
                     self.error_message = Some("API key seems too short.".into());
                 } else {
-                    // Try to store the API key
+                    // Try to store the manually entered API key
                     match secrets::set(
                         "ANTHROPIC_API_KEY",
                         &self.api_key_input,
@@ -323,17 +350,32 @@ impl OnboardingWizard {
                     }
                 }
             }
-            KeyCode::Char('s') if self.api_key_input.is_empty() => {
+            KeyCode::Char('s') if self.api_key_input.is_empty() && !self.use_detected_auth => {
                 self.skip_api_key = true;
                 self.current_step = WizardStep::Namespace;
+            }
+            KeyCode::Char('d') if self.detected_auth.is_some() => {
+                // Toggle between detected and manual input
+                self.use_detected_auth = !self.use_detected_auth;
+                if self.use_detected_auth {
+                    self.api_key_input.clear();
+                }
             }
             KeyCode::Char('t') => {
                 self.api_key_masked = !self.api_key_masked;
             }
             KeyCode::Backspace => {
                 self.api_key_input.pop();
+                // If user starts typing, switch to manual mode
+                if self.use_detected_auth && !self.api_key_input.is_empty() {
+                    self.use_detected_auth = false;
+                }
             }
             KeyCode::Char(c) if !c.is_control() => {
+                // If user starts typing, switch to manual mode
+                if self.use_detected_auth {
+                    self.use_detected_auth = false;
+                }
                 self.api_key_input.push(c);
             }
             KeyCode::Left => {
@@ -615,6 +657,126 @@ impl OnboardingWizard {
 
     /// Render API key setup screen
     fn render_api_key(&self, f: &mut Frame, area: Rect) {
+        // Different layout if we detected Claude Code auth
+        if let Some(ref auth) = self.detected_auth {
+            self.render_api_key_with_detected(f, area, auth);
+        } else {
+            self.render_api_key_manual(f, area);
+        }
+    }
+
+    /// Render API key screen when Claude Code auth is detected
+    fn render_api_key_with_detected(&self, f: &mut Frame, area: Rect, auth: &ClaudeCodeAuth) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(4),  // Title
+                Constraint::Length(8),  // Detected info
+                Constraint::Length(5),  // Input/Confirm
+                Constraint::Min(4),     // Info
+            ])
+            .margin(2)
+            .split(area);
+
+        // Title - show success that we found credentials
+        let title = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "✓ Claude Code Detected",
+                Style::default().fg(theme::SUCCESS).add_modifier(Modifier::BOLD),
+            )),
+        ])
+        .alignment(Alignment::Center);
+        f.render_widget(title, chunks[0]);
+
+        // Show detected account info
+        let account_name = auth.display_name.as_deref().unwrap_or("Unknown");
+        let account_email = auth.email.as_deref().unwrap_or("unknown@example.com");
+        let masked_token = secrets::mask_token(&auth.access_token);
+
+        let detected_info = vec![
+            Line::from(Span::styled(
+                "Found existing Claude Code authentication:",
+                Style::default().fg(theme::TEXT),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Account:  ", Style::default().fg(theme::DIM)),
+                Span::styled(account_name, Style::default().fg(theme::SPARKLE)),
+                Span::styled(format!(" ({})", account_email), Style::default().fg(theme::DIM)),
+            ]),
+            Line::from(vec![
+                Span::styled("  Token:    ", Style::default().fg(theme::DIM)),
+                Span::styled(masked_token, Style::default().fg(theme::TEXT)),
+            ]),
+        ];
+        let detected_widget = Paragraph::new(detected_info).alignment(Alignment::Center);
+        f.render_widget(detected_widget, chunks[1]);
+
+        // Show either confirmation or manual input
+        let input_area = centered_rect(60, 3, chunks[2]);
+
+        if self.use_detected_auth {
+            // Show confirmation box
+            let confirm_block = Block::default()
+                .title(Span::styled(" ✓ Use this credential ", Style::default().fg(theme::SUCCESS)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SUCCESS));
+
+            let confirm = Paragraph::new(Span::styled(
+                "Press Enter to add to subscription pool",
+                Style::default().fg(theme::TEXT),
+            ))
+            .alignment(Alignment::Center)
+            .block(confirm_block);
+
+            f.render_widget(confirm, input_area);
+        } else {
+            // Show manual input
+            let display_value = if self.api_key_masked && !self.api_key_input.is_empty() {
+                "●".repeat(self.api_key_input.len())
+            } else {
+                self.api_key_input.clone()
+            };
+
+            let input_block = Block::default()
+                .title(Span::styled(" Different API Key ", Style::default().fg(theme::PURPLE)))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::PURPLE));
+
+            let input = Paragraph::new(if display_value.is_empty() {
+                Span::styled("sk-ant-...", Style::default().fg(theme::DIM))
+            } else {
+                Span::styled(display_value, Style::default().fg(theme::TEXT))
+            })
+            .block(input_block);
+
+            f.render_widget(input, input_area);
+        }
+
+        // Info text with toggle option
+        let info = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[d]", Style::default().fg(theme::PURPLE)),
+                Span::styled(
+                    if self.use_detected_auth { " Enter different key  " } else { " Use detected key  " },
+                    Style::default().fg(theme::DIM),
+                ),
+                Span::styled("[t]", Style::default().fg(theme::PURPLE)),
+                Span::styled(" Toggle visibility", Style::default().fg(theme::DIM)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Your credential will be added to the subscription pool.",
+                Style::default().fg(theme::SPARKLE),
+            )),
+        ];
+        let info_widget = Paragraph::new(info).alignment(Alignment::Center);
+        f.render_widget(info_widget, chunks[3]);
+    }
+
+    /// Render API key screen for manual entry (no detected auth)
+    fn render_api_key_manual(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -873,11 +1035,16 @@ impl OnboardingWizard {
         let title_widget = Paragraph::new(title).alignment(Alignment::Center);
         f.render_widget(title_widget, chunks[1]);
 
-        // Summary
+        // Summary - show source of API key
         let api_status = if self.skip_api_key {
             Span::styled("Skipped (configure later with 'kage secret set')", Style::default().fg(theme::WARNING))
+        } else if self.use_detected_auth && self.detected_auth.is_some() {
+            let email = self.detected_auth.as_ref()
+                .and_then(|a| a.email.as_deref())
+                .unwrap_or("detected");
+            Span::styled(format!("Claude Code ({}) → pool", email), Style::default().fg(theme::SUCCESS))
         } else {
-            Span::styled("Saved to OS keychain", Style::default().fg(theme::SUCCESS))
+            Span::styled("Added to subscription pool", Style::default().fg(theme::SUCCESS))
         };
 
         let summary = vec![
@@ -922,11 +1089,29 @@ impl OnboardingWizard {
                 ("[s]", "Skip setup"),
                 ("[Esc]", "Quit"),
             ],
-            WizardStep::ApiKey => vec![
-                ("[Enter]", "Save & Continue"),
-                ("[←]", "Back"),
-                ("[s]", "Skip"),
-            ],
+            WizardStep::ApiKey => {
+                if self.detected_auth.is_some() {
+                    if self.use_detected_auth {
+                        vec![
+                            ("[Enter]", "Add to pool"),
+                            ("[d]", "Different key"),
+                            ("[←]", "Back"),
+                        ]
+                    } else {
+                        vec![
+                            ("[Enter]", "Save & Continue"),
+                            ("[d]", "Use detected"),
+                            ("[←]", "Back"),
+                        ]
+                    }
+                } else {
+                    vec![
+                        ("[Enter]", "Save & Continue"),
+                        ("[←]", "Back"),
+                        ("[s]", "Skip"),
+                    ]
+                }
+            }
             WizardStep::Namespace => vec![
                 ("[Enter]", "Continue"),
                 ("[←]", "Back"),

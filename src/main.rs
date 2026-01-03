@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
                 // Launch interactive dashboard if terminal is a TTY
                 if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
                     // Ensure daemon is running before launching dashboard
-                    ensure_daemon_running().await?;
+                    daemon::client::ensure_running().await?;
                     tui::dashboard::run().await?;
                     return Ok(());
                 }
@@ -116,49 +116,4 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// Ensure the daemon is running, starting it in the background if needed
-async fn ensure_daemon_running() -> Result<()> {
-    use daemon::client::{default_socket_path, is_daemon_running};
-
-    let socket_path = default_socket_path();
-
-    if is_daemon_running(&socket_path).await {
-        tracing::debug!("Daemon already running");
-        return Ok(());
-    }
-
-    tracing::info!("Starting daemon in background...");
-
-    // Load config
-    let cfg = config::load()?;
-
-    // Spawn daemon in background
-    let daemon_cfg = cfg.clone();
-    tokio::spawn(async move {
-        match daemon::Daemon::new(daemon_cfg) {
-            Ok(mut d) => {
-                if let Err(e) = d.run().await {
-                    tracing::error!("Daemon error: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to create daemon: {}", e);
-            }
-        }
-    });
-
-    // Wait briefly for daemon to start
-    for _ in 0..10 {
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        if is_daemon_running(&socket_path).await {
-            tracing::info!("Daemon started successfully");
-            return Ok(());
-        }
-    }
-
-    // Continue anyway - dashboard will show disconnected status
-    tracing::warn!("Daemon may not have started, continuing with dashboard");
-    Ok(())
 }

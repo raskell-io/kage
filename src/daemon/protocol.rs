@@ -185,6 +185,17 @@ pub enum Request {
 
     /// Unsubscribe from daemon events
     Unsubscribe,
+
+    /// List registered subscriptions
+    ListSubscriptions,
+
+    /// Add a new subscription (API key stored in keychain)
+    AddSubscription {
+        /// Subscription name
+        name: String,
+        /// API key (will be stored in keychain)
+        api_key: String,
+    },
 }
 
 /// Response from daemon to client
@@ -312,6 +323,29 @@ pub enum Response {
 
     /// Daemon event (streamed to subscribers)
     Event(DaemonEvent),
+
+    /// Subscription list
+    SubscriptionList {
+        /// Subscriptions (without API keys)
+        subscriptions: Vec<SubscriptionInfo>,
+    },
+
+    /// Subscription added
+    SubscriptionAdded {
+        /// Subscription name
+        name: String,
+    },
+}
+
+/// Subscription info (without sensitive data)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscriptionInfo {
+    /// Subscription name
+    pub name: String,
+    /// Provider type
+    pub provider: String,
+    /// Status
+    pub status: String,
 }
 
 /// Daemon event for real-time streaming

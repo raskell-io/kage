@@ -183,6 +183,16 @@ impl DaemonClient {
         self.request(&Request::Shutdown).await
     }
 
+    /// List registered subscriptions
+    pub async fn list_subscriptions(&mut self) -> Result<Response> {
+        self.request(&Request::ListSubscriptions).await
+    }
+
+    /// Add a new subscription
+    pub async fn add_subscription(&mut self, name: String, api_key: String) -> Result<Response> {
+        self.request(&Request::AddSubscription { name, api_key }).await
+    }
+
     /// Query memory entries
     pub async fn query_memory(
         &mut self,
@@ -300,6 +310,49 @@ pub fn default_socket_path() -> std::path::PathBuf {
     } else {
         std::path::PathBuf::from("/tmp/kage.sock")
     }
+}
+
+/// Ensure the daemon is running, starting it in the background if needed
+pub async fn ensure_running() -> Result<()> {
+    let socket_path = default_socket_path();
+
+    if is_daemon_running(&socket_path).await {
+        tracing::debug!("Daemon already running");
+        return Ok(());
+    }
+
+    tracing::info!("Starting daemon in background...");
+
+    // Load config
+    let cfg = crate::config::load()?;
+
+    // Spawn daemon in background task
+    let daemon_cfg = cfg.clone();
+    tokio::spawn(async move {
+        match super::Daemon::new(daemon_cfg) {
+            Ok(mut d) => {
+                if let Err(e) = d.run().await {
+                    tracing::error!("Daemon error: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to create daemon: {}", e);
+            }
+        }
+    });
+
+    // Wait briefly for daemon to start
+    for _ in 0..10 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        if is_daemon_running(&socket_path).await {
+            tracing::info!("Daemon started successfully");
+            return Ok(());
+        }
+    }
+
+    // Continue anyway - dashboard will show disconnected status
+    tracing::warn!("Daemon may not have started, continuing anyway");
+    Ok(())
 }
 
 // Helper module for XDG paths
