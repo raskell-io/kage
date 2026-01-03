@@ -1,0 +1,228 @@
+# Kage - mise configuration
+# https://mise.jdx.dev/
+
+[env]
+RUST_BACKTRACE = "1"
+CARGO_TERM_COLOR = "always"
+
+# Tool versions
+[tools]
+rust = "stable"
+protoc = "latest"
+
+# =============================================================================
+# Build Tasks
+# =============================================================================
+
+[tasks.build]
+description = "Build the project (debug)"
+run = "cargo build"
+
+[tasks."build:release"]
+description = "Build optimized release binary"
+run = "cargo build --release"
+
+[tasks."build:static"]
+description = "Build fully static binary for Linux (musl)"
+run = """
+rustup target add x86_64-unknown-linux-musl 2>/dev/null || true
+cargo build --release --target x86_64-unknown-linux-musl
+"""
+
+[tasks."build:all-features"]
+description = "Build with all features enabled"
+run = "cargo build --all-features"
+
+# =============================================================================
+# Development Tasks
+# =============================================================================
+
+[tasks.dev]
+description = "Run in development mode with auto-reload"
+run = "cargo watch -x run"
+
+[tasks.check]
+description = "Quick compile check without building"
+run = "cargo check --all-features"
+
+[tasks.fmt]
+description = "Format code"
+run = "cargo fmt"
+
+[tasks."fmt:check"]
+description = "Check code formatting"
+run = "cargo fmt -- --check"
+
+[tasks.clippy]
+description = "Run clippy lints"
+run = "cargo clippy --all-features -- -D warnings"
+
+[tasks.lint]
+description = "Run all lints (fmt + clippy)"
+depends = ["fmt:check", "clippy"]
+
+# =============================================================================
+# Test Tasks
+# =============================================================================
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test"
+
+[tasks."test:unit"]
+description = "Run unit tests only"
+run = "cargo test --lib"
+
+[tasks."test:integration"]
+description = "Run integration tests"
+run = "cargo test --test '*'"
+
+[tasks."test:watch"]
+description = "Run tests with auto-reload"
+run = "cargo watch -x test"
+
+[tasks."test:coverage"]
+description = "Run tests with coverage report"
+run = """
+cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+cargo llvm-cov report --html
+"""
+
+# =============================================================================
+# Documentation Tasks
+# =============================================================================
+
+[tasks.doc]
+description = "Generate documentation"
+run = "cargo doc --no-deps --all-features"
+
+[tasks."doc:open"]
+description = "Generate and open documentation"
+run = "cargo doc --no-deps --all-features --open"
+
+# =============================================================================
+# Release Tasks
+# =============================================================================
+
+[tasks.release]
+description = "Build release and run checks"
+depends = ["lint", "test", "build:release"]
+
+[tasks."release:prepare"]
+description = "Prepare for release (update version, changelog)"
+usage = 'arg "<version>" help="New version number (e.g., 0.2.0)"'
+run = """
+echo "Preparing release ${usage_version}"
+# Update version in Cargo.toml
+sed -i '' "s/^version = \".*\"/version = \"${usage_version}\"/" Cargo.toml
+cargo check
+git add Cargo.toml
+echo "Version updated to ${usage_version}"
+echo "Remember to update CHANGELOG.md and commit"
+"""
+
+# =============================================================================
+# Clean Tasks
+# =============================================================================
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "cargo clean"
+
+[tasks."clean:all"]
+description = "Clean everything including IDE caches"
+run = """
+cargo clean
+rm -rf .idea .vscode/*.log
+rm -f lcov.info
+"""
+
+# =============================================================================
+# Install Tasks
+# =============================================================================
+
+[tasks.install]
+description = "Install kage locally"
+run = "cargo install --path ."
+
+[tasks."install:dev"]
+description = "Install development tools"
+run = """
+cargo install cargo-watch
+cargo install cargo-llvm-cov
+cargo install cargo-audit
+cargo install cargo-outdated
+"""
+
+# =============================================================================
+# Security & Maintenance
+# =============================================================================
+
+[tasks.audit]
+description = "Audit dependencies for security vulnerabilities"
+run = "cargo audit"
+
+[tasks.outdated]
+description = "Check for outdated dependencies"
+run = "cargo outdated"
+
+[tasks.update]
+description = "Update dependencies"
+run = "cargo update"
+
+# =============================================================================
+# Proto Tasks (for gRPC/server feature)
+# =============================================================================
+
+[tasks.proto]
+description = "Generate Rust code from proto files"
+run = """
+if [ -f proto/kage.proto ]; then
+  cargo build --features server
+  echo "Proto files compiled"
+else
+  echo "No proto files found in proto/"
+fi
+"""
+
+# =============================================================================
+# Run Tasks
+# =============================================================================
+
+[tasks.run]
+description = "Run kage"
+run = "cargo run --"
+
+[tasks."run:daemon"]
+description = "Start the daemon"
+run = "cargo run -- daemon start --foreground"
+
+[tasks."run:help"]
+description = "Show help"
+run = "cargo run -- --help"
+
+# =============================================================================
+# CI Tasks
+# =============================================================================
+
+[tasks.ci]
+description = "Run full CI pipeline"
+depends = ["fmt:check", "clippy", "test", "build:release", "doc"]
+
+[tasks."ci:quick"]
+description = "Quick CI check"
+depends = ["check", "test:unit"]
+
+# =============================================================================
+# Hooks
+# =============================================================================
+
+[tasks."pre-commit"]
+description = "Pre-commit hook tasks"
+depends = ["fmt", "clippy", "test:unit"]
+hide = true
+
+[tasks."pre-push"]
+description = "Pre-push hook tasks"
+depends = ["ci:quick"]
+hide = true

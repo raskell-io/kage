@@ -1,0 +1,103 @@
+[package]
+name = "kage"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Raskell <hello@raskell.io>"]
+description = "Shadow agents for autonomous code work - a local-first agentic work orchestrator"
+repository = "https://github.com/raskell-io/kage"
+license = "MIT"
+keywords = ["cli", "ai", "agents", "claude", "orchestrator"]
+categories = ["command-line-utilities", "development-tools"]
+
+[features]
+default = []
+# Enable TUI onboarding and dashboard
+tui = ["ratatui", "crossterm"]
+# Enable gRPC for remote/multi-user mode
+server = ["tonic", "prost", "tonic-build"]
+
+[[bin]]
+name = "kage"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# CLI
+clap = { version = "4.4", features = ["derive", "env", "wrap_help"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+rmp-serde = "1.1.2"                  # MessagePack for state/memory (pinned to avoid edition2024)
+
+# Storage (embedded, no external DB)
+redb = "2.0"                          # Pure Rust embedded KV store
+
+# IDs
+ulid = { version = "1.1", features = ["serde"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# PTY for agent process management
+portable-pty = "0.8"
+
+# File system
+notify = "6.1"                        # File watching
+directories = "5.0"                   # XDG paths
+walkdir = "2.4"
+
+# Secrets (OS keychain)
+keyring = "2.3"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# TUI (optional, enabled by default for onboarding)
+ratatui = { version = "0.26", optional = true }
+crossterm = { version = "0.27", optional = true }
+
+# gRPC (optional, for server/multi-user mode)
+tonic = { version = "0.11", optional = true }
+prost = { version = "0.12", optional = true }
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+
+# Unix process management
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# HTTP client (for future MCP gateway)
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls", "json"] }
+
+[build-dependencies]
+tonic-build = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+tokio-test = "0.4"
+assert_cmd = "2.0"
+predicates = "3.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# For musl static builds on Linux
+[profile.release-static]
+inherits = "release"
+# Additional settings for fully static binary

@@ -1,0 +1,23 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Kage state (for development)
+*.redb
+*.log
+
+# Build artifacts
+*.so
+*.dylib
+*.dll

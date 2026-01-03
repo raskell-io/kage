@@ -1,0 +1,319 @@
+//! IPC Protocol for daemon communication
+//!
+//! Uses a simple length-prefixed MessagePack protocol over Unix sockets.
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+use crate::agent::AgentId;
+use crate::task::TaskId;
+
+/// Request from client to daemon
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    /// Ping the daemon
+    Ping,
+
+    /// Get daemon status
+    Status,
+
+    /// Spawn a new agent
+    SpawnAgent {
+        /// Working directory for the agent
+        working_dir: PathBuf,
+        /// Namespace (optional)
+        namespace: Option<String>,
+        /// Initial prompt/goal (optional)
+        prompt: Option<String>,
+        /// Model to use (optional, defaults to config)
+        model: Option<String>,
+        /// Maximum iterations (optional, defaults to config)
+        max_iterations: Option<u32>,
+    },
+
+    /// Kill an agent
+    KillAgent {
+        /// Agent ID to kill
+        id: AgentId,
+        /// Force kill without graceful shutdown
+        force: bool,
+    },
+
+    /// List all agents
+    ListAgents {
+        /// Filter by namespace
+        namespace: Option<String>,
+        /// Include stopped agents
+        include_stopped: bool,
+    },
+
+    /// Get agent details
+    GetAgent {
+        /// Agent ID
+        id: AgentId,
+    },
+
+    /// Send input to an agent
+    SendInput {
+        /// Agent ID
+        id: AgentId,
+        /// Input text
+        input: String,
+    },
+
+    /// Get agent output
+    GetOutput {
+        /// Agent ID
+        id: AgentId,
+        /// Number of lines (0 = all available)
+        lines: usize,
+    },
+
+    /// Attach to agent (stream output)
+    Attach {
+        /// Agent ID
+        id: AgentId,
+    },
+
+    /// Detach from agent
+    Detach {
+        /// Agent ID
+        id: AgentId,
+    },
+
+    /// Pause an agent
+    PauseAgent {
+        /// Agent ID
+        id: AgentId,
+    },
+
+    /// Resume an agent
+    ResumeAgent {
+        /// Agent ID
+        id: AgentId,
+    },
+
+    /// Add a task
+    AddTask {
+        /// Task goal
+        goal: String,
+        /// Namespace
+        namespace: Option<String>,
+        /// Repository path
+        repository: Option<PathBuf>,
+        /// Max iterations
+        max_iterations: Option<u32>,
+    },
+
+    /// List tasks
+    ListTasks {
+        /// Filter by status
+        status: Option<String>,
+    },
+
+    /// Cancel a task
+    CancelTask {
+        /// Task ID
+        id: TaskId,
+    },
+
+    /// Shutdown the daemon
+    Shutdown,
+}
+
+/// Response from daemon to client
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    /// Success with no data
+    Ok,
+
+    /// Error response
+    Error {
+        /// Error message
+        message: String,
+    },
+
+    /// Pong response
+    Pong {
+        /// Daemon version
+        version: String,
+        /// Uptime in seconds
+        uptime_secs: u64,
+    },
+
+    /// Daemon status
+    Status {
+        /// Daemon version
+        version: String,
+        /// Uptime in seconds
+        uptime_secs: u64,
+        /// Number of active agents
+        active_agents: usize,
+        /// Number of pending tasks
+        pending_tasks: usize,
+        /// Number of running tasks
+        running_tasks: usize,
+    },
+
+    /// Agent spawned
+    AgentSpawned {
+        /// New agent ID
+        id: AgentId,
+    },
+
+    /// Agent list
+    AgentList {
+        /// List of agents
+        agents: Vec<AgentInfo>,
+    },
+
+    /// Agent details
+    AgentDetails {
+        /// Agent info
+        agent: AgentInfo,
+    },
+
+    /// Agent output
+    AgentOutput {
+        /// Output lines
+        lines: Vec<OutputLine>,
+        /// Whether there's more output
+        has_more: bool,
+    },
+
+    /// Task added
+    TaskAdded {
+        /// New task ID
+        id: TaskId,
+    },
+
+    /// Task list
+    TaskList {
+        /// List of tasks
+        tasks: Vec<TaskInfo>,
+    },
+
+    /// Streaming output line (for attach)
+    StreamLine {
+        /// Output text
+        text: String,
+        /// Whether this is stderr
+        is_error: bool,
+        /// Timestamp
+        timestamp: i64,
+    },
+
+    /// Stream ended
+    StreamEnd,
+}
+
+/// Agent information for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentInfo {
+    /// Agent ID
+    pub id: AgentId,
+    /// Display name
+    pub name: String,
+    /// Current status
+    pub status: String,
+    /// Working directory
+    pub working_dir: PathBuf,
+    /// Namespace
+    pub namespace: Option<String>,
+    /// Current iteration
+    pub iteration: u32,
+    /// Max iterations
+    pub max_iterations: u32,
+    /// Started at (unix timestamp)
+    pub started_at: i64,
+    /// PID of the process
+    pub pid: Option<u32>,
+}
+
+/// Output line
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputLine {
+    /// Line text
+    pub text: String,
+    /// Whether this is stderr
+    pub is_error: bool,
+    /// Timestamp (unix timestamp)
+    pub timestamp: i64,
+}
+
+/// Task information for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    /// Task ID
+    pub id: TaskId,
+    /// Goal
+    pub goal: String,
+    /// Status
+    pub status: String,
+    /// Assigned agent
+    pub agent: Option<AgentId>,
+    /// Namespace
+    pub namespace: Option<String>,
+    /// Iterations completed
+    pub iterations: u32,
+    /// Max iterations
+    pub max_iterations: u32,
+    /// Created at (unix timestamp)
+    pub created_at: i64,
+}
+
+/// Encode a message with length prefix
+pub fn encode_message<T: Serialize>(msg: &T) -> anyhow::Result<Vec<u8>> {
+    let data = rmp_serde::to_vec(msg)?;
+    let len = (data.len() as u32).to_be_bytes();
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&len);
+    buf.extend_from_slice(&data);
+    Ok(buf)
+}
+
+/// Decode a message from bytes (without length prefix)
+pub fn decode_message<T: for<'de> Deserialize<'de>>(data: &[u8]) -> anyhow::Result<T> {
+    Ok(rmp_serde::from_slice(data)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_encode_decode_request() {
+        let req = Request::Ping;
+        let encoded = encode_message(&req).unwrap();
+
+        // Skip length prefix
+        let decoded: Request = decode_message(&encoded[4..]).unwrap();
+
+        match decoded {
+            Request::Ping => {}
+            _ => panic!("Wrong request type"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_response() {
+        let resp = Response::Pong {
+            version: "0.1.0".into(),
+            uptime_secs: 100,
+        };
+        let encoded = encode_message(&resp).unwrap();
+
+        // Skip length prefix
+        let decoded: Response = decode_message(&encoded[4..]).unwrap();
+
+        match decoded {
+            Response::Pong { version, uptime_secs } => {
+                assert_eq!(version, "0.1.0");
+                assert_eq!(uptime_secs, 100);
+            }
+            _ => panic!("Wrong response type"),
+        }
+    }
+}
