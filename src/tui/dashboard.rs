@@ -64,6 +64,12 @@ struct OutputLineDisplay {
 /// Action request from TUI to daemon
 #[derive(Debug, Clone)]
 enum Action {
+    /// Spawn a new agent
+    SpawnAgent {
+        repo: String,
+        prompt: String,
+        namespace: Option<String>,
+    },
     /// Kill an agent
     KillAgent { id: String },
     /// Pause an agent
@@ -126,6 +132,10 @@ pub struct Dashboard {
     show_task_details: bool,
     /// Show approvals popup
     show_approvals: bool,
+    /// Show spawn agent dialog
+    show_spawn_dialog: bool,
+    /// Spawn dialog state
+    spawn_dialog: SpawnDialogState,
     /// Last tick time (for animations)
     last_tick: Instant,
     /// Last data refresh
@@ -508,6 +518,118 @@ struct LogState {
     max_entries: usize,
 }
 
+/// Spawn dialog state for creating new agents
+struct SpawnDialogState {
+    /// Which field is focused (0 = repo, 1 = prompt, 2 = namespace)
+    focus: usize,
+    /// Repository path
+    repo: String,
+    /// Initial prompt/goal
+    prompt: String,
+    /// Namespace (optional)
+    namespace: String,
+    /// Cursor position in current field
+    cursor: usize,
+}
+
+impl SpawnDialogState {
+    fn new() -> Self {
+        // Default to current directory
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        Self {
+            focus: 1, // Start on prompt field (most important)
+            repo: cwd,
+            prompt: String::new(),
+            namespace: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+
+        self.focus = 1;
+        self.repo = cwd;
+        self.prompt.clear();
+        self.namespace.clear();
+        self.cursor = 0;
+    }
+
+    fn current_field(&self) -> &str {
+        match self.focus {
+            0 => &self.repo,
+            1 => &self.prompt,
+            _ => &self.namespace,
+        }
+    }
+
+    fn current_field_mut(&mut self) -> &mut String {
+        match self.focus {
+            0 => &mut self.repo,
+            1 => &mut self.prompt,
+            _ => &mut self.namespace,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.focus = (self.focus + 1) % 3;
+        self.cursor = self.current_field().len();
+    }
+
+    fn prev_field(&mut self) {
+        self.focus = if self.focus == 0 { 2 } else { self.focus - 1 };
+        self.cursor = self.current_field().len();
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let cursor = self.cursor;
+        let field = self.current_field_mut();
+        if cursor <= field.len() {
+            field.insert(cursor, c);
+            self.cursor += 1;
+        }
+    }
+
+    fn delete_char(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let cursor = self.cursor;
+            let field = self.current_field_mut();
+            if !field.is_empty() && cursor < field.len() {
+                field.remove(cursor);
+            }
+        }
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_cursor_right(&mut self) {
+        let len = self.current_field().len();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    fn move_cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_cursor_end(&mut self) {
+        self.cursor = self.current_field().len();
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.repo.trim().is_empty() && !self.prompt.trim().is_empty()
+    }
+}
+
 /// Agent output state
 struct OutputState {
     /// Current agent ID being viewed
@@ -638,6 +760,8 @@ impl Dashboard {
             show_agent_details: false,
             show_task_details: false,
             show_approvals: false,
+            show_spawn_dialog: false,
+            spawn_dialog: SpawnDialogState::new(),
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
             should_quit: false,
@@ -775,6 +899,48 @@ impl Dashboard {
             return;
         }
 
+        if self.show_spawn_dialog {
+            match key {
+                KeyCode::Esc => {
+                    self.show_spawn_dialog = false;
+                    self.spawn_dialog.reset();
+                }
+                KeyCode::Enter => {
+                    if self.spawn_dialog.is_valid() {
+                        self.handle_spawn_agent();
+                        self.show_spawn_dialog = false;
+                        self.spawn_dialog.reset();
+                    }
+                }
+                KeyCode::Tab => {
+                    self.spawn_dialog.next_field();
+                }
+                KeyCode::BackTab => {
+                    self.spawn_dialog.prev_field();
+                }
+                KeyCode::Backspace => {
+                    self.spawn_dialog.delete_char();
+                }
+                KeyCode::Left => {
+                    self.spawn_dialog.move_cursor_left();
+                }
+                KeyCode::Right => {
+                    self.spawn_dialog.move_cursor_right();
+                }
+                KeyCode::Home => {
+                    self.spawn_dialog.move_cursor_home();
+                }
+                KeyCode::End => {
+                    self.spawn_dialog.move_cursor_end();
+                }
+                KeyCode::Char(c) => {
+                    self.spawn_dialog.insert_char(c);
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Global keys - Ctrl combinations first (they need priority)
         match (key, modifiers.contains(KeyModifiers::CONTROL)) {
             // Ctrl+C or Ctrl+Q to quit
@@ -834,6 +1000,7 @@ impl Dashboard {
             KeyCode::Backspace => self.handle_delete(),        // Kill/cancel
             KeyCode::Char('c') => self.handle_cancel(),        // Cancel task
             KeyCode::Char('a') => self.show_approvals = true,  // Open approvals popup
+            KeyCode::Char('n') => self.show_spawn_dialog = true, // New agent
             KeyCode::Char('r') => self.refresh(),              // Refresh
             KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
@@ -922,6 +1089,20 @@ impl Dashboard {
         if self.focus == Panel::Output {
             self.output.scroll_down(20);
         }
+    }
+
+    /// Handle spawn agent from dialog
+    fn handle_spawn_agent(&mut self) {
+        let repo = self.spawn_dialog.repo.trim().to_string();
+        let prompt = self.spawn_dialog.prompt.trim().to_string();
+        let namespace = if self.spawn_dialog.namespace.trim().is_empty() {
+            None
+        } else {
+            Some(self.spawn_dialog.namespace.trim().to_string())
+        };
+
+        self.logs.add_info("dashboard", &format!("Spawning agent: {}...", truncate(&prompt, 30)));
+        self.send_action(Action::SpawnAgent { repo, prompt, namespace });
     }
 
     /// Handle Ctrl+K - kill selected agent
@@ -1237,6 +1418,9 @@ impl Dashboard {
         }
         if self.show_approvals {
             self.render_approvals_popup(f, area);
+        }
+        if self.show_spawn_dialog {
+            self.render_spawn_dialog(f, area);
         }
     }
 
@@ -1602,10 +1786,10 @@ impl Dashboard {
             Panel::Logs => "4:Logs",
         };
         let hints = vec![
+            ("n", "New"),
             ("Tab", "Panel"),
             (panel_hint, ""),
-            ("↑↓/jk", "Scroll"),
-            ("Enter", "Select"),
+            ("↑↓", "Nav"),
             ("?", "Help"),
             ("q", "Quit"),
         ];
@@ -1659,6 +1843,10 @@ impl Dashboard {
             Line::from(""),
             Line::from(Span::styled("Agent Actions", Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD))),
             Line::from(""),
+            Line::from(vec![
+                Span::styled("  n                ", Style::default().fg(theme::LIGHT_PURPLE)),
+                Span::styled("New agent (spawn dialog)", Style::default().fg(theme::TEXT)),
+            ]),
             Line::from(vec![
                 Span::styled("  Ctrl+K / x / Del ", Style::default().fg(theme::LIGHT_PURPLE)),
                 Span::styled("Kill agent", Style::default().fg(theme::TEXT)),
@@ -1882,6 +2070,166 @@ impl Dashboard {
         f.render_widget(details, popup_area);
     }
 
+    /// Render spawn agent dialog
+    fn render_spawn_dialog(&self, f: &mut Frame, area: Rect) {
+        let popup_area = centered_rect(70, 50, area);
+
+        // Build the dialog content
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Spawn a new Claude Code agent to work on a task.",
+                Style::default().fg(theme::DIM),
+            )),
+            Line::from(""),
+        ];
+
+        // Repository field
+        let repo_focused = self.spawn_dialog.focus == 0;
+        let repo_style = if repo_focused {
+            Style::default().fg(theme::PURPLE)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
+        let repo_value_style = if repo_focused {
+            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  Repository: ", repo_style),
+        ]));
+
+        // Show repo value with cursor if focused
+        let repo_display = if repo_focused {
+            let cursor_pos = self.spawn_dialog.cursor;
+            let repo = &self.spawn_dialog.repo;
+            if cursor_pos < repo.len() {
+                format!("  {}│{}", &repo[..cursor_pos], &repo[cursor_pos..])
+            } else {
+                format!("  {}│", repo)
+            }
+        } else {
+            format!("  {}", self.spawn_dialog.repo)
+        };
+        lines.push(Line::from(Span::styled(repo_display, repo_value_style)));
+        lines.push(Line::from(""));
+
+        // Prompt field (required)
+        let prompt_focused = self.spawn_dialog.focus == 1;
+        let prompt_style = if prompt_focused {
+            Style::default().fg(theme::PURPLE)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
+        let prompt_value_style = if prompt_focused {
+            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  Prompt: ", prompt_style),
+            Span::styled("*", Style::default().fg(theme::ERROR)),
+        ]));
+
+        // Show prompt value with cursor if focused
+        let prompt_display = if prompt_focused {
+            let cursor_pos = self.spawn_dialog.cursor;
+            let prompt = &self.spawn_dialog.prompt;
+            if cursor_pos < prompt.len() {
+                format!("  {}│{}", &prompt[..cursor_pos], &prompt[cursor_pos..])
+            } else {
+                format!("  {}│", prompt)
+            }
+        } else if self.spawn_dialog.prompt.is_empty() {
+            "  (enter a goal for the agent)".to_string()
+        } else {
+            format!("  {}", self.spawn_dialog.prompt)
+        };
+        let prompt_display_style = if self.spawn_dialog.prompt.is_empty() && !prompt_focused {
+            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+        } else {
+            prompt_value_style
+        };
+        lines.push(Line::from(Span::styled(prompt_display, prompt_display_style)));
+        lines.push(Line::from(""));
+
+        // Namespace field (optional)
+        let ns_focused = self.spawn_dialog.focus == 2;
+        let ns_style = if ns_focused {
+            Style::default().fg(theme::PURPLE)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
+        let ns_value_style = if ns_focused {
+            Style::default().fg(theme::TEXT).bg(theme::BG_HIGHLIGHT)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  Namespace: ", ns_style),
+            Span::styled("(optional)", Style::default().fg(theme::DIM)),
+        ]));
+
+        // Show namespace value with cursor if focused
+        let ns_display = if ns_focused {
+            let cursor_pos = self.spawn_dialog.cursor;
+            let ns = &self.spawn_dialog.namespace;
+            if cursor_pos < ns.len() {
+                format!("  {}│{}", &ns[..cursor_pos], &ns[cursor_pos..])
+            } else {
+                format!("  {}│", ns)
+            }
+        } else if self.spawn_dialog.namespace.is_empty() {
+            "  (default)".to_string()
+        } else {
+            format!("  {}", self.spawn_dialog.namespace)
+        };
+        let ns_display_style = if self.spawn_dialog.namespace.is_empty() && !ns_focused {
+            Style::default().fg(theme::DIM).add_modifier(Modifier::ITALIC)
+        } else {
+            ns_value_style
+        };
+        lines.push(Line::from(Span::styled(ns_display, ns_display_style)));
+        lines.push(Line::from(""));
+        lines.push(Line::from(""));
+
+        // Footer hints
+        let can_submit = self.spawn_dialog.is_valid();
+        let submit_style = if can_submit {
+            Style::default().fg(theme::BG).bg(theme::SUCCESS)
+        } else {
+            Style::default().fg(theme::DIM).bg(theme::BG_HIGHLIGHT)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(" Tab ", Style::default().fg(theme::BG).bg(theme::PURPLE)),
+            Span::styled(" Next field  ", Style::default().fg(theme::DIM)),
+            Span::styled(" Enter ", submit_style),
+            Span::styled(" Spawn  ", Style::default().fg(theme::DIM)),
+            Span::styled(" Esc ", Style::default().fg(theme::BG).bg(theme::ERROR)),
+            Span::styled(" Cancel", Style::default().fg(theme::DIM)),
+        ]));
+
+        let dialog = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(Span::styled(
+                        " New Agent ",
+                        Style::default().fg(theme::PURPLE).add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme::PURPLE))
+                    .style(Style::default().bg(theme::BG)),
+            );
+
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+        f.render_widget(dialog, popup_area);
+    }
+
     /// Render approvals popup
     fn render_approvals_popup(&self, f: &mut Frame, area: Rect) {
         let popup_area = centered_rect(75, 70, area);
@@ -2077,6 +2425,22 @@ async fn data_fetcher(
                 // Process pending actions
                 for action in pending_actions.drain(..) {
                     match action {
+                        Action::SpawnAgent { repo, prompt, namespace } => {
+                            let repo_path = std::path::PathBuf::from(&repo);
+                            match client.spawn_agent(repo_path, namespace, Some(prompt), None, None).await {
+                                Ok(_) => {
+                                    // Agent spawned successfully, will appear in next refresh
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "spawn".to_string(),
+                                        message: format!("Failed to spawn agent: {}", e),
+                                    }));
+                                }
+                            }
+                        }
                         Action::KillAgent { id } => {
                             if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
                                 let _ = client.kill_agent(agent_id, false).await;
