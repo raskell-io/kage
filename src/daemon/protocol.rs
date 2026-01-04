@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::agent::AgentId;
-use crate::memory::{MemoryEntry, MemoryScope};
+use crate::memory::{ContextRefId, ContextRefType, MemoryEntry, MemoryId, MemoryScope};
 use crate::task::{ApprovalAction, ApprovalId, TaskId};
 
 /// Request from client to daemon
@@ -216,6 +216,52 @@ pub enum Request {
         /// API key (will be stored in keychain)
         api_key: String,
     },
+
+    // -------------------------------------------------------------------------
+    // Context References
+    // -------------------------------------------------------------------------
+
+    /// Attach context to an agent
+    AttachContext {
+        /// Agent ID
+        agent_id: AgentId,
+        /// Memory entry ID
+        memory_id: MemoryId,
+        /// Reference type (attached, pinned, bookmarked)
+        ref_type: ContextRefType,
+    },
+
+    /// Detach context from an agent
+    DetachContext {
+        /// Agent ID
+        agent_id: AgentId,
+        /// Memory entry ID
+        memory_id: MemoryId,
+    },
+
+    /// List context refs for an agent
+    ListContextRefs {
+        /// Agent ID
+        agent_id: AgentId,
+        /// Filter by ref type (optional)
+        ref_type: Option<String>,
+    },
+
+    /// Get all context refs pointing to a memory entry
+    ListContextRefsByMemory {
+        /// Memory ID
+        memory_id: MemoryId,
+    },
+
+    /// Inherit context from parent agent to child (for forking)
+    InheritContext {
+        /// Parent agent ID
+        from_agent: AgentId,
+        /// Child agent ID
+        to_agent: AgentId,
+        /// Specific entries to inherit (optional, defaults to pinned)
+        entries: Option<Vec<MemoryId>>,
+    },
 }
 
 /// Response from daemon to client
@@ -354,6 +400,31 @@ pub enum Response {
     SubscriptionAdded {
         /// Subscription name
         name: String,
+    },
+
+    // -------------------------------------------------------------------------
+    // Context References
+    // -------------------------------------------------------------------------
+
+    /// Context ref attached
+    ContextRefAttached {
+        /// Context ref ID
+        id: ContextRefId,
+    },
+
+    /// Context ref detached
+    ContextRefDetached,
+
+    /// Context ref list
+    ContextRefList {
+        /// List of context refs
+        refs: Vec<ContextRefInfo>,
+    },
+
+    /// Context inherited
+    ContextInherited {
+        /// Number of refs inherited
+        count: usize,
     },
 }
 
@@ -528,6 +599,23 @@ pub struct MemoryInfo {
     pub tags: Vec<String>,
     /// Scope (e.g., "agent:xxx", "namespace:backend", "global")
     pub scope: String,
+}
+
+/// Context reference information for responses
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextRefInfo {
+    /// Context ref ID
+    pub id: ContextRefId,
+    /// Agent ID that owns this ref
+    pub agent_id: AgentId,
+    /// Memory entry being referenced
+    pub memory_id: MemoryId,
+    /// Reference type
+    pub ref_type: String,
+    /// Created at (unix timestamp)
+    pub created_at: i64,
+    /// Whether this ref auto-loads on agent start
+    pub is_auto_load: bool,
 }
 
 /// Encode a message with length prefix

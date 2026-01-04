@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod context;
 pub mod daemon;
 pub mod memory;
 pub mod namespace;

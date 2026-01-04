@@ -2,6 +2,7 @@
 //!
 //! - Working Memory: Fast, in-memory, session-scoped
 //! - Long-Term Memory: Persistent storage (filesystem, S3, or Azure Blob)
+//! - Context Refs: Link memory entries to agents (attached, bookmarked, inherited, pinned)
 
 pub mod backend;
 pub mod backends;
@@ -9,6 +10,7 @@ mod bus;
 pub mod entry;
 mod longterm;
 mod query;
+pub mod refs;
 mod working;
 
 pub use backend::{MemoryBackend, MemoryBackendConfig};
@@ -16,6 +18,7 @@ pub use bus::ContextBus;
 pub use entry::{MemoryContent, MemoryEntry, MemoryId, MemoryScope};
 pub use longterm::LongTermMemory;
 pub use query::MemoryQuery;
+pub use refs::{ContextRef, ContextRefId, ContextRefStore, ContextRefType, PersistentContextRefStore};
 pub use working::WorkingMemory;
 
 use std::sync::Arc;
@@ -33,6 +36,9 @@ pub struct MemorySystem {
     /// Real-time pub/sub bus
     pub bus: Arc<ContextBus>,
 
+    /// Context references (agent -> memory links)
+    pub refs: Arc<RwLock<ContextRefStore>>,
+
     /// Legacy accessor for direct LongTermMemory access (prune, etc.)
     /// TODO: Remove once all callers use the backend trait
     pub longterm: Arc<LongTermMemory>,
@@ -48,6 +54,7 @@ impl MemorySystem {
             working: Arc::new(RwLock::new(WorkingMemory::new())),
             longterm_backend: Arc::new(backend),
             bus: Arc::new(ContextBus::new()),
+            refs: Arc::new(RwLock::new(ContextRefStore::new())),
             longterm,
         })
     }
@@ -66,6 +73,7 @@ impl MemorySystem {
             working: Arc::new(RwLock::new(WorkingMemory::new())),
             longterm_backend: backend,
             bus: Arc::new(ContextBus::new()),
+            refs: Arc::new(RwLock::new(ContextRefStore::new())),
             longterm,
         })
     }
@@ -81,6 +89,7 @@ impl MemorySystem {
             working: Arc::new(RwLock::new(WorkingMemory::new())),
             longterm_backend: Arc::from(backend),
             bus: Arc::new(ContextBus::new()),
+            refs: Arc::new(RwLock::new(ContextRefStore::new())),
             longterm,
         })
     }

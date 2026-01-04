@@ -57,6 +57,21 @@ pub enum MemoryBackendConfig {
         prefix: String,
     },
 
+    /// S3-compatible storage (MinIO, DigitalOcean Spaces, Cloudflare R2, Backblaze B2, etc.)
+    #[cfg(feature = "storage-s3")]
+    S3Compatible {
+        /// S3-compatible endpoint URL (e.g., "https://nyc3.digitaloceanspaces.com")
+        endpoint: String,
+        /// Bucket name
+        bucket: String,
+        /// Region (some providers require this, defaults to "us-east-1")
+        #[serde(default)]
+        region: Option<String>,
+        /// Key prefix for all objects (default: "kage/memory")
+        #[serde(default = "default_s3_prefix")]
+        prefix: String,
+    },
+
     /// Azure Blob Storage
     #[cfg(feature = "storage-azure")]
     AzureBlob {
@@ -67,6 +82,19 @@ pub enum MemoryBackendConfig {
         /// Blob prefix for all objects (default: "kage/memory")
         #[serde(default = "default_azure_prefix")]
         prefix: String,
+    },
+
+    /// Google Cloud Storage
+    #[cfg(feature = "storage-gcs")]
+    Gcs {
+        /// GCS bucket name
+        bucket: String,
+        /// Key prefix for all objects (default: "kage/memory")
+        #[serde(default = "default_gcs_prefix")]
+        prefix: String,
+        /// Path to credentials JSON file (default: GOOGLE_APPLICATION_CREDENTIALS env var)
+        #[serde(default)]
+        credentials_file: Option<std::path::PathBuf>,
     },
 }
 
@@ -83,6 +111,11 @@ fn default_s3_prefix() -> String {
 
 #[cfg(feature = "storage-azure")]
 fn default_azure_prefix() -> String {
+    "kage/memory".to_string()
+}
+
+#[cfg(feature = "storage-gcs")]
+fn default_gcs_prefix() -> String {
     "kage/memory".to_string()
 }
 
@@ -108,12 +141,33 @@ pub async fn create_backend(
             Ok(Box::new(backend))
         }
 
+        #[cfg(feature = "storage-s3")]
+        MemoryBackendConfig::S3Compatible { endpoint, bucket, region, prefix } => {
+            let backend = super::backends::S3Backend::with_endpoint(
+                bucket.clone(),
+                region.clone(),
+                prefix.clone(),
+                Some(endpoint.clone()),
+            ).await?;
+            Ok(Box::new(backend))
+        }
+
         #[cfg(feature = "storage-azure")]
         MemoryBackendConfig::AzureBlob { account, container, prefix } => {
             let backend = super::backends::AzureBlobBackend::new(
                 account.clone(),
                 container.clone(),
                 prefix.clone(),
+            ).await?;
+            Ok(Box::new(backend))
+        }
+
+        #[cfg(feature = "storage-gcs")]
+        MemoryBackendConfig::Gcs { bucket, prefix, credentials_file } => {
+            let backend = super::backends::GcsBackend::new(
+                bucket.clone(),
+                prefix.clone(),
+                credentials_file.clone(),
             ).await?;
             Ok(Box::new(backend))
         }

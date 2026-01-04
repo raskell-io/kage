@@ -81,6 +81,14 @@ enum Action {
         pty_rows: u16,
         pty_cols: u16,
     },
+    /// Fork an agent (spawn new agent in same dir and inherit context)
+    ForkAgent {
+        parent_id: String,
+        repo: String,
+        namespace: Option<String>,
+        pty_rows: u16,
+        pty_cols: u16,
+    },
     /// Kill an agent
     KillAgent { id: String },
     /// Pause an agent
@@ -2220,20 +2228,21 @@ impl Dashboard {
         }
     }
 
-    /// Handle fork agent - spawn a new agent in the same working directory
+    /// Handle fork agent - spawn a new agent in the same working directory and inherit context
     fn handle_fork_agent(&mut self) {
         if let Some(agent) = self.agents.selected() {
+            let parent_id = agent.id.clone();
             let repo = agent.working_dir.clone();
             let namespace = Some(agent.namespace.clone());
             let (pty_rows, pty_cols) = self.calculate_stream_panel_size();
 
             self.logs.add_info("dashboard", &format!(
-                "Forking agent {} → new session in {} (PTY: {}x{})",
-                &agent.id[..8.min(agent.id.len())],
+                "Forking agent {} → new session in {} (PTY: {}x{}) with context inheritance",
+                &parent_id[..8.min(parent_id.len())],
                 truncate(&repo, 20),
                 pty_cols, pty_rows
             ));
-            self.send_action(Action::SpawnAgent { repo, namespace, pty_rows, pty_cols });
+            self.send_action(Action::ForkAgent { parent_id, repo, namespace, pty_rows, pty_cols });
         } else {
             self.logs.add_error("dashboard", "No agent selected to fork");
         }
@@ -4713,6 +4722,61 @@ async fn data_fetcher(
                                         level: LogLevel::Error,
                                         source: "spawn".to_string(),
                                         message: format!("Failed to spawn agent: {}", e),
+                                    }));
+                                }
+                            }
+                        }
+                        Action::ForkAgent { parent_id, repo, namespace, pty_rows, pty_cols } => {
+                            let repo_path = std::path::PathBuf::from(&repo);
+                            // Spawn new agent in same directory
+                            match client.spawn_agent(repo_path, namespace, None, None, None, Some(pty_rows), Some(pty_cols)).await {
+                                Ok(Response::AgentSpawned { id: new_id }) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Info,
+                                        source: "fork".to_string(),
+                                        message: format!("Agent {} forked → {}", &parent_id[..8.min(parent_id.len())], &new_id.to_string()[..8]),
+                                    }));
+                                    // Inherit context from parent to new agent
+                                    if let Ok(from_agent) = parent_id.parse::<crate::agent::AgentId>() {
+                                        match client.inherit_context(from_agent, new_id, None).await {
+                                            Ok(Response::ContextInherited { count }) => {
+                                                if count > 0 {
+                                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                                        level: LogLevel::Info,
+                                                        source: "fork".to_string(),
+                                                        message: format!("Inherited {} context ref(s)", count),
+                                                    }));
+                                                }
+                                            }
+                                            Ok(Response::Error { message }) => {
+                                                let _ = tx.send(DataUpdate::Log(LogEntry {
+                                                    timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                                    level: LogLevel::Warning,
+                                                    source: "fork".to_string(),
+                                                    message: format!("Context inherit failed: {}", message),
+                                                }));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                Ok(Response::Error { message }) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "fork".to_string(),
+                                        message: format!("Fork failed: {}", message),
+                                    }));
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "fork".to_string(),
+                                        message: format!("Failed to fork agent: {}", e),
                                     }));
                                 }
                             }

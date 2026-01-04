@@ -30,6 +30,14 @@ impl std::fmt::Display for MemoryId {
     }
 }
 
+impl std::str::FromStr for MemoryId {
+    type Err = ulid::DecodeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Ulid::from_string(s)?))
+    }
+}
+
 /// Memory scope controls visibility
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryScope {

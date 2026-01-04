@@ -12,6 +12,7 @@ const AGENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("agents"
 const TASKS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("tasks");
 const NAMESPACES_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("namespaces");
 const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("config");
+const CONTEXT_REFS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("context_refs");
 
 /// Known table names
 #[derive(Debug, Clone, Copy)]
@@ -20,6 +21,7 @@ pub enum Table {
     Tasks,
     Namespaces,
     Config,
+    ContextRefs,
 }
 
 impl Table {
@@ -29,6 +31,7 @@ impl Table {
             Table::Tasks => TASKS_TABLE,
             Table::Namespaces => NAMESPACES_TABLE,
             Table::Config => CONFIG_TABLE,
+            Table::ContextRefs => CONTEXT_REFS_TABLE,
         }
     }
 }
@@ -55,6 +58,7 @@ impl Store {
             let _ = write_txn.open_table(TASKS_TABLE)?;
             let _ = write_txn.open_table(NAMESPACES_TABLE)?;
             let _ = write_txn.open_table(CONFIG_TABLE)?;
+            let _ = write_txn.open_table(CONTEXT_REFS_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -106,6 +110,32 @@ impl Store {
             keys.push(key.value().to_string());
         }
         Ok(keys)
+    }
+
+    /// List all key-value pairs in a table
+    pub fn list_all(&self, table: Table) -> Result<Vec<(String, Vec<u8>)>> {
+        let read_txn = self.db.begin_read()?;
+        let t = read_txn.open_table(table.definition())?;
+
+        let mut pairs = vec![];
+        for entry in t.iter()? {
+            let (key, value) = entry?;
+            pairs.push((key.value().to_string(), value.value().to_vec()));
+        }
+        Ok(pairs)
+    }
+
+    /// Batch insert multiple entries (transactional)
+    pub fn put_batch(&self, table: Table, entries: &[(&str, &[u8])]) -> Result<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut t = write_txn.open_table(table.definition())?;
+            for (key, value) in entries {
+                t.insert(*key, *value)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 }
 

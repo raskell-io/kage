@@ -36,6 +36,12 @@ pub enum Commands {
         command: MemoryCommands,
     },
 
+    /// Context references (attach/detach memory to agents)
+    Context {
+        #[command(subcommand)]
+        command: ContextCommands,
+    },
+
     /// Namespace management
     Namespace {
         #[command(subcommand)]
@@ -340,6 +346,64 @@ pub enum MemoryCommands {
 }
 
 #[derive(Subcommand)]
+pub enum ContextCommands {
+    /// Attach a memory entry to an agent
+    Attach {
+        /// Agent ID
+        #[arg(short, long)]
+        agent: String,
+
+        /// Memory entry ID
+        #[arg(short, long)]
+        memory: String,
+
+        /// Reference type (attached, pinned, bookmarked)
+        #[arg(short = 't', long, default_value = "attached")]
+        r#type: String,
+    },
+
+    /// Detach a memory entry from an agent
+    Detach {
+        /// Agent ID
+        #[arg(short, long)]
+        agent: String,
+
+        /// Memory entry ID
+        #[arg(short, long)]
+        memory: String,
+    },
+
+    /// List context refs for an agent
+    List {
+        /// Agent ID
+        agent: String,
+
+        /// Filter by type (attached, pinned, bookmarked, inherited)
+        #[arg(short = 't', long)]
+        r#type: Option<String>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inherit context from parent to child agent (for forking)
+    Inherit {
+        /// Parent agent ID
+        #[arg(short, long)]
+        from: String,
+
+        /// Child agent ID
+        #[arg(short = 'c', long)]
+        to: String,
+
+        /// Specific memory IDs to inherit (comma-separated, default: pinned only)
+        #[arg(short, long)]
+        entries: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ApprovalCommands {
     /// List pending approvals
     List {
@@ -587,6 +651,7 @@ pub async fn run(cmd: Commands) -> Result<()> {
         Commands::Agent { command } => commands::agent::run(command).await,
         Commands::Task { command } => commands::task::run(command).await,
         Commands::Memory { command } => commands::memory::run(command).await,
+        Commands::Context { command } => commands::context::run(command).await,
         Commands::Namespace { command } => commands::namespace::run(command).await,
         Commands::Secret { command } => commands::secret::run(command).await,
         Commands::Subscription { command } => commands::subscription::run(command).await,

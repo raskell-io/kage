@@ -23,8 +23,9 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 
 use crate::config::Config;
-use crate::memory::MemorySystem;
+use crate::memory::{MemorySystem, PersistentContextRefStore};
 use crate::secrets::SecretsManager;
+use crate::storage;
 use crate::task::{
     CheckpointStore, CriteriaAction, CriteriaContext, Task, TaskConfig, TaskRegistry,
     TaskScheduler, TaskStatus,
@@ -45,6 +46,8 @@ pub struct Daemon {
     checkpoint_store: Arc<CheckpointStore>,
     /// Memory system for context sharing
     memory: Arc<MemorySystem>,
+    /// Context references (agent -> memory links)
+    refs: Arc<RwLock<PersistentContextRefStore>>,
     /// Secrets manager
     secrets: Arc<SecretsManager>,
     /// Event bus for real-time streaming to UI clients
@@ -76,6 +79,12 @@ impl Daemon {
         let memory = Arc::new(MemorySystem::new(config.daemon.state_dir.clone())?);
         tracing::info!("Memory system initialized (backend: {})", memory.backend_name());
 
+        // Initialize context refs storage
+        let refs_db_path = config.daemon.state_dir.join("kage.redb");
+        let refs_store = Arc::new(storage::Store::open(refs_db_path)?);
+        let refs = Arc::new(RwLock::new(PersistentContextRefStore::new(refs_store)?));
+        tracing::info!("Context refs store initialized");
+
         // Initialize secrets manager
         let secrets = Arc::new(SecretsManager::new());
         tracing::info!("Secrets manager initialized (backend: {})", secrets.backend_name());
@@ -93,6 +102,7 @@ impl Daemon {
             scheduler,
             checkpoint_store,
             memory,
+            refs,
             secrets,
             event_bus,
         })
@@ -367,6 +377,7 @@ impl Daemon {
                 Arc::clone(&self.supervisor),
                 Arc::clone(&self.scheduler),
                 Arc::clone(&self.memory),
+                Arc::clone(&self.refs),
                 self.started_at,
             ));
             let grpc_server = crate::rpc::GrpcServer::new(grpc_addr, state);
@@ -390,13 +401,14 @@ impl Daemon {
                             let scheduler = Arc::clone(&self.scheduler);
                             let checkpoint_store = Arc::clone(&self.checkpoint_store);
                             let memory = Arc::clone(&self.memory);
+                            let refs = Arc::clone(&self.refs);
                             let event_bus = Arc::clone(&self.event_bus);
                             let started_at = self.started_at;
                             let mut conn_shutdown_rx = shutdown_tx.subscribe();
 
                             tokio::spawn(async move {
                                 tokio::select! {
-                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, memory, event_bus, started_at) => {
+                                    result = handle_connection(stream, supervisor, scheduler, checkpoint_store, memory, refs, event_bus, started_at) => {
                                         if let Err(e) = result {
                                             tracing::debug!("Connection closed: {}", e);
                                         }
@@ -453,6 +465,7 @@ async fn handle_connection(
     scheduler: Arc<TaskScheduler>,
     checkpoint_store: Arc<CheckpointStore>,
     memory: Arc<MemorySystem>,
+    refs: Arc<RwLock<PersistentContextRefStore>>,
     event_bus: Arc<EventBus>,
     started_at: Instant,
 ) -> Result<()> {
@@ -506,6 +519,7 @@ async fn handle_connection(
             &scheduler,
             &checkpoint_store,
             &memory,
+            &refs,
             &event_bus,
             started_at,
             &mut stream,
@@ -526,6 +540,15 @@ async fn send_response(stream: &mut UnixStream, response: &Response) -> Result<(
     Ok(())
 }
 
+/// State for request handling (passed to handler)
+struct RequestState<'a> {
+    supervisor: &'a Arc<RwLock<Supervisor>>,
+    scheduler: &'a Arc<TaskScheduler>,
+    refs: &'a Arc<RwLock<PersistentContextRefStore>>,
+    event_bus: &'a Arc<EventBus>,
+    started_at: Instant,
+}
+
 /// Handle a single request
 async fn handle_request(
     request: Request,
@@ -533,10 +556,18 @@ async fn handle_request(
     scheduler: &Arc<TaskScheduler>,
     _checkpoint_store: &Arc<CheckpointStore>,
     _memory: &Arc<MemorySystem>,
+    refs: &Arc<RwLock<PersistentContextRefStore>>,
     event_bus: &Arc<EventBus>,
     started_at: Instant,
     stream: &mut UnixStream,
 ) -> Option<Response> {
+    let state = RequestState {
+        supervisor,
+        scheduler,
+        refs,
+        event_bus,
+        started_at,
+    };
     match request {
         Request::Ping => Some(Response::Pong {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1046,6 +1077,87 @@ async fn handle_request(
             // Client can simply disconnect to unsubscribe
             Some(Response::Ok)
         }
+
+        // -------------------------------------------------------------------------
+        // Context References
+        // -------------------------------------------------------------------------
+
+        Request::AttachContext {
+            agent_id,
+            memory_id,
+            ref_type,
+        } => {
+            use crate::memory::ContextRef;
+
+            let ctx_ref = ContextRef::new(agent_id, memory_id, ref_type);
+            let ref_id = ctx_ref.id;
+
+            match state.refs.write().await.add(ctx_ref) {
+                Ok(()) => Some(Response::ContextRefAttached { id: ref_id }),
+                Err(e) => Some(Response::Error {
+                    message: format!("Failed to attach context: {}", e),
+                }),
+            }
+        }
+
+        Request::DetachContext {
+            agent_id,
+            memory_id,
+        } => {
+            match state.refs.write().await.remove_by_agent_memory(agent_id, memory_id) {
+                Ok(Some(_)) => Some(Response::ContextRefDetached),
+                Ok(None) => Some(Response::Error {
+                    message: "Context ref not found".to_string(),
+                }),
+                Err(e) => Some(Response::Error {
+                    message: format!("Failed to detach context: {}", e),
+                }),
+            }
+        }
+
+        Request::ListContextRefs { agent_id, ref_type } => {
+            let refs_guard = state.refs.read().await;
+            let refs: Vec<_> = refs_guard.by_agent(agent_id)
+                .into_iter()
+                .filter(|r| {
+                    if let Some(ref filter) = ref_type {
+                        r.ref_type.name() == filter
+                    } else {
+                        true
+                    }
+                })
+                .map(context_ref_to_info)
+                .collect();
+
+            Some(Response::ContextRefList { refs })
+        }
+
+        Request::ListContextRefsByMemory { memory_id } => {
+            let refs_guard = state.refs.read().await;
+            let refs: Vec<_> = refs_guard.by_memory(memory_id)
+                .into_iter()
+                .map(context_ref_to_info)
+                .collect();
+
+            Some(Response::ContextRefList { refs })
+        }
+
+        Request::InheritContext {
+            from_agent,
+            to_agent,
+            entries,
+        } => {
+            match state.refs.write().await.inherit_from_parent(
+                from_agent,
+                to_agent,
+                entries.as_deref(),
+            ) {
+                Ok(count) => Some(Response::ContextInherited { count }),
+                Err(e) => Some(Response::Error {
+                    message: format!("Failed to inherit context: {}", e),
+                }),
+            }
+        }
     }
 }
 
@@ -1115,6 +1227,18 @@ fn memory_entry_to_info(entry: &crate::memory::MemoryEntry) -> protocol::MemoryI
         content: content_json,
         tags: entry.tags.clone(),
         scope: String::new(), // Will be set by caller if needed
+    }
+}
+
+/// Convert a ContextRef to ContextRefInfo for wire format
+fn context_ref_to_info(ctx_ref: &crate::memory::ContextRef) -> protocol::ContextRefInfo {
+    protocol::ContextRefInfo {
+        id: ctx_ref.id,
+        agent_id: ctx_ref.agent_id,
+        memory_id: ctx_ref.memory_id,
+        ref_type: ctx_ref.ref_type.name().to_string(),
+        created_at: ctx_ref.created_at.timestamp(),
+        is_auto_load: ctx_ref.is_auto_load(),
     }
 }
 

@@ -251,6 +251,56 @@ impl DaemonClient {
         .await
     }
 
+    /// Attach context to an agent
+    pub async fn attach_context(
+        &mut self,
+        agent_id: crate::agent::AgentId,
+        memory_id: crate::memory::MemoryId,
+        ref_type: crate::memory::ContextRefType,
+    ) -> Result<Response> {
+        self.request(&Request::AttachContext {
+            agent_id,
+            memory_id,
+            ref_type,
+        })
+        .await
+    }
+
+    /// Detach context from an agent
+    pub async fn detach_context(
+        &mut self,
+        agent_id: crate::agent::AgentId,
+        memory_id: crate::memory::MemoryId,
+    ) -> Result<Response> {
+        self.request(&Request::DetachContext { agent_id, memory_id })
+            .await
+    }
+
+    /// List context refs for an agent
+    pub async fn list_context_refs(
+        &mut self,
+        agent_id: crate::agent::AgentId,
+        ref_type: Option<String>,
+    ) -> Result<Response> {
+        self.request(&Request::ListContextRefs { agent_id, ref_type })
+            .await
+    }
+
+    /// Inherit context from parent agent to child
+    pub async fn inherit_context(
+        &mut self,
+        from_agent: crate::agent::AgentId,
+        to_agent: crate::agent::AgentId,
+        entries: Option<Vec<crate::memory::MemoryId>>,
+    ) -> Result<Response> {
+        self.request(&Request::InheritContext {
+            from_agent,
+            to_agent,
+            entries,
+        })
+        .await
+    }
+
     /// Subscribe to daemon events (real-time streaming)
     ///
     /// After calling this, use `read_event()` to receive events.

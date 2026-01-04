@@ -10,7 +10,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::RwLock;
 
 use crate::agent::AgentId;
-use crate::memory::{MemoryEntry, MemoryQuery, MemoryScope, MemorySystem};
+use crate::memory::{MemoryEntry, MemoryQuery, MemoryScope, MemorySystem, PersistentContextRefStore};
 use crate::task::{ApprovalId, Task, TaskConfig, TaskId, TaskScheduler, TaskStatus};
 
 use super::protocol::{AgentInfo, ApprovalInfo, MemoryInfo, OutputLine, TaskInfo};
@@ -21,6 +21,7 @@ pub struct HandlerState {
     pub supervisor: Arc<RwLock<Supervisor>>,
     pub scheduler: Arc<TaskScheduler>,
     pub memory: Arc<MemorySystem>,
+    pub refs: Arc<RwLock<PersistentContextRefStore>>,
     pub started_at: Instant,
 }
 
@@ -30,12 +31,14 @@ impl HandlerState {
         supervisor: Arc<RwLock<Supervisor>>,
         scheduler: Arc<TaskScheduler>,
         memory: Arc<MemorySystem>,
+        refs: Arc<RwLock<PersistentContextRefStore>>,
         started_at: Instant,
     ) -> Self {
         Self {
             supervisor,
             scheduler,
             memory,
+            refs,
             started_at,
         }
     }

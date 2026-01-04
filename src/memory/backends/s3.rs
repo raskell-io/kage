@@ -24,14 +24,61 @@ impl S3Backend {
     ///
     /// Uses the default AWS credential chain (env vars, IAM role, etc.)
     pub async fn new(bucket: String, region: Option<String>, prefix: String) -> Result<Self> {
-        let mut config_loader = aws_config::from_env();
+        Self::with_endpoint(bucket, region, prefix, None).await
+    }
 
-        if let Some(region) = region {
-            config_loader = config_loader.region(aws_sdk_s3::config::Region::new(region));
-        }
+    /// Create an S3-compatible backend with custom endpoint
+    ///
+    /// Supports MinIO, DigitalOcean Spaces, Cloudflare R2, Backblaze B2, etc.
+    ///
+    /// # Arguments
+    /// * `bucket` - Bucket name
+    /// * `region` - Region (some providers require this even if not AWS)
+    /// * `prefix` - Key prefix for all objects
+    /// * `endpoint` - Custom endpoint URL (e.g., "https://nyc3.digitaloceanspaces.com")
+    ///
+    /// # Environment Variables
+    /// - `AWS_ACCESS_KEY_ID` - Access key for authentication
+    /// - `AWS_SECRET_ACCESS_KEY` - Secret key for authentication
+    pub async fn with_endpoint(
+        bucket: String,
+        region: Option<String>,
+        prefix: String,
+        endpoint: Option<String>,
+    ) -> Result<Self> {
+        use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 
-        let config = config_loader.load().await;
-        let client = Client::new(&config);
+        let region_val = region.unwrap_or_else(|| "us-east-1".to_string());
+
+        let client = if let Some(endpoint_url) = endpoint {
+            // S3-compatible endpoint configuration
+            // Load credentials from environment
+            let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+                .or_else(|_| std::env::var("S3_ACCESS_KEY_ID"))
+                .context("Missing AWS_ACCESS_KEY_ID or S3_ACCESS_KEY_ID environment variable")?;
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY")
+                .or_else(|_| std::env::var("S3_SECRET_ACCESS_KEY"))
+                .context("Missing AWS_SECRET_ACCESS_KEY or S3_SECRET_ACCESS_KEY environment variable")?;
+
+            let creds = Credentials::new(access_key, secret_key, None, None, "env");
+
+            let config = aws_sdk_s3::Config::builder()
+                .behavior_version(BehaviorVersion::latest())
+                .region(Region::new(region_val))
+                .credentials_provider(creds)
+                .endpoint_url(&endpoint_url)
+                .force_path_style(true) // Required for most S3-compatible services
+                .build();
+
+            Client::from_conf(config)
+        } else {
+            // Standard AWS S3
+            let mut config_loader = aws_config::from_env();
+            config_loader = config_loader.region(Region::new(region_val));
+
+            let config = config_loader.load().await;
+            Client::new(&config)
+        };
 
         Ok(Self {
             client,
