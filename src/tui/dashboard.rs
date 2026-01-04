@@ -2227,7 +2227,7 @@ impl Dashboard {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),  // Header
+                Constraint::Length(2),  // Header (logo + border)
                 Constraint::Min(10),    // Main content
                 Constraint::Length(2),  // Footer
             ])
@@ -2348,7 +2348,19 @@ impl Dashboard {
 
     /// Render the main content area
     fn render_main(&self, f: &mut Frame, area: Rect) {
-        // Two-column layout: Left (Agents/Tasks) + separator + Right (Stream/Logs)
+        // Vertical layout: panel headers row + content
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),  // Panel headers
+                Constraint::Min(5),     // Panel content
+            ])
+            .split(area);
+
+        // Render panel header row
+        self.render_panel_headers(f, rows[0]);
+
+        // Two-column layout for content: Left + separator + Right
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -2356,7 +2368,7 @@ impl Dashboard {
                 Constraint::Length(1),      // Vertical separator
                 Constraint::Percentage(70), // Right panel
             ])
-            .split(area);
+            .split(rows[1]);
 
         // Left panel: Agents (default) or Tasks (when focused)
         if self.focus == Panel::Tasks {
@@ -2374,6 +2386,83 @@ impl Dashboard {
 
         // Draw separator
         self.render_vertical_separator(f, cols[1]);
+    }
+
+    /// Render the panel headers row (Agents/Tasks | Stream/Logs)
+    fn render_panel_headers(&self, f: &mut Frame, area: Rect) {
+        // Split into left and right parts matching the panel widths
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(30), // Left header
+                Constraint::Length(1),      // Separator
+                Constraint::Percentage(70), // Right header
+            ])
+            .split(area);
+
+        // Left header: Agents [1] info │ Tasks [3] info
+        let is_agents_focused = self.focus == Panel::Agents;
+        let is_tasks_focused = self.focus == Panel::Tasks;
+
+        let filter_text = match self.agent_filter {
+            AgentFilter::All => "all",
+            AgentFilter::Working => "working",
+            AgentFilter::Idle => "idle",
+            AgentFilter::Waiting => "waiting",
+        };
+        let (working, idle, waiting) = self.agent_counts();
+        let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
+        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+
+        let left_spans = vec![
+            Span::styled(
+                format!("Agents [1] {} {}{} {}{} {}{}", filter_text, self.s().working, working, self.s().idle, idle, self.s().waiting, waiting),
+                Style::default().fg(if is_agents_focused { self.c().accent } else { self.c().text_muted }),
+            ),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Tasks [3] ({}/{})", running_tasks, pending_tasks + running_tasks),
+                Style::default().fg(if is_tasks_focused { self.c().accent } else { self.c().text_muted }),
+            ),
+        ];
+        let left_header = Paragraph::new(Line::from(left_spans));
+        f.render_widget(left_header, cols[0]);
+
+        // Separator
+        let sep = Paragraph::new("│").style(Style::default().fg(self.c().border));
+        f.render_widget(sep, cols[1]);
+
+        // Right header: Stream [2] info │ Logs [4] info
+        let is_stream_focused = self.focus == Panel::Stream;
+        let is_logs_focused = self.focus == Panel::Logs;
+        let log_count = self.logs.entries.len();
+
+        let stream_info = if self.prefix_active {
+            "^B-".to_string()
+        } else if let Some(ref agent_id) = self.stream.agent_id {
+            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
+            if is_stream_focused {
+                format!("{} │ ^B: menu", short_id)
+            } else {
+                short_id.to_string()
+            }
+        } else {
+            "no agent".to_string()
+        };
+
+        let right_spans = vec![
+            Span::styled(
+                format!("Stream [2] {}", stream_info),
+                Style::default().fg(if is_stream_focused { self.c().accent } else { self.c().text_muted }),
+            ),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Logs [4] ({})", log_count),
+                Style::default().fg(if is_logs_focused { self.c().accent } else { self.c().text_muted }),
+            ),
+        ];
+        let right_header = Paragraph::new(Line::from(right_spans));
+        f.render_widget(right_header, cols[2]);
     }
 
     /// Render a vertical separator line
@@ -2394,16 +2483,6 @@ impl Dashboard {
 
     /// Render the agents panel
     fn render_agents_panel(&self, f: &mut Frame, area: Rect) {
-        let is_focused = self.focus == Panel::Agents;
-
-        // Build filter info for title
-        let filter_text = match self.agent_filter {
-            AgentFilter::All => "all",
-            AgentFilter::Working => "working",
-            AgentFilter::Idle => "idle",
-            AgentFilter::Waiting => "waiting",
-        };
-
         // Filter agents
         let filtered: Vec<&AgentInfo> = self.filtered_agents();
 
@@ -2426,30 +2505,7 @@ impl Dashboard {
             ])
         }).collect();
 
-        // Title with tabs: Agents [1] | Tasks [3]
-        let (working, idle, waiting) = self.agent_counts();
-        let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
-        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
-
-        let title_spans = vec![
-            Span::styled(
-                format!("Agents [1] {} {}{} {}{} {}{}", filter_text, self.s().working, working, self.s().idle, idle, self.s().waiting, waiting),
-                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                format!("Tasks [3] ({}/{})", running_tasks, pending_tasks + running_tasks),
-                Style::default().fg(self.c().text_muted),
-            ),
-        ];
-
-        // Render title line
-        let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(title_spans));
-        f.render_widget(title_widget, title_area);
-
-        // Render list below title
-        let list_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+        // Render list (title is rendered separately in render_panel_headers)
         let list = List::new(items)
             .highlight_style(
                 Style::default()
@@ -2458,62 +2514,13 @@ impl Dashboard {
             )
             .highlight_symbol("▸ ");
 
-        f.render_stateful_widget(list, list_area, &mut self.agents.state.clone());
+        f.render_stateful_widget(list, area, &mut self.agents.state.clone());
     }
 
     /// Render the stream panel (agent output)
     fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
-        let is_focused = self.focus == Panel::Stream;
-        let log_count = self.logs.entries.len();
-
-        // Build stream title part
-        let stream_info = if self.prefix_active {
-            "^B-".to_string()  // Waiting for command
-        } else if let Some(ref agent_id) = self.stream.agent_id {
-            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
-            if is_focused {
-                format!("{} │ ^B: menu", short_id)
-            } else {
-                short_id.to_string()
-            }
-        } else {
-            String::new()
-        };
-
-        let scroll_info = if self.stream.scroll > 0 {
-            format!(" ↑{}", self.stream.scroll)
-        } else {
-            String::new()
-        };
-
-        let title_color = if self.prefix_active {
-            self.c().warning
-        } else if is_focused {
-            self.c().accent
-        } else {
-            self.c().text_dim
-        };
-
-        // Title with tabs: Stream [2] | Logs [4]
-        let title_spans = vec![
-            Span::styled(
-                format!("Stream [2] {}", stream_info),
-                Style::default().fg(title_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(scroll_info, Style::default().fg(self.c().text_muted)),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                format!("Logs [4] ({})", log_count),
-                Style::default().fg(self.c().text_muted),
-            ),
-        ];
-
-        // Render title line
-        let title_area = Rect { height: 1, ..area };
-        f.render_widget(Paragraph::new(Line::from(title_spans)), title_area);
-
-        let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
-        let inner_height = content_area.height as usize;
+        // Title is rendered separately in render_panel_headers
+        let inner_height = area.height as usize;
 
         if self.stream.lines.is_empty() {
             let empty_msg = if self.stream.agent_id.is_some() {
@@ -2525,14 +2532,12 @@ impl Dashboard {
                 empty_msg,
                 Style::default().fg(self.c().text_muted),
             )));
-            f.render_widget(content, content_area);
+            f.render_widget(content, area);
         } else {
             // Calculate visible range (scroll is from bottom, 0 = at bottom)
             let total_lines = self.stream.lines.len();
             let end_idx = total_lines.saturating_sub(self.stream.scroll);
             let start_idx = end_idx.saturating_sub(inner_height);
-
-            let max_width = content_area.width as usize;
 
             let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
@@ -2544,7 +2549,7 @@ impl Dashboard {
 
             // Don't wrap - PTY already wrapped at correct width
             let content = Paragraph::new(visible_lines);
-            f.render_widget(content, content_area);
+            f.render_widget(content, area);
         }
     }
 
@@ -2713,35 +2718,7 @@ impl Dashboard {
 
     /// Render the tasks panel
     fn render_tasks_panel(&self, f: &mut Frame, area: Rect) {
-        let is_focused = self.focus == Panel::Tasks;
-
-        let pending = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
-        let running = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
-        let (working, idle, waiting) = self.agent_counts();
-
-        // Title with tabs: Agents [1] | Tasks [3] (Tasks highlighted)
-        let title_spans = vec![
-            Span::styled(
-                format!("Agents [1] ({})", working + idle + waiting),
-                Style::default().fg(self.c().text_muted),
-            ),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                format!("Tasks [3] ({} pending, {} running)", pending, running),
-                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-            ),
-        ];
-
-        // Render title line
-        let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(title_spans));
-        f.render_widget(title_widget, title_area);
-
-        // If collapsed, just render the header
-        if self.tasks_collapsed {
-            return;
-        }
-
+        // Title is rendered separately in render_panel_headers
         let items: Vec<ListItem> = self.tasks.items.iter().map(|task| {
             let status_style = match task.status {
                 TaskDisplayStatus::Pending => Style::default().fg(self.c().text_muted),
@@ -2774,8 +2751,7 @@ impl Dashboard {
             ])
         }).collect();
 
-        // Render list below title
-        let list_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+        // Render list (title is rendered separately in render_panel_headers)
         let list = List::new(items)
             .highlight_style(
                 Style::default()
@@ -2784,52 +2760,21 @@ impl Dashboard {
             )
             .highlight_symbol("▸ ");
 
-        f.render_stateful_widget(list, list_area, &mut self.tasks.state.clone());
+        f.render_stateful_widget(list, area, &mut self.tasks.state.clone());
     }
 
     /// Render the logs panel
     fn render_logs_panel(&self, f: &mut Frame, area: Rect) {
-        let is_focused = self.focus == Panel::Logs;
-
-        let errors = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Error)).count();
-
-        // Title with tabs: Stream [2] | Logs [4] (Logs highlighted)
-        let logs_info = if errors > 0 {
-            format!("Logs [4] ({} entries, {} errors)", self.logs.entries.len(), errors)
-        } else {
-            format!("Logs [4] ({} entries)", self.logs.entries.len())
-        };
-
-        let title_spans = vec![
-            Span::styled("Stream [2]", Style::default().fg(self.c().text_muted)),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                logs_info,
-                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-            ),
-        ];
-
-        // Render title line
-        let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(title_spans));
-        f.render_widget(title_widget, title_area);
-
-        // If collapsed, just render the header
-        if self.logs_collapsed {
-            return;
-        }
-
-        // Content area below title
-        let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
+        // Title is rendered separately in render_panel_headers
 
         // Calculate available width for message
         // Prefix: "HH:MM:SS ℹ [source] " = timestamp(8) + space(1) + level(2) + source(~10) = ~21 chars
-        let max_msg_width = content_area.width.saturating_sub(21) as usize;
+        let max_msg_width = area.width.saturating_sub(21) as usize;
 
         let visible_logs: Vec<ListItem> = self.logs.entries
             .iter()
             .skip(self.logs.scroll)
-            .take(content_area.height as usize)
+            .take(area.height as usize)
             .map(|entry| {
                 let level_style = match entry.level {
                     LogLevel::Info => Style::default().fg(self.c().info),
@@ -2856,7 +2801,7 @@ impl Dashboard {
             .collect();
 
         let list = List::new(visible_logs);
-        f.render_widget(list, content_area);
+        f.render_widget(list, area);
     }
 
     /// Get current mode for status bar
