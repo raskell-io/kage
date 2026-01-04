@@ -6,6 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use alacritty_terminal::event::VoidListener;
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::term::cell::Flags as CellFlags;
+use alacritty_terminal::term::{Config as TermConfig, Term};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, StdSyncHandler};
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::broadcast;
@@ -18,6 +23,26 @@ use crate::subscription::{SubscriptionId, SubscriptionRegistry};
 use crate::task::{ApprovalAction, ApprovalId, ApprovalLevel, ApprovalRequest, TaskId};
 
 use super::protocol::{AgentInfo, ApprovalInfo, OutputLine};
+
+/// Simple dimensions for terminal initialization
+struct TermDimensions {
+    rows: usize,
+    cols: usize,
+}
+
+impl Dimensions for TermDimensions {
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+
+    fn columns(&self) -> usize {
+        self.cols
+    }
+}
 
 /// Detected workspace configuration for AI agents
 #[derive(Debug, Clone, Default)]
@@ -154,8 +179,8 @@ struct ManagedAgent {
     pty_master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     /// Writer for PTY input - wrapped in Mutex for Sync
     writer: Mutex<Option<Box<dyn Write + Send>>>,
-    /// Virtual terminal parser - maintains screen state
-    vt_parser: Arc<Mutex<vt100::Parser>>,
+    /// Alacritty terminal emulator with built-in scrollback
+    terminal: Arc<Mutex<Term<VoidListener>>>,
     /// Broadcast sender for screen update notifications
     screen_tx: broadcast::Sender<ScreenUpdate>,
     /// Legacy output history for compatibility - shared with reader thread
@@ -166,8 +191,8 @@ struct ManagedAgent {
     child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
     /// When the agent started
     started_at: Instant,
-    /// Maximum output history lines
-    max_history: usize,
+    /// Maximum scrollback history lines
+    max_scrollback: usize,
     /// Subscription being used by this agent
     subscription_id: Option<SubscriptionId>,
     /// Token count for usage tracking (estimated from output)
@@ -459,22 +484,36 @@ impl Supervisor {
             tokens_used: None,
         };
 
-        // Create managed agent with vt100 parser and shared output history
+        // Create managed agent with alacritty terminal (has built-in scrollback)
         let output_history = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let vt_parser = Arc::new(Mutex::new(vt100::Parser::new(actual_rows, actual_cols, 1000)));
         let (screen_tx, _) = broadcast::channel(16);
+
+        // Configure alacritty terminal with scrollback
+        let mut term_config = TermConfig::default();
+        term_config.scrolling_history = 10000; // 10k lines of scrollback
+
+        let term_dims = TermDimensions {
+            rows: actual_rows as usize,
+            cols: actual_cols as usize,
+        };
+
+        let terminal = Arc::new(Mutex::new(Term::new(
+            term_config,
+            &term_dims,
+            VoidListener,
+        )));
 
         let agent = ManagedAgent {
             info,
             pty_master: Mutex::new(Some(pty_pair.master)),
             writer: Mutex::new(Some(writer)),
-            vt_parser,
+            terminal,
             screen_tx,
             output_history,
             output_tx: output_tx.clone(),
             child: Mutex::new(Some(child)),
             started_at: Instant::now(),
-            max_history: 10000,
+            max_scrollback: 10000,
             subscription_id,
             tokens_used: 0,
             memory_processed_idx: 0,
@@ -506,13 +545,16 @@ impl Supervisor {
             if let Some(mut reader) = reader {
                 let output_tx = agent.output_tx.clone();
                 let output_history = agent.output_history.clone();
-                let vt_parser = agent.vt_parser.clone();
+                let terminal = agent.terminal.clone();
                 let screen_tx = agent.screen_tx.clone();
-                let max_history = agent.max_history;
+                let max_scrollback = agent.max_scrollback;
 
                 // Spawn blocking task to read PTY output
                 std::thread::spawn(move || {
                     let mut buf = [0u8; 4096];
+                    // Create a processor for feeding bytes to the terminal
+                    let mut processor: Processor<StdSyncHandler> = Processor::new();
+
                     loop {
                         match reader.read(&mut buf) {
                             Ok(0) => {
@@ -521,9 +563,10 @@ impl Supervisor {
                                 break;
                             }
                             Ok(n) => {
-                                // Feed raw bytes to vt100 parser for proper terminal emulation
-                                if let Ok(mut parser) = vt_parser.lock() {
-                                    parser.process(&buf[..n]);
+                                // Feed raw bytes to alacritty terminal
+                                // Alacritty handles all escape sequences and scrollback internally
+                                if let Ok(mut term) = terminal.lock() {
+                                    processor.advance(&mut *term, &buf[..n]);
                                 }
 
                                 // Notify about screen update
@@ -532,7 +575,7 @@ impl Supervisor {
                                     timestamp: chrono::Utc::now().timestamp(),
                                 });
 
-                                // Legacy: also store as text for compatibility
+                                // Legacy: also store raw text for compatibility
                                 let text = String::from_utf8_lossy(&buf[..n]).to_string();
                                 let line = OutputLine {
                                     text,
@@ -545,8 +588,8 @@ impl Supervisor {
                                     history.push(line.clone());
                                     // Trim to max history size
                                     let len = history.len();
-                                    if len > max_history {
-                                        history.drain(0..len - max_history);
+                                    if len > max_scrollback {
+                                        history.drain(0..len - max_scrollback);
                                     }
                                 }
 
@@ -714,17 +757,175 @@ impl Supervisor {
         }
     }
 
-    /// Get agent screen content from vt100 parser
-    /// Returns Vec of screen lines with ANSI color codes preserved
+    /// Get agent screen content from alacritty terminal
+    /// Returns Vec of screen lines including scrollback history with ANSI color codes
     pub fn get_screen_content(&self, id: AgentId) -> Result<Vec<OutputLine>> {
         let agent = self
             .agents
             .get(&id)
             .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
 
-        // Return full output history for scrollback support
-        let history = agent.output_history.lock().unwrap();
-        Ok(history.clone())
+        let now = chrono::Utc::now().timestamp();
+        let mut result = Vec::new();
+
+        if let Ok(term) = agent.terminal.lock() {
+            let grid = term.grid();
+            let cols = grid.columns();
+
+            // Iterate from topmost line (oldest in scrollback) to bottommost (current screen)
+            let topmost = grid.topmost_line();
+            let bottommost = grid.bottommost_line();
+
+            // Iterate through all lines including scrollback
+            let mut line_idx = topmost;
+            while line_idx <= bottommost {
+                let row = &grid[line_idx];
+                let mut line_text = String::with_capacity(cols * 2); // Extra space for escape codes
+
+                // Track current style to avoid redundant escape codes
+                let mut current_fg: Option<AnsiColor> = None;
+                let mut current_bg: Option<AnsiColor> = None;
+                let mut current_flags = CellFlags::empty();
+
+                // Extract characters with colors from each cell in the row
+                for col in 0..cols {
+                    let cell = &row[alacritty_terminal::index::Column(col)];
+
+                    // Check if style changed
+                    let fg_changed = current_fg.as_ref() != Some(&cell.fg);
+                    let bg_changed = current_bg.as_ref() != Some(&cell.bg);
+                    let flags_changed = current_flags != cell.flags;
+
+                    if fg_changed || bg_changed || flags_changed {
+                        // Build style escape sequence
+                        let mut codes = Vec::new();
+                        let mut colors_handled = false;
+
+                        // Handle flags (bold, italic, underline, etc.)
+                        if flags_changed {
+                            // If we had flags before and now have fewer/different, reset first
+                            if !current_flags.is_empty() && current_flags != cell.flags {
+                                codes.push("0".to_string()); // Full reset
+                                // After reset, we need to re-emit colors
+                                if let Some(code) = Self::color_to_ansi(&cell.fg, true) {
+                                    codes.push(code);
+                                }
+                                if let Some(code) = Self::color_to_ansi(&cell.bg, false) {
+                                    codes.push(code);
+                                }
+                                colors_handled = true;
+                                current_fg = Some(cell.fg);
+                                current_bg = Some(cell.bg);
+                            }
+                            // Now add the new flags
+                            if cell.flags.contains(CellFlags::BOLD) {
+                                codes.push("1".to_string());
+                            }
+                            if cell.flags.contains(CellFlags::DIM) {
+                                codes.push("2".to_string());
+                            }
+                            if cell.flags.contains(CellFlags::ITALIC) {
+                                codes.push("3".to_string());
+                            }
+                            if cell.flags.contains(CellFlags::UNDERLINE) {
+                                codes.push("4".to_string());
+                            }
+                            if cell.flags.contains(CellFlags::INVERSE) {
+                                codes.push("7".to_string());
+                            }
+                            if cell.flags.contains(CellFlags::STRIKEOUT) {
+                                codes.push("9".to_string());
+                            }
+                            current_flags = cell.flags;
+                        }
+
+                        // Handle foreground color (if not already handled by reset)
+                        if fg_changed && !colors_handled {
+                            if let Some(code) = Self::color_to_ansi(&cell.fg, true) {
+                                codes.push(code);
+                            }
+                            current_fg = Some(cell.fg);
+                        }
+
+                        // Handle background color (if not already handled by reset)
+                        if bg_changed && !colors_handled {
+                            if let Some(code) = Self::color_to_ansi(&cell.bg, false) {
+                                codes.push(code);
+                            }
+                            current_bg = Some(cell.bg);
+                        }
+
+                        if !codes.is_empty() {
+                            line_text.push_str(&format!("\x1b[{}m", codes.join(";")));
+                        }
+                    }
+
+                    line_text.push(cell.c);
+                }
+
+                // Reset at end of line
+                if current_fg.is_some() || current_bg.is_some() || !current_flags.is_empty() {
+                    line_text.push_str("\x1b[0m");
+                }
+
+                // Trim trailing whitespace but preserve content and colors
+                let trimmed = line_text.trim_end();
+                result.push(OutputLine {
+                    text: trimmed.to_string(),
+                    is_error: false,
+                    timestamp: now,
+                });
+
+                line_idx = line_idx + 1;
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Convert alacritty Color to ANSI escape code string
+    fn color_to_ansi(color: &AnsiColor, foreground: bool) -> Option<String> {
+        let base = if foreground { 38 } else { 48 };
+        let reset = if foreground { 39 } else { 49 };
+
+        match color {
+            AnsiColor::Named(named) => {
+                // Standard 16 colors (0-15)
+                let code = match named {
+                    NamedColor::Black => 0,
+                    NamedColor::Red => 1,
+                    NamedColor::Green => 2,
+                    NamedColor::Yellow => 3,
+                    NamedColor::Blue => 4,
+                    NamedColor::Magenta => 5,
+                    NamedColor::Cyan => 6,
+                    NamedColor::White => 7,
+                    NamedColor::BrightBlack => 8,
+                    NamedColor::BrightRed => 9,
+                    NamedColor::BrightGreen => 10,
+                    NamedColor::BrightYellow => 11,
+                    NamedColor::BrightBlue => 12,
+                    NamedColor::BrightMagenta => 13,
+                    NamedColor::BrightCyan => 14,
+                    NamedColor::BrightWhite => 15,
+                    // Default colors - emit reset code to clear previous color
+                    NamedColor::Foreground | NamedColor::Background => {
+                        return Some(format!("{}", reset));
+                    }
+                    // Other named colors - use 256-color mode
+                    _ => return Some(format!("{};5;{}", base, *named as u8)),
+                };
+                Some(format!("{};5;{}", base, code))
+            }
+            AnsiColor::Indexed(idx) => {
+                // 256-color palette
+                Some(format!("{};5;{}", base, idx))
+            }
+            AnsiColor::Spec(rgb) => {
+                // True color (24-bit)
+                Some(format!("{};2;{};{};{}", base, rgb.r, rgb.g, rgb.b))
+            }
+        }
     }
 
     /// Subscribe to screen update notifications
@@ -750,7 +951,7 @@ impl Supervisor {
         Ok(agent.output_tx.subscribe())
     }
 
-    /// Resize agent PTY and vt100 parser
+    /// Resize agent PTY and terminal emulator
     pub fn resize(&self, id: AgentId, rows: u16, cols: u16) -> Result<()> {
         let agent = self
             .agents
@@ -768,9 +969,13 @@ impl Supervisor {
             tracing::debug!("Resized agent {} PTY to {}x{}", agent.info.name, cols, rows);
         }
 
-        // Also resize the vt100 parser to match
-        if let Ok(mut parser) = agent.vt_parser.lock() {
-            parser.set_size(rows, cols);
+        // Also resize the alacritty terminal to match
+        if let Ok(mut term) = agent.terminal.lock() {
+            let new_dims = TermDimensions {
+                rows: rows as usize,
+                cols: cols as usize,
+            };
+            term.resize(new_dims);
         }
 
         Ok(())

@@ -61,7 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # PTY for agent process management
 portable-pty = "0.8"
-vt100 = "0.15"                        # Terminal emulator for parsing PTY output
+alacritty_terminal = "0.25"           # Terminal emulator with proper scrollback
 
 # File system
 notify = "6.1"                        # File watching

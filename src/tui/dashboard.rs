@@ -305,8 +305,6 @@ pub struct Dashboard {
     last_refresh: Instant,
     /// Spinner animation frame
     spinner_frame: usize,
-    /// Debug: mouse scroll event counter
-    mouse_scroll_count: usize,
     /// Should quit
     should_quit: bool,
     /// Data update receiver
@@ -1052,7 +1050,6 @@ impl Dashboard {
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
             spinner_frame: 0,
-            mouse_scroll_count: 0,
             should_quit: false,
             data_rx: None,
             action_tx: None,
@@ -1329,11 +1326,6 @@ impl Dashboard {
 
     /// Handle mouse input (scroll wheel like tmux)
     fn handle_mouse(&mut self, kind: MouseEventKind, _col: u16, _row: u16) {
-        // Debug: count scroll events
-        if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
-            self.mouse_scroll_count += 1;
-        }
-
         // In fullscreen modes, always scroll the fullscreen content
         if self.fullscreen_stream {
             match kind {
@@ -2415,7 +2407,6 @@ impl Dashboard {
         let status = Paragraph::new(Line::from(vec![
             Span::styled("Daemon: ", Style::default().fg(self.c().text_muted)),
             Span::styled(status_text, Style::default().fg(status_color)),
-            Span::styled(format!(" │ 🖱{}", self.mouse_scroll_count), Style::default().fg(self.c().text_muted)),
         ]));
         f.render_widget(status, top_chunks[1]);
 
@@ -2684,11 +2675,12 @@ impl Dashboard {
             f.render_widget(content, content_area);
         }
 
-        // Render scroll indicator at bottom
+        // Render scroll indicator at bottom (shows total lines for debugging)
+        let total = self.stream.lines.len();
         let indicator = if self.stream.scroll > 0 {
-            format!("─── ↑{} lines ─── scroll: wheel/⌥↑↓ ", self.stream.scroll)
+            format!("─── ↑{}/{} ─── scroll: wheel/⌥↑↓ ", self.stream.scroll, total)
         } else if !self.stream.lines.is_empty() {
-            "─── bottom ─── scroll: wheel/⌥↑↓ ".to_string()
+            format!("─── bottom ({} lines) ─── scroll: wheel/⌥↑↓ ", total)
         } else {
             String::new()
         };
