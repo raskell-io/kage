@@ -4143,8 +4143,8 @@ async fn data_fetcher(
                 if metadata_tick >= 25 {
                     metadata_tick = 0;
 
-                    // Fetch agents
-                    match client.list_agents(None, true).await {
+                    // Fetch agents (exclude stopped/killed agents)
+                    match client.list_agents(None, false).await {
                         Ok(Response::AgentList { agents }) => {
                             // If no agent selected yet, select the first one
                             if current_agent_id.is_none() && !agents.is_empty() {
