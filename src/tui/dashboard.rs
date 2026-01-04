@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind, EnableMouseCapture, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -1202,11 +1202,10 @@ impl Dashboard {
 
     /// Run the dashboard
     pub fn run(&mut self) -> Result<()> {
-        // Setup terminal
-        // NOTE: Mouse capture is disabled to allow normal terminal copy/paste
+        // Setup terminal with mouse support (like tmux)
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1220,7 +1219,7 @@ impl Dashboard {
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
 
         result
@@ -1246,6 +1245,9 @@ impl Dashboard {
                         if key.kind == KeyEventKind::Press {
                             self.handle_input(key.code, key.modifiers);
                         }
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse.kind, mouse.column, mouse.row);
                     }
                     Event::Resize(_cols, _rows) => {
                         // Terminal resized - PTY resize will be handled on next draw cycle
@@ -1319,6 +1321,31 @@ impl Dashboard {
                 self.last_stream_size = new_size;
                 self.last_resized_agent = current_agent;
             }
+        }
+    }
+
+    /// Handle mouse input (scroll wheel like tmux)
+    fn handle_mouse(&mut self, kind: MouseEventKind, _col: u16, _row: u16) {
+        match kind {
+            MouseEventKind::ScrollUp => {
+                // Scroll up in the focused panel
+                match self.focus {
+                    Panel::Stream => self.stream.scroll_up(3),
+                    Panel::Logs => self.logs.scroll_up(),
+                    Panel::Agents => self.agents.previous(),
+                    Panel::Tasks => self.tasks.previous(),
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                // Scroll down in the focused panel
+                match self.focus {
+                    Panel::Stream => self.stream.scroll_down(3),
+                    Panel::Logs => self.logs.scroll_down(),
+                    Panel::Agents => self.agents.next(),
+                    Panel::Tasks => self.tasks.next(),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2627,9 +2654,9 @@ impl Dashboard {
 
         // Render scroll indicator at bottom
         let indicator = if self.stream.scroll > 0 {
-            format!("─── ↑{} lines ─── ⌥↑/↓ scroll ", self.stream.scroll)
+            format!("─── ↑{} lines ─── scroll: wheel/⌥↑↓ ", self.stream.scroll)
         } else if !self.stream.lines.is_empty() {
-            "─── bottom ─── ⌥↑/↓ scroll ".to_string()
+            "─── bottom ─── scroll: wheel/⌥↑↓ ".to_string()
         } else {
             String::new()
         };
@@ -2695,9 +2722,9 @@ impl Dashboard {
 
         // Build status line: left side hints, right side mode
         let left_status = if self.stream.scroll > 0 {
-            format!(" ↑{} │ ⌥↑/↓: scroll │ ^B: menu", self.stream.scroll)
+            format!(" ↑{} │ wheel: scroll │ ^B: menu", self.stream.scroll)
         } else {
-            " ⌥↑/↓: scroll │ ^B: menu".to_string()
+            " wheel: scroll │ ^B: menu".to_string()
         };
 
         // Calculate spacing
