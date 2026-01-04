@@ -648,7 +648,10 @@ impl Supervisor {
                     .as_ref()
                     .map(|ns| a.info.namespace.as_ref() == Some(ns))
                     .unwrap_or(true);
-                let status_match = include_stopped || a.info.status != "stopped";
+                let status_match = include_stopped || !matches!(
+                    a.info.status.as_str(),
+                    "stopped" | "completed" | "failed"
+                );
                 ns_match && status_match
             })
             .map(|a| a.info.clone())
