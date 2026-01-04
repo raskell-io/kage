@@ -275,6 +275,8 @@ pub struct Dashboard {
     show_spawn_dialog: bool,
     /// Fullscreen stream mode (no panels, just agent output)
     fullscreen_stream: bool,
+    /// Fullscreen logs mode
+    fullscreen_logs: bool,
     /// Tasks panel collapsed
     tasks_collapsed: bool,
     /// Logs panel collapsed
@@ -935,6 +937,7 @@ impl Dashboard {
             show_approvals: false,
             show_spawn_dialog: false,
             fullscreen_stream: false,
+            fullscreen_logs: false,
             tasks_collapsed: true,  // Collapsed by default
             logs_collapsed: true,   // Collapsed by default
             spawn_dialog: SpawnDialogState::new(),
@@ -1097,10 +1100,10 @@ impl Dashboard {
 
     /// Handle keyboard input
     fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        // Fullscreen mode - Esc or 'f' to exit
+        // Fullscreen stream mode - Esc or 'f' to exit
         if self.fullscreen_stream {
             match key {
-                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') | KeyCode::Char('2') => {
                     self.fullscreen_stream = false;
                 }
                 // Allow scrolling in fullscreen
@@ -1110,6 +1113,28 @@ impl Dashboard {
                 KeyCode::Char('G') => self.stream.scroll_to_bottom(),
                 KeyCode::PageUp => self.stream.scroll_up(20),
                 KeyCode::PageDown => self.stream.scroll_down(20),
+                _ => {}
+            }
+            return;
+        }
+
+        // Fullscreen logs mode - Esc or '4' to exit
+        if self.fullscreen_logs {
+            match key {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('4') => {
+                    self.fullscreen_logs = false;
+                }
+                // Allow scrolling in fullscreen
+                KeyCode::Up | KeyCode::Char('k') => self.logs.scroll_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.logs.scroll_down(),
+                KeyCode::Char('g') => self.logs.scroll = self.logs.entries.len().saturating_sub(1),
+                KeyCode::Char('G') => self.logs.scroll = 0,
+                KeyCode::PageUp => {
+                    for _ in 0..20 { self.logs.scroll_up(); }
+                }
+                KeyCode::PageDown => {
+                    for _ in 0..20 { self.logs.scroll_down(); }
+                }
                 _ => {}
             }
             return;
@@ -1335,9 +1360,22 @@ impl Dashboard {
             KeyCode::Tab => self.focus = self.focus.next(),
             KeyCode::BackTab => self.focus = self.focus.prev(),
             KeyCode::Char('1') => self.focus = Panel::Agents,
-            KeyCode::Char('2') => self.focus = Panel::Stream,
+            KeyCode::Char('2') => {
+                if self.focus == Panel::Stream {
+                    self.fullscreen_stream = !self.fullscreen_stream;
+                } else {
+                    self.focus = Panel::Stream;
+                }
+            }
             KeyCode::Char('3') => self.focus = Panel::Tasks,
-            KeyCode::Char('4') => self.focus = Panel::Logs,
+            KeyCode::Char('4') => {
+                if self.focus == Panel::Logs {
+                    self.fullscreen_logs = !self.fullscreen_logs;
+                } else {
+                    self.focus = Panel::Logs;
+                    self.logs_collapsed = false; // Expand when focusing
+                }
+            }
 
             // Horizontal panel navigation (vim-style)
             KeyCode::Char('h') | KeyCode::Left => self.handle_left(),
@@ -1806,6 +1844,12 @@ impl Dashboard {
             return;
         }
 
+        // Fullscreen logs mode
+        if self.fullscreen_logs {
+            self.render_fullscreen_logs(f, area);
+            return;
+        }
+
         // Main layout
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2190,6 +2234,96 @@ impl Dashboard {
             .alignment(Alignment::Right);
             f.render_widget(status_bar, status_area);
         }
+    }
+
+    /// Render fullscreen logs (no decorations, just log entries)
+    fn render_fullscreen_logs(&self, f: &mut Frame, area: Rect) {
+        let inner_height = area.height.saturating_sub(2) as usize; // Leave room for header and footer
+
+        // Header
+        let header_area = Rect { height: 1, ..area };
+        let errors = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Error)).count();
+        let header_text = format!(" Logs ({} entries, {} errors) | Press 4 or Esc to exit fullscreen ",
+            self.logs.entries.len(), errors);
+        let header = Paragraph::new(Line::from(Span::styled(
+            header_text,
+            Style::default().fg(self.c().text).bg(self.c().bg_surface).add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(header, header_area);
+
+        // Content area
+        let content_area = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(2),
+            ..area
+        };
+
+        if self.logs.entries.is_empty() {
+            let empty_msg = "No log entries";
+            let content = Paragraph::new(Line::from(Span::styled(
+                empty_msg,
+                Style::default().fg(self.c().text_muted),
+            )))
+            .alignment(Alignment::Center);
+            f.render_widget(content, content_area);
+            return;
+        }
+
+        // Calculate visible range (scroll from bottom)
+        let total_entries = self.logs.entries.len();
+        let end_idx = total_entries.saturating_sub(self.logs.scroll);
+        let start_idx = end_idx.saturating_sub(inner_height);
+
+        let visible_logs: Vec<Line> = self.logs.entries[start_idx..end_idx]
+            .iter()
+            .map(|entry| {
+                let level_style = match entry.level {
+                    LogLevel::Error => Style::default().fg(self.c().error),
+                    LogLevel::Warning => Style::default().fg(self.c().warning),
+                    LogLevel::Info => Style::default().fg(self.c().accent),
+                    LogLevel::Success => Style::default().fg(self.c().success),
+                    LogLevel::Debug => Style::default().fg(self.c().text_muted),
+                };
+                let level_icon = match entry.level {
+                    LogLevel::Error => "✗",
+                    LogLevel::Warning => "⚠",
+                    LogLevel::Info => "ℹ",
+                    LogLevel::Success => "✓",
+                    LogLevel::Debug => "·",
+                };
+                Line::from(vec![
+                    Span::styled(format!("{} ", entry.timestamp), Style::default().fg(self.c().text_dim)),
+                    Span::styled(format!("{} ", level_icon), level_style),
+                    Span::styled(format!("[{}] ", entry.source), Style::default().fg(self.c().accent)),
+                    Span::styled(&entry.message, Style::default().fg(self.c().text)),
+                ])
+            })
+            .collect();
+
+        let content = Paragraph::new(visible_logs)
+            .style(Style::default().bg(self.c().bg))
+            .wrap(ratatui::widgets::Wrap { trim: false });
+
+        f.render_widget(content, content_area);
+
+        // Footer with scroll info
+        let footer_area = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+        let scroll_info = if self.logs.scroll > 0 {
+            format!(" ↑{} entries ", self.logs.scroll)
+        } else {
+            " (latest) ".to_string()
+        };
+        let footer = Paragraph::new(Line::from(Span::styled(
+            scroll_info,
+            Style::default().fg(self.c().text_muted).bg(self.c().bg_surface),
+        )))
+        .alignment(Alignment::Right);
+        f.render_widget(footer, footer_area);
     }
 
     /// Render the tasks panel
@@ -3306,8 +3440,24 @@ async fn data_fetcher(
                         Action::SpawnAgent { repo, prompt, namespace } => {
                             let repo_path = std::path::PathBuf::from(&repo);
                             match client.spawn_agent(repo_path, namespace, Some(prompt), None, None).await {
+                                Ok(Response::AgentSpawned { id }) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Info,
+                                        source: "spawn".to_string(),
+                                        message: format!("Agent {} spawned successfully", &id.to_string()[..8]),
+                                    }));
+                                }
+                                Ok(Response::Error { message }) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "spawn".to_string(),
+                                        message: format!("Spawn failed: {}", message),
+                                    }));
+                                }
                                 Ok(_) => {
-                                    // Agent spawned successfully, will appear in next refresh
+                                    // Unexpected response
                                 }
                                 Err(e) => {
                                     let _ = tx.send(DataUpdate::Log(LogEntry {
