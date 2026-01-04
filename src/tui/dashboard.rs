@@ -1392,35 +1392,54 @@ impl Dashboard {
             }
 
             // Scroll keys are intercepted (not sent to agent)
-            // Note: PageUp/PageDown may be intercepted by terminal emulators on macOS
-            // Use Ctrl+U/D as reliable alternatives
-            match (key, modifiers.contains(KeyModifiers::CONTROL)) {
-                // Ctrl+U = scroll up half page (vim style, always works)
-                (KeyCode::Char('u'), true) => {
-                    self.stream.scroll_up(15);
+            let is_ctrl = modifiers.contains(KeyModifiers::CONTROL);
+            let is_alt = modifiers.contains(KeyModifiers::ALT);
+            let is_shift = modifiers.contains(KeyModifiers::SHIFT);
+
+            // Multiple ways to scroll - try to catch all terminal variants
+            match key {
+                // Alt+Up/Down - most reliable on macOS (Option key)
+                KeyCode::Up if is_alt => {
+                    self.stream.scroll_up(5);
                     return;
                 }
-                // Ctrl+D = scroll down half page (vim style, always works)
-                (KeyCode::Char('d'), true) => {
-                    self.stream.scroll_down(15);
+                KeyCode::Down if is_alt => {
+                    self.stream.scroll_down(5);
                     return;
                 }
-                // PageUp/PageDown (may not work on all terminals)
-                (KeyCode::PageUp, _) => {
-                    self.stream.scroll_up(20);
-                    return;
-                }
-                (KeyCode::PageDown, _) => {
-                    self.stream.scroll_down(20);
-                    return;
-                }
-                // Shift+Up/Down for single line scroll
-                _ if key == KeyCode::Up && modifiers.contains(KeyModifiers::SHIFT) => {
+                // Shift+Up/Down
+                KeyCode::Up if is_shift => {
                     self.stream.scroll_up(1);
                     return;
                 }
-                _ if key == KeyCode::Down && modifiers.contains(KeyModifiers::SHIFT) => {
+                KeyCode::Down if is_shift => {
                     self.stream.scroll_down(1);
+                    return;
+                }
+                // Ctrl+U/D or raw control chars
+                KeyCode::Char('u') | KeyCode::Char('U') if is_ctrl => {
+                    self.stream.scroll_up(15);
+                    return;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') if is_ctrl => {
+                    self.stream.scroll_down(15);
+                    return;
+                }
+                KeyCode::Char('\x15') => { // Raw Ctrl+U (ASCII 21)
+                    self.stream.scroll_up(15);
+                    return;
+                }
+                KeyCode::Char('\x04') => { // Raw Ctrl+D (ASCII 4)
+                    self.stream.scroll_down(15);
+                    return;
+                }
+                // PageUp/PageDown
+                KeyCode::PageUp => {
+                    self.stream.scroll_up(20);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.stream.scroll_down(20);
                     return;
                 }
                 _ => {}
@@ -2608,9 +2627,9 @@ impl Dashboard {
 
         // Render scroll indicator at bottom
         let indicator = if self.stream.scroll > 0 {
-            format!("─── ↑{} lines ─── ^U/^D scroll ", self.stream.scroll)
+            format!("─── ↑{} lines ─── ⌥↑/↓ scroll ", self.stream.scroll)
         } else if !self.stream.lines.is_empty() {
-            "─── bottom ─── ^U/^D scroll ".to_string()
+            "─── bottom ─── ⌥↑/↓ scroll ".to_string()
         } else {
             String::new()
         };
@@ -2676,9 +2695,9 @@ impl Dashboard {
 
         // Build status line: left side hints, right side mode
         let left_status = if self.stream.scroll > 0 {
-            format!(" ↑{} │ ^U/^D: scroll │ ^B: menu", self.stream.scroll)
+            format!(" ↑{} │ ⌥↑/↓: scroll │ ^B: menu", self.stream.scroll)
         } else {
-            " ^U/^D: scroll │ ^B: menu".to_string()
+            " ⌥↑/↓: scroll │ ^B: menu".to_string()
         };
 
         // Calculate spacing
