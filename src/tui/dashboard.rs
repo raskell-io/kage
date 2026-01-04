@@ -2571,8 +2571,10 @@ impl Dashboard {
 
     /// Render the stream panel (agent output)
     fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
-        // Title is rendered separately in render_panel_headers
-        let inner_height = area.height as usize;
+        // Reserve 1 line for scroll indicator at bottom
+        let content_height = area.height.saturating_sub(1) as usize;
+        let content_area = Rect { height: area.height.saturating_sub(1), ..area };
+        let indicator_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
 
         if self.stream.lines.is_empty() {
             let empty_msg = if self.stream.agent_id.is_some() {
@@ -2584,12 +2586,12 @@ impl Dashboard {
                 empty_msg,
                 Style::default().fg(self.c().text_muted),
             )));
-            f.render_widget(content, area);
+            f.render_widget(content, content_area);
         } else {
             // Calculate visible range (scroll is from bottom, 0 = at bottom)
             let total_lines = self.stream.lines.len();
             let end_idx = total_lines.saturating_sub(self.stream.scroll);
-            let start_idx = end_idx.saturating_sub(inner_height);
+            let start_idx = end_idx.saturating_sub(content_height);
 
             let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
@@ -2601,7 +2603,23 @@ impl Dashboard {
 
             // Don't wrap - PTY already wrapped at correct width
             let content = Paragraph::new(visible_lines);
-            f.render_widget(content, area);
+            f.render_widget(content, content_area);
+        }
+
+        // Render scroll indicator at bottom
+        let indicator = if self.stream.scroll > 0 {
+            format!("─── ↑{} lines ─── ^U/^D scroll ", self.stream.scroll)
+        } else if !self.stream.lines.is_empty() {
+            "─── bottom ─── ^U/^D scroll ".to_string()
+        } else {
+            String::new()
+        };
+        if !indicator.is_empty() {
+            let indicator_widget = Paragraph::new(Line::from(Span::styled(
+                indicator,
+                Style::default().fg(self.c().text_muted),
+            )));
+            f.render_widget(indicator_widget, indicator_area);
         }
     }
 
