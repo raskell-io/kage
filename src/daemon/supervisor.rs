@@ -26,6 +26,8 @@ pub struct Supervisor {
     agent_counter: u32,
     /// Subscription pool for API key management
     subscription_pool: Option<Arc<SubscriptionPool>>,
+    /// Cached API keys (loaded once at init, never touches keychain again)
+    api_key_cache: HashMap<SubscriptionId, String>,
     /// Pending approval requests
     pending_approvals: HashMap<ApprovalId, ApprovalRequest>,
     /// Agent to approval level mapping (from tasks)
@@ -68,6 +70,7 @@ impl Supervisor {
             agents: HashMap::new(),
             agent_counter: 0,
             subscription_pool: None,
+            api_key_cache: HashMap::new(),
             pending_approvals: HashMap::new(),
             agent_approval_levels: HashMap::new(),
             agent_tasks: HashMap::new(),
@@ -81,6 +84,7 @@ impl Supervisor {
             agents: HashMap::new(),
             agent_counter: 0,
             subscription_pool: Some(pool),
+            api_key_cache: HashMap::new(),
             pending_approvals: HashMap::new(),
             agent_approval_levels: HashMap::new(),
             agent_tasks: HashMap::new(),
@@ -94,20 +98,41 @@ impl Supervisor {
 
     /// Initialize subscription pool from config
     ///
-    /// Note: We intentionally do NOT auto-detect Claude Code credentials here.
-    /// Keychain access should only happen during onboarding/setup wizard to avoid
-    /// macOS keychain password prompts on every daemon start.
+    /// This loads all subscriptions from the database and caches their API keys
+    /// in memory. Keychain access happens ONCE here, never during agent spawn.
     pub fn init_subscription_pool(&mut self) -> Result<()> {
+        use crate::secrets::{SecretScope, get as get_secret};
+
         let db_path = self.config.daemon.state_dir.join("subscriptions.redb");
         let registry = Arc::new(SubscriptionRegistry::open(db_path)?);
         let pool = Arc::new(SubscriptionPool::new(registry));
+
+        // Pre-load all API keys from keychain into memory cache
+        // This is the ONLY time we access keychain for spawning
+        let subscriptions = pool.list_subscriptions();
+        for sub in &subscriptions {
+            match get_secret(&sub.api_key_ref, &SecretScope::Global) {
+                Ok(Some(key)) => {
+                    tracing::debug!("Cached API key for subscription: {}", sub.name);
+                    self.api_key_cache.insert(sub.id, key);
+                }
+                Ok(None) => {
+                    tracing::warn!("API key not found in keychain for subscription: {} (ref: {})", sub.name, sub.api_key_ref);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load API key for subscription {}: {}", sub.name, e);
+                }
+            }
+        }
+
         self.subscription_pool = Some(pool.clone());
 
-        let count = pool.subscription_count();
-        if count == 0 {
+        let cached = self.api_key_cache.len();
+        let total = subscriptions.len();
+        if total == 0 {
             tracing::info!("No subscriptions in pool. Add credentials via 'kage subscription add' or the setup wizard.");
         } else {
-            tracing::info!("Subscription pool initialized with {} subscription(s)", count);
+            tracing::info!("Subscription pool initialized: {}/{} subscriptions with cached keys", cached, total);
         }
         Ok(())
     }
@@ -127,11 +152,13 @@ impl Supervisor {
     }
 
     /// Add a new subscription
+    ///
+    /// Stores the API key in both keychain (for persistence) and memory cache (for spawning).
     pub fn add_subscription(&mut self, name: String, api_key: String) -> Result<()> {
         use crate::subscription::{ProviderType, Subscription};
         use crate::secrets::{SecretScope, set as set_secret};
 
-        // Store API key in keychain
+        // Store API key in keychain (for persistence across daemon restarts)
         let key_name = format!("subscription:{}", name);
         set_secret(&key_name, &api_key, &SecretScope::Global)?;
 
@@ -139,10 +166,12 @@ impl Supervisor {
         let subscription = Subscription::new(&name, &key_name)
             .with_provider(ProviderType::ClaudeCode);
 
-        // Add to pool/registry
+        // Add to pool/registry and cache the API key in memory
         if let Some(ref pool) = self.subscription_pool {
-            pool.add_subscription(subscription)?;
-            tracing::info!("Added subscription: {}", name);
+            let sub_id = pool.add_subscription(subscription)?;
+            // Cache the API key so spawn() never needs to touch keychain
+            self.api_key_cache.insert(sub_id, api_key);
+            tracing::info!("Added subscription: {} (cached)", name);
             Ok(())
         } else {
             anyhow::bail!("Subscription pool not initialized")
@@ -178,11 +207,15 @@ impl Supervisor {
             match pool.acquire(&context) {
                 Ok(lease) => {
                     let sub_id = lease.id();
-                    let key_ref = lease.api_key_ref().to_string();
 
-                    // Get the actual API key from keychain
-                    let api_key = crate::secrets::get(&key_ref, &crate::secrets::SecretScope::Global)?
-                        .ok_or_else(|| anyhow::anyhow!("API key not found in keychain: {}", key_ref))?;
+                    // Get API key from in-memory cache (never touches keychain here)
+                    let api_key = self.api_key_cache.get(&sub_id)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "API key not cached for subscription: {} ({}). Restart daemon to reload keys.",
+                            lease.name(),
+                            sub_id
+                        ))?;
 
                     tracing::info!(
                         "Agent {} acquired subscription {} ({})",
@@ -1029,6 +1062,7 @@ impl Clone for Supervisor {
             agents: HashMap::new(),
             agent_counter: self.agent_counter,
             subscription_pool: self.subscription_pool.clone(),
+            api_key_cache: self.api_key_cache.clone(),
             pending_approvals: HashMap::new(),
             agent_approval_levels: HashMap::new(),
             agent_tasks: HashMap::new(),
