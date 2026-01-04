@@ -2823,13 +2823,8 @@ impl Dashboard {
 
     /// Render the footer with mode indicator
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        // Panel indicators - group related panels together
+        // Panel indicators
         let agents_style = if self.focus == Panel::Agents {
-            Style::default().fg(self.c().bg).bg(self.c().accent)
-        } else {
-            Style::default().fg(self.c().text_muted)
-        };
-        let tasks_style = if self.focus == Panel::Tasks {
             Style::default().fg(self.c().bg).bg(self.c().accent)
         } else {
             Style::default().fg(self.c().text_muted)
@@ -2839,18 +2834,10 @@ impl Dashboard {
         } else {
             Style::default().fg(self.c().text_muted)
         };
-        let logs_style = if self.focus == Panel::Logs {
-            Style::default().fg(self.c().bg).bg(self.c().accent)
-        } else {
-            Style::default().fg(self.c().text_muted)
-        };
 
         let hint_spans: Vec<Span> = vec![
             Span::styled(" 1:Agents ", agents_style),
-            Span::styled(" 3:Tasks ", tasks_style),
-            Span::styled("  ", Style::default()),
             Span::styled(" 2:Stream ", stream_style),
-            Span::styled(" 4:Logs ", logs_style),
             Span::styled("  ", Style::default()),
             Span::styled(" ? ", Style::default().fg(self.c().bg).bg(self.c().accent)),
             Span::styled(" Help ", Style::default().fg(self.c().text_muted)),
