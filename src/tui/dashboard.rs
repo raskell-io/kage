@@ -201,8 +201,13 @@ impl SetupWizardState {
     fn insert_char(&mut self, c: char) {
         let cursor = self.cursor;
         let field = self.current_field_mut();
-        if cursor <= field.len() {
-            field.insert(cursor, c);
+        let char_count = field.chars().count();
+        if cursor <= char_count {
+            let byte_pos = field.char_indices()
+                .nth(cursor)
+                .map(|(i, _)| i)
+                .unwrap_or(field.len());
+            field.insert(byte_pos, c);
             self.cursor += 1;
         }
     }
@@ -212,8 +217,13 @@ impl SetupWizardState {
             self.cursor -= 1;
             let cursor = self.cursor;
             let field = self.current_field_mut();
-            if !field.is_empty() && cursor < field.len() {
-                field.remove(cursor);
+            let char_count = field.chars().count();
+            if !field.is_empty() && cursor < char_count {
+                let byte_pos = field.char_indices()
+                    .nth(cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                field.remove(byte_pos);
             }
         }
     }
@@ -764,13 +774,14 @@ impl SpawnDialogState {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
+        let cursor = cwd.chars().count(); // Start cursor at end
 
         Self {
             focus: 0, // Start on repo field
             repo: cwd,
             provider: AgentProvider::default(),
             namespace: String::new(),
-            cursor: 0,
+            cursor,
         }
     }
 
@@ -780,10 +791,10 @@ impl SpawnDialogState {
             .unwrap_or_else(|_| ".".to_string());
 
         self.focus = 0;
+        self.cursor = cwd.chars().count(); // Start cursor at end
         self.repo = cwd;
         self.provider = AgentProvider::default();
         self.namespace.clear();
-        self.cursor = 0;
     }
 
     /// Get the current text field (repo or namespace, not provider which is a selector)
@@ -806,30 +817,41 @@ impl SpawnDialogState {
     fn next_field(&mut self) {
         self.focus = (self.focus + 1) % 3;
         if let Some(field) = self.current_text_field() {
-            self.cursor = field.len();
+            self.cursor = field.chars().count();
         }
     }
 
     fn prev_field(&mut self) {
         self.focus = if self.focus == 0 { 2 } else { self.focus - 1 };
         if let Some(field) = self.current_text_field() {
-            self.cursor = field.len();
+            self.cursor = field.chars().count();
         }
     }
 
     fn insert_char(&mut self, c: char) {
         let cursor = self.cursor;
-        // Edit the appropriate field based on focus
+        // Edit the appropriate field based on focus (using char indices)
         match self.focus {
             0 => {
-                if cursor <= self.repo.len() {
-                    self.repo.insert(cursor, c);
+                let char_count = self.repo.chars().count();
+                if cursor <= char_count {
+                    // Find byte position from char position
+                    let byte_pos = self.repo.char_indices()
+                        .nth(cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.repo.len());
+                    self.repo.insert(byte_pos, c);
                     self.cursor += 1;
                 }
             }
             2 => {
-                if cursor <= self.namespace.len() {
-                    self.namespace.insert(cursor, c);
+                let char_count = self.namespace.chars().count();
+                if cursor <= char_count {
+                    let byte_pos = self.namespace.char_indices()
+                        .nth(cursor)
+                        .map(|(i, _)| i)
+                        .unwrap_or(self.namespace.len());
+                    self.namespace.insert(byte_pos, c);
                     self.cursor += 1;
                 }
             }
@@ -843,13 +865,23 @@ impl SpawnDialogState {
             let cursor = self.cursor;
             match self.focus {
                 0 => {
-                    if !self.repo.is_empty() && cursor < self.repo.len() {
-                        self.repo.remove(cursor);
+                    let char_count = self.repo.chars().count();
+                    if !self.repo.is_empty() && cursor < char_count {
+                        let byte_pos = self.repo.char_indices()
+                            .nth(cursor)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.repo.remove(byte_pos);
                     }
                 }
                 2 => {
-                    if !self.namespace.is_empty() && cursor < self.namespace.len() {
-                        self.namespace.remove(cursor);
+                    let char_count = self.namespace.chars().count();
+                    if !self.namespace.is_empty() && cursor < char_count {
+                        let byte_pos = self.namespace.char_indices()
+                            .nth(cursor)
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        self.namespace.remove(byte_pos);
                     }
                 }
                 _ => {}
@@ -868,7 +900,7 @@ impl SpawnDialogState {
 
     fn move_cursor_right(&mut self) {
         if let Some(field) = self.current_text_field() {
-            if self.cursor < field.len() {
+            if self.cursor < field.chars().count() {
                 self.cursor += 1;
             }
         } else if self.focus == 1 {
@@ -883,7 +915,7 @@ impl SpawnDialogState {
 
     fn move_cursor_end(&mut self) {
         if let Some(field) = self.current_text_field() {
-            self.cursor = field.len();
+            self.cursor = field.chars().count();
         }
     }
 
@@ -1202,11 +1234,11 @@ impl Dashboard {
 
     /// Run the dashboard
     pub fn run(&mut self) -> Result<()> {
-        // Setup terminal (no mouse capture - allows native text selection with Cmd+C)
-        // Use Option+↑/↓ or Page Up/Down for scrolling instead
+        // Setup terminal with mouse capture for scroll wheel support
+        // Use Shift+drag to select text for copying (bypasses mouse capture)
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1220,7 +1252,7 @@ impl Dashboard {
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
         terminal.show_cursor()?;
 
         result
@@ -1246,6 +1278,9 @@ impl Dashboard {
                         if key.kind == KeyEventKind::Press {
                             self.handle_input(key.code, key.modifiers);
                         }
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse.kind, mouse.column, mouse.row);
                     }
                     Event::Resize(_cols, _rows) => {
                         // Terminal resized - PTY resize will be handled on next draw cycle
@@ -3795,8 +3830,12 @@ impl Dashboard {
         let repo_display = if repo_focused {
             let cursor_pos = self.spawn_dialog.cursor;
             let repo = &self.spawn_dialog.repo;
-            if cursor_pos < repo.len() {
-                format!("  {}│{}", &repo[..cursor_pos], &repo[cursor_pos..])
+            let char_count = repo.chars().count();
+            if cursor_pos < char_count {
+                // Split at char index
+                let before: String = repo.chars().take(cursor_pos).collect();
+                let after: String = repo.chars().skip(cursor_pos).collect();
+                format!("  {}│{}", before, after)
             } else {
                 format!("  {}│", repo)
             }
@@ -3854,8 +3893,11 @@ impl Dashboard {
         let ns_display = if ns_focused {
             let cursor_pos = self.spawn_dialog.cursor;
             let ns = &self.spawn_dialog.namespace;
-            if cursor_pos < ns.len() {
-                format!("  {}│{}", &ns[..cursor_pos], &ns[cursor_pos..])
+            let char_count = ns.chars().count();
+            if cursor_pos < char_count {
+                let before: String = ns.chars().take(cursor_pos).collect();
+                let after: String = ns.chars().skip(cursor_pos).collect();
+                format!("  {}│{}", before, after)
             } else {
                 format!("  {}│", ns)
             }
