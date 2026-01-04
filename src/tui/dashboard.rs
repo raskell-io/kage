@@ -1715,7 +1715,10 @@ impl Dashboard {
 
     fn handle_up(&mut self) {
         match self.focus {
-            Panel::Agents => self.agents.previous(),
+            Panel::Agents => {
+                self.agents.previous();
+                self.sync_stream_to_selected_agent();
+            }
             Panel::Stream => self.stream.scroll_up(1),
             Panel::Tasks => self.tasks.previous(),
             Panel::Logs => self.logs.scroll_up(),
@@ -1724,10 +1727,27 @@ impl Dashboard {
 
     fn handle_down(&mut self) {
         match self.focus {
-            Panel::Agents => self.agents.next(),
+            Panel::Agents => {
+                self.agents.next();
+                self.sync_stream_to_selected_agent();
+            }
             Panel::Stream => self.stream.scroll_down(1),
             Panel::Tasks => self.tasks.next(),
             Panel::Logs => self.logs.scroll_down(),
+        }
+    }
+
+    /// Sync stream panel to show output from currently selected agent
+    fn sync_stream_to_selected_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let agent_id = agent.id.clone();
+            if self.stream.agent_id.as_ref() != Some(&agent_id) {
+                self.stream.agent_id = Some(agent_id.clone());
+                self.stream.lines.clear();
+                self.stream.scroll = 0;
+                // Request fresh output for this agent
+                self.send_action(Action::RequestOutput { id: agent_id });
+            }
         }
     }
 
