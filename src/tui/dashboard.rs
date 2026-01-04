@@ -3688,6 +3688,9 @@ async fn data_fetcher(
     // Pending actions to process
     let mut pending_actions: Vec<Action> = Vec::new();
 
+    // Counter for metadata refresh (every N ticks)
+    let mut metadata_tick: u32 = 0;
+
     // Track if we've checked subscriptions on startup
     let mut checked_subscriptions = false;
 
@@ -3827,19 +3830,7 @@ async fn data_fetcher(
                     }
                 }
 
-                // Fetch agents
-                match client.list_agents(None, true).await {
-                    Ok(Response::AgentList { agents }) => {
-                        // If no agent selected yet, select the first one
-                        if current_agent_id.is_none() && !agents.is_empty() {
-                            current_agent_id = Some(agents[0].id.to_string());
-                        }
-                        let _ = tx.send(DataUpdate::Agents(agents));
-                    }
-                    _ => {}
-                }
-
-                // Fetch screen content for current agent (uses vt100 parser for proper terminal emulation)
+                // Fetch screen content for current agent - this is the fast path (every tick)
                 if let Some(ref agent_id) = current_agent_id {
                     if let Ok(id) = agent_id.parse::<crate::agent::AgentId>() {
                         match client.get_screen_content(id).await {
@@ -3863,32 +3854,50 @@ async fn data_fetcher(
                     }
                 }
 
-                // Fetch tasks
-                match client.list_tasks(None).await {
-                    Ok(Response::TaskList { tasks }) => {
-                        let _ = tx.send(DataUpdate::Tasks(tasks));
-                    }
-                    _ => {}
-                }
+                // Fetch metadata less frequently (every 500ms = 25 ticks at 20ms)
+                metadata_tick += 1;
+                if metadata_tick >= 25 {
+                    metadata_tick = 0;
 
-                // Fetch pending approvals
-                match client.list_approvals().await {
-                    Ok(Response::ApprovalList { approvals }) => {
-                        let _ = tx.send(DataUpdate::Approvals(approvals));
+                    // Fetch agents
+                    match client.list_agents(None, true).await {
+                        Ok(Response::AgentList { agents }) => {
+                            // If no agent selected yet, select the first one
+                            if current_agent_id.is_none() && !agents.is_empty() {
+                                current_agent_id = Some(agents[0].id.to_string());
+                            }
+                            let _ = tx.send(DataUpdate::Agents(agents));
+                        }
+                        _ => {}
                     }
-                    _ => {}
-                }
 
-                // Get status for version/uptime
-                match client.status().await {
-                    Ok(Response::Status { version, uptime_secs, .. }) => {
-                        let _ = tx.send(DataUpdate::Status {
-                            connected: true,
-                            version: Some(version),
-                            uptime_secs: Some(uptime_secs),
-                        });
+                    // Fetch tasks
+                    match client.list_tasks(None).await {
+                        Ok(Response::TaskList { tasks }) => {
+                            let _ = tx.send(DataUpdate::Tasks(tasks));
+                        }
+                        _ => {}
                     }
-                    _ => {}
+
+                    // Fetch pending approvals
+                    match client.list_approvals().await {
+                        Ok(Response::ApprovalList { approvals }) => {
+                            let _ = tx.send(DataUpdate::Approvals(approvals));
+                        }
+                        _ => {}
+                    }
+
+                    // Get status for version/uptime
+                    match client.status().await {
+                        Ok(Response::Status { version, uptime_secs, .. }) => {
+                            let _ = tx.send(DataUpdate::Status {
+                                connected: true,
+                                version: Some(version),
+                                uptime_secs: Some(uptime_secs),
+                            });
+                        }
+                        _ => {}
+                    }
                 }
             }
             Err(_) => {
@@ -3901,8 +3910,8 @@ async fn data_fetcher(
             }
         }
 
-        // Fast polling for responsive terminal - screen content needs frequent updates
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Fast polling for responsive terminal (50fps)
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
 }
 
