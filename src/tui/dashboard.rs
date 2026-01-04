@@ -1391,6 +1391,28 @@ impl Dashboard {
                 return;
             }
 
+            // Scroll keys are intercepted (not sent to agent)
+            match key {
+                KeyCode::PageUp => {
+                    self.stream.scroll_up(20);
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.stream.scroll_down(20);
+                    return;
+                }
+                // Shift+Up/Down for single line scroll
+                KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.stream.scroll_up(1);
+                    return;
+                }
+                KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.stream.scroll_down(1);
+                    return;
+                }
+                _ => {}
+            }
+
             // Send keystroke to agent
             if let Some(ref agent_id) = self.stream.agent_id {
                 let input = self.key_to_string(key, modifiers);
@@ -2623,9 +2645,9 @@ impl Dashboard {
 
         // Build status line: left side hints, right side mode
         let left_status = if self.stream.scroll > 0 {
-            format!(" ↑{} │ ^B: menu", self.stream.scroll)
+            format!(" ↑{} │ PgUp/Dn: scroll │ ^B: menu", self.stream.scroll)
         } else {
-            " ^B: menu".to_string()
+            " PgUp/Dn: scroll │ ^B: menu".to_string()
         };
 
         // Calculate spacing
