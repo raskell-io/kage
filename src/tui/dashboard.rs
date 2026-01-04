@@ -4012,18 +4012,59 @@ async fn data_fetcher(
                             }
                         }
                         Action::KillAgent { id } => {
-                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
-                                let _ = client.kill_agent(agent_id, false).await;
+                            match id.parse::<crate::agent::AgentId>() {
+                                Ok(agent_id) => {
+                                    match client.kill_agent(agent_id, true).await {
+                                        Ok(_) => {
+                                            let _ = tx.send(DataUpdate::Log(LogEntry {
+                                                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                                level: LogLevel::Info,
+                                                source: "agent".to_string(),
+                                                message: format!("Agent {} killed", &id[..8.min(id.len())]),
+                                            }));
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(DataUpdate::Log(LogEntry {
+                                                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                                level: LogLevel::Error,
+                                                source: "agent".to_string(),
+                                                message: format!("Failed to kill agent: {}", e),
+                                            }));
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "agent".to_string(),
+                                        message: format!("Invalid agent ID: {}", id),
+                                    }));
+                                }
                             }
                         }
                         Action::PauseAgent { id } => {
                             if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
-                                let _ = client.pause_agent(agent_id).await;
+                                if let Err(e) = client.pause_agent(agent_id).await {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "agent".to_string(),
+                                        message: format!("Failed to pause agent: {}", e),
+                                    }));
+                                }
                             }
                         }
                         Action::ResumeAgent { id } => {
                             if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
-                                let _ = client.resume_agent(agent_id).await;
+                                if let Err(e) = client.resume_agent(agent_id).await {
+                                    let _ = tx.send(DataUpdate::Log(LogEntry {
+                                        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                        level: LogLevel::Error,
+                                        source: "agent".to_string(),
+                                        message: format!("Failed to resume agent: {}", e),
+                                    }));
+                                }
                             }
                         }
                         Action::CancelTask { id } => {
