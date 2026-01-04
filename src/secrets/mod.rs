@@ -158,14 +158,58 @@ pub fn set(name: &str, value: &str, scope: &SecretScope) -> Result<()> {
 }
 
 /// Retrieve a secret from the OS keychain
+///
+/// On macOS, this uses the `security` CLI to avoid keychain authorization prompts
+/// when running in a background daemon process.
 pub fn get(name: &str, scope: &SecretScope) -> Result<Option<String>> {
     let key = scope.to_key(name);
-    let entry = keyring::Entry::new(SERVICE_NAME, &key)?;
 
-    match entry.get_password() {
-        Ok(value) => Ok(Some(value)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
+    // On macOS, use the security CLI to avoid keychain prompts in daemon mode
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s", SERVICE_NAME,
+                "-a", &key,
+                "-w", // Output just the password
+            ])
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let password = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if password.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(password))
+                }
+            }
+            Ok(_) => {
+                // Command failed (item not found)
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::debug!("security command failed, falling back to keyring: {}", e);
+                // Fall back to keyring crate
+                let entry = keyring::Entry::new(SERVICE_NAME, &key)?;
+                match entry.get_password() {
+                    Ok(value) => Ok(Some(value)),
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(e) => Err(e.into()),
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let entry = keyring::Entry::new(SERVICE_NAME, &key)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
