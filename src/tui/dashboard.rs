@@ -2528,11 +2528,35 @@ impl Dashboard {
             Panel::Stream => {
                 let lines = self.stream.lines.len();
                 let scroll = self.stream.scroll;
-                if let Some(ref agent_id) = self.stream.agent_id {
-                    let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
+
+                // Get token info from selected agent
+                let token_span = if let Some(agent) = self.agents.selected() {
+                    let tokens_k = agent.tokens_used / 1000;
+                    let limit_k = agent.token_limit / 1000;
+                    let remaining_pct = if agent.token_limit > 0 {
+                        ((agent.token_limit - agent.tokens_used.min(agent.token_limit)) * 100 / agent.token_limit) as u32
+                    } else {
+                        100
+                    };
+                    let token_color = if remaining_pct < 10 {
+                        self.c().error
+                    } else if remaining_pct < 25 {
+                        self.c().warning
+                    } else {
+                        self.c().text_muted
+                    };
+                    Span::styled(
+                        format!("{}k/{}k ", tokens_k, limit_k),
+                        Style::default().fg(token_color),
+                    )
+                } else {
+                    Span::styled("", Style::default())
+                };
+
+                if self.stream.agent_id.is_some() {
                     vec![
-                        Span::styled(short_id, Style::default().fg(self.c().accent_bright)),
-                        Span::styled(format!(" {}L", lines), Style::default().fg(self.c().text_muted)),
+                        token_span,
+                        Span::styled(format!("{}L", lines), Style::default().fg(self.c().text_muted)),
                         if scroll > 0 {
                             Span::styled(format!(" ↑{}", scroll), Style::default().fg(self.c().warning))
                         } else {
@@ -2708,10 +2732,7 @@ impl Dashboard {
 
     /// Render the stream panel (agent output)
     fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
-        // Reserve 1 line for scroll indicator at bottom
-        let content_height = area.height.saturating_sub(1) as usize;
-        let content_area = Rect { height: area.height.saturating_sub(1), ..area };
-        let indicator_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
+        let content_height = area.height as usize;
 
         if self.stream.lines.is_empty() {
             let empty_msg = if self.stream.agent_id.is_some() {
@@ -2723,7 +2744,7 @@ impl Dashboard {
                 empty_msg,
                 Style::default().fg(self.c().text_muted),
             )));
-            f.render_widget(content, content_area);
+            f.render_widget(content, area);
         } else {
             // Calculate visible range (scroll is offset from bottom)
             let total_lines = self.stream.lines.len();
@@ -2746,24 +2767,7 @@ impl Dashboard {
 
             // Don't wrap - PTY already wrapped at correct width
             let content = Paragraph::new(visible_lines);
-            f.render_widget(content, content_area);
-        }
-
-        // Render scroll indicator at bottom (shows total lines for debugging)
-        let total = self.stream.lines.len();
-        let indicator = if self.stream.scroll > 0 {
-            format!("─── ↑{}/{} ─── scroll: wheel/⌥↑↓ ", self.stream.scroll, total)
-        } else if !self.stream.lines.is_empty() {
-            format!("─── bottom ({} lines) ─── scroll: wheel/⌥↑↓ ", total)
-        } else {
-            String::new()
-        };
-        if !indicator.is_empty() {
-            let indicator_widget = Paragraph::new(Line::from(Span::styled(
-                indicator,
-                Style::default().fg(self.c().text_muted),
-            )));
-            f.render_widget(indicator_widget, indicator_area);
+            f.render_widget(content, area);
         }
     }
 
@@ -3047,9 +3051,7 @@ impl Dashboard {
     /// Render the footer with mode indicator
     fn render_footer(&self, f: &mut Frame, area: Rect) {
         // Get selected agent info for status bar
-        let mut status_spans: Vec<Span> = Vec::new();
-
-        if let Some(agent) = self.agents.selected() {
+        let status_spans: Vec<Span> = if let Some(agent) = self.agents.selected() {
             // Agent status with color
             let (status_text, status_color) = match agent.status {
                 AgentDisplayStatus::Working => ("WORKING", self.c().success),
@@ -3059,39 +3061,19 @@ impl Dashboard {
                 AgentDisplayStatus::Error => ("ERROR", self.c().error),
             };
 
-            status_spans.push(Span::styled(
-                format!(" {} ", status_text),
-                Style::default().fg(Color::White).bg(status_color).add_modifier(Modifier::BOLD),
-            ));
-            status_spans.push(Span::styled("  ", Style::default()));
-
-            // Token usage
-            let tokens_k = agent.tokens_used / 1000;
-            let limit_k = agent.token_limit / 1000;
-            let remaining_pct = if agent.token_limit > 0 {
-                ((agent.token_limit - agent.tokens_used.min(agent.token_limit)) * 100 / agent.token_limit) as u32
-            } else {
-                100
-            };
-
-            let token_color = if remaining_pct < 10 {
-                self.c().error
-            } else if remaining_pct < 25 {
-                self.c().warning
-            } else {
-                self.c().text_muted
-            };
-
-            status_spans.push(Span::styled(
-                format!("{}k/{}k tokens ({}% left)", tokens_k, limit_k, remaining_pct),
-                Style::default().fg(token_color),
-            ));
+            vec![
+                Span::styled(
+                    format!(" {} ", status_text),
+                    Style::default().fg(Color::White).bg(status_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("  {}", agent.name), Style::default().fg(self.c().text_muted)),
+            ]
         } else {
-            status_spans.push(Span::styled(
+            vec![Span::styled(
                 " No agent selected ",
                 Style::default().fg(self.c().text_muted),
-            ));
-        }
+            )]
+        };
 
         let hint_spans = status_spans;
 
