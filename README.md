@@ -50,23 +50,26 @@ cargo install raskell-kage
 # Or via Docker
 docker pull ghcr.io/raskell-io/kage:latest
 
-# Run
+# Start the daemon and launch the dashboard
 kage daemon start
-kage agent spawn --repo ~/code/myproject
+kage dashboard
 ```
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| **Supervisor Pattern** | Spawn agents with goals, monitor progress, enforce limits |
-| **Event Sourcing** | Immutable audit trails, replay, time-travel queries |
-| **Namespace Organization** | Group repos, share context across agents |
-| **Two-Tier Memory** | Working memory + persistent long-term storage |
-| **Multi-Subscription** | Pool multiple Claude subscriptions for parallel scaling |
+| **Supervisor Pattern** | Spawn agents with goals, monitor progress, enforce iteration limits |
+| **Task Management** | Define success/abort criteria, checkpoints, dependencies, and approval workflows |
+| **Approval Workflows** | Control agent actions with configurable gates (none, on-write, on-commit, always) |
+| **Two-Tier Memory** | Working memory + persistent long-term storage with cross-agent sharing |
+| **Multi-Subscription** | Pool multiple Claude subscriptions for parallel scaling with intelligent routing |
+| **Namespace Organization** | Group repositories, share context, scope configuration |
+| **Secrets Management** | Secure credential storage via OS keychain (never plaintext) |
+| **Interactive Dashboard** | Real-time TUI for monitoring agents, tasks, and approvals |
 | **Single Binary** | Zero dependencies, just download and run |
 
-## Why Kage
+## Why Kage?
 
 Running a single Claude Code session is straightforward. But what happens when you need agents working across multiple repositories? When you want to step away and let them work autonomously? When they need to share what they've learned?
 
@@ -76,34 +79,178 @@ Kage solves these problems with a supervisor architecture:
 - **Monitor health and progress** — Track what your agents are doing in real-time
 - **Enforce iteration limits** — Set guardrails to prevent runaway execution
 - **Checkpoint and resume** — Save state, review progress, provide guidance, and continue
+- **Approval gates** — Control what agents can do autonomously vs. what needs your sign-off
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                   Kage Daemon                       │
-├─────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  │
-│  │   Agent 1   │  │   Agent 2   │  │   Agent 3   │  │
-│  │  (Claude)   │  │  (Claude)   │  │  (Claude)   │  │
-│  └─────────────┘  └─────────────┘  └─────────────┘  │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │              Memory Store                     │  │
-│  │  ┌──────────────┐  ┌──────────────┐           │  │
-│  │  │   Working    │  │  Long-term   │           │  │
-│  │  │   Memory     │  │   Memory     │           │  │
-│  │  └──────────────┘  └──────────────┘           │  │
-│  └───────────────────────────────────────────────┘  │
-│                                                     │
-│  ┌───────────────────────────────────────────────┐  │
-│  │           Subscription Pool                   │  │
-│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐                  │  │
-│  │  │ S1 │ │ S2 │ │ S3 │ │ S4 │  ...             │  │
-│  │  └────┘ └────┘ └────┘ └────┘                  │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                       Kage Daemon                            │
+├─────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │   Agent 1   │  │   Agent 2   │  │   Agent 3   │   ...    │
+│  │  (Claude)   │  │  (Claude)   │  │  (Claude)   │          │
+│  └─────────────┘  └─────────────┘  └─────────────┘          │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                   Task Scheduler                        │ │
+│  │  Queue • Checkpoints • Success/Abort Criteria          │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                    Memory Store                         │ │
+│  │  ┌──────────────────┐  ┌──────────────────┐            │ │
+│  │  │  Working Memory  │  │  Long-term Memory │            │ │
+│  │  └──────────────────┘  └──────────────────┘            │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                 Subscription Pool                       │ │
+│  │  ┌────┐ ┌────┐ ┌────┐ ┌────┐                           │ │
+│  │  │ S1 │ │ S2 │ │ S3 │ │ S4 │  (health + rate limiting) │ │
+│  │  └────┘ └────┘ └────┘ └────┘                           │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+## CLI Reference
+
+### Dashboard
+
+```bash
+kage                    # Launch interactive dashboard
+kage dashboard          # Same as above
+```
+
+### Daemon
+
+```bash
+kage daemon start       # Start the daemon
+kage daemon stop        # Stop the daemon
+kage daemon status      # Check daemon status
+```
+
+### Agents
+
+```bash
+kage agent spawn                      # Spawn a new agent
+kage agent spawn --prompt "Fix bug"   # Spawn with initial goal
+kage agent list                       # List active agents
+kage agent attach <id>                # Attach to an agent
+kage agent detach                     # Detach from agent
+kage agent kill <id>                  # Kill an agent
+kage agent status <id>                # Show agent status
+```
+
+### Tasks
+
+```bash
+# Create a task with guardrails
+kage task add "Refactor auth module" \
+    --max-iterations 20 \
+    --checkpoint-every 5 \
+    --approval on-commit \
+    --success-on "tests-pass" \
+    --abort-on "error-count:5:compilation failed"
+
+kage task list                        # List tasks
+kage task show <id>                   # Show task details
+kage task pause <id>                  # Pause a task
+kage task resume <id> --guidance "Focus on edge cases"
+kage task cancel <id>                 # Cancel a task
+
+# Checkpoint management
+kage task checkpoint list <id>        # List checkpoints
+kage task checkpoint show <id>        # Show checkpoint details
+```
+
+### Approvals
+
+```bash
+kage approval list                    # List pending approvals
+kage approval show <id>               # View approval details
+kage approval approve <id>            # Approve an action
+kage approval approve all             # Approve all pending
+kage approval reject <id> --reason "Use existing utils"
+```
+
+### Memory
+
+```bash
+kage memory list                      # List memory entries
+kage memory search "auth patterns"    # Search memories
+kage memory show <id>                 # Show entry details
+kage memory share <id> --scope global # Share to wider scope
+kage memory watch                     # Stream updates
+kage memory export -o backup.json     # Export memory
+```
+
+### Subscriptions
+
+```bash
+# Add subscriptions for parallel scaling
+kage subscription add --name "work" --priority 150
+kage subscription add --name "personal" --priority 100
+
+kage subscription list                # List subscriptions
+kage subscription status              # Pool overview
+kage subscription usage --period week # Usage stats
+
+# Configure routing
+kage subscription route --namespace backend --subscriptions "work,personal"
+kage subscription route --priority high --subscriptions "work"
+```
+
+### Namespaces
+
+```bash
+kage namespace create backend         # Create namespace
+kage namespace add-repo backend ~/code/api
+kage namespace add-repo backend ~/code/auth
+kage namespace list                   # List namespaces
+kage namespace show backend           # Show details
+```
+
+### Secrets
+
+```bash
+kage secret set API_KEY               # Set global secret
+kage secret set DB_PASS --scope namespace:backend
+kage secret list                      # List secret names
+kage secret delete API_KEY            # Delete secret
+```
+
+## Task Features
+
+### Success Criteria
+
+Automatically complete tasks when conditions are met:
+
+```bash
+--success-on "tests-pass"                    # Test suite passes
+--success-on "pattern:Implementation complete"  # Output matches
+--success-on "file-exists:src/auth/jwt.ts"   # File created
+--success-on "command:npm run build"         # Command succeeds
+```
+
+### Abort Criteria
+
+Automatically stop tasks when problems occur:
+
+```bash
+--abort-on "error-count:5:TypeError"         # Too many errors
+--abort-on "repeated-output:3:10"            # Stuck in loop
+--abort-on "no-progress:5"                   # No file changes
+```
+
+### Approval Levels
+
+| Level | Description |
+|-------|-------------|
+| `none` | Full autonomy |
+| `on-write` | Approve file modifications |
+| `on-commit` | Approve git commits (default) |
+| `always` | Approve all actions |
 
 ## Enterprise Ready
 
@@ -131,55 +278,25 @@ CLI flags > Environment > Task-specific > Namespace > Global
 # ~/.config/kage/config.toml
 
 [daemon]
-socket = "/tmp/kage.sock"
-log_level = "info"
+socket_path = "/tmp/kage.sock"
+max_agents = 10
 
-[defaults]
-max_iterations = 50
-checkpoint_interval = 10
+[claude]
+model = "sonnet"
+max_iterations = 30
+approval = "on-commit"
+
+[tasks]
+default_approval = "on-commit"
+default_checkpoint_every = 3
 
 [namespaces.backend]
-repos = [
-    "~/code/api-server",
-    "~/code/auth-service",
-]
+repos = ["~/code/api", "~/code/auth"]
 memory_sharing = "full"
-```
 
-## CLI Reference
-
-### Daemon
-
-```bash
-kage daemon start       # Start the daemon
-kage daemon stop        # Stop the daemon
-kage daemon status      # Check daemon status
-```
-
-### Agents
-
-```bash
-kage agent spawn        # Spawn a new agent
-kage agent list         # List active agents
-kage agent attach <id>  # Attach to an agent
-kage agent kill <id>    # Kill an agent
-```
-
-### Tasks
-
-```bash
-kage task add "<goal>"  # Add a new task
-kage task list          # List tasks
-kage task status <id>   # Check task status
-kage task resume <id>   # Resume a paused task
-```
-
-### Memory
-
-```bash
-kage memory search "<query>"  # Search memories
-kage memory list              # List recent memories
-kage memory inject <target> --from <source>  # Share context
+[subscriptions.routing]
+backend = ["work-main", "work-backup"]
+high = ["premium"]
 ```
 
 ## File Locations
@@ -189,6 +306,7 @@ kage memory inject <target> --from <source>  # Share context
 | Global config | `~/.config/kage/config.toml` |
 | State directory | `~/.local/share/kage/state/` |
 | Daemon logs | `~/.local/share/kage/logs/` |
+| Checkpoints | `~/.local/share/kage/state/checkpoints/` |
 | Unix socket | `/tmp/kage.sock` |
 | Per-project config | `.kage/config.toml` |
 
@@ -198,9 +316,10 @@ Secrets (API keys) are stored in your OS keychain, never in plaintext files.
 
 - **Rust** — Memory-safe, fast, and reliable
 - **Tokio** — Async runtime
-- **redb** — Embedded key-value store (pure Rust)
+- **redb** — Embedded key-value store (pure Rust, zero dependencies)
 - **tonic** — gRPC framework
 - **ratatui** — Terminal UI
+- **portable-pty** — Cross-platform PTY support
 
 ## Documentation
 
