@@ -1202,10 +1202,11 @@ impl Dashboard {
 
     /// Run the dashboard
     pub fn run(&mut self) -> Result<()> {
-        // Setup terminal with mouse support (like tmux)
+        // Setup terminal (no mouse capture - allows native text selection with Cmd+C)
+        // Use Option+↑/↓ or Page Up/Down for scrolling instead
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
@@ -1219,7 +1220,7 @@ impl Dashboard {
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
 
         result
@@ -1245,9 +1246,6 @@ impl Dashboard {
                         if key.kind == KeyEventKind::Press {
                             self.handle_input(key.code, key.modifiers);
                         }
-                    }
-                    Event::Mouse(mouse) => {
-                        self.handle_mouse(mouse.kind, mouse.column, mouse.row);
                     }
                     Event::Resize(_cols, _rows) => {
                         // Terminal resized - PTY resize will be handled on next draw cycle
@@ -2076,6 +2074,82 @@ impl Dashboard {
             self.show_approvals = false;
         }
         // Could also deselect items if needed
+    }
+
+    /// Copy visible stream content to system clipboard
+    fn copy_stream_to_clipboard(&mut self) {
+        if self.stream.lines.is_empty() {
+            self.logs.add_info("dashboard", "Nothing to copy - stream is empty");
+            return;
+        }
+
+        // Get all lines as plain text (strip ANSI codes)
+        let content: String = self.stream.lines
+            .iter()
+            .map(|line| {
+                // Strip ANSI escape codes for clean clipboard content
+                let mut clean = String::new();
+                let mut in_escape = false;
+                for c in line.text.chars() {
+                    if c == '\x1b' {
+                        in_escape = true;
+                    } else if in_escape {
+                        if c == 'm' {
+                            in_escape = false;
+                        }
+                    } else {
+                        clean.push(c);
+                    }
+                }
+                clean
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Copy to clipboard using pbcopy (macOS) or xclip (Linux)
+        #[cfg(target_os = "macos")]
+        let result = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(content.as_bytes())?;
+                }
+                child.wait()
+            });
+
+        #[cfg(target_os = "linux")]
+        let result = std::process::Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut child| {
+                use std::io::Write;
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(content.as_bytes())?;
+                }
+                child.wait()
+            });
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let result: Result<std::process::ExitStatus, std::io::Error> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Clipboard not supported on this platform",
+        ));
+
+        match result {
+            Ok(status) if status.success() => {
+                let line_count = self.stream.lines.len();
+                self.logs.add_info("dashboard", &format!("Copied {} lines to clipboard", line_count));
+            }
+            Ok(_) => {
+                self.logs.add_info("dashboard", "Failed to copy to clipboard");
+            }
+            Err(e) => {
+                self.logs.add_info("dashboard", &format!("Clipboard error: {}", e));
+            }
+        }
     }
 
     /// Handle approve - approve the selected action
