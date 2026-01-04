@@ -370,6 +370,10 @@ struct AgentInfo {
     max_iterations: u32,
     current_action: String,
     started_at: String,
+    /// Token usage (input + output)
+    tokens_used: u64,
+    /// Token limit for context window
+    token_limit: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,6 +434,8 @@ impl AgentListState {
                 max_iterations: a.max_iterations,
                 current_action: format!("Iteration {}/{}", a.iteration, a.max_iterations),
                 started_at: started_ago,
+                tokens_used: a.tokens_used.unwrap_or(0),
+                token_limit: 200_000, // Claude's context window
             }
         }).collect();
 
@@ -2843,25 +2849,54 @@ impl Dashboard {
 
     /// Render the footer with mode indicator
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        // Panel indicators
-        let agents_style = if self.focus == Panel::Agents {
-            Style::default().fg(self.c().bg).bg(self.c().accent)
-        } else {
-            Style::default().fg(self.c().text_muted)
-        };
-        let stream_style = if self.focus == Panel::Stream {
-            Style::default().fg(self.c().bg).bg(self.c().accent)
-        } else {
-            Style::default().fg(self.c().text_muted)
-        };
+        // Get selected agent info for status bar
+        let mut status_spans: Vec<Span> = Vec::new();
 
-        let hint_spans: Vec<Span> = vec![
-            Span::styled(" 1:Agents ", agents_style),
-            Span::styled(" 2:Stream ", stream_style),
-            Span::styled("  ", Style::default()),
-            Span::styled(" ? ", Style::default().fg(self.c().bg).bg(self.c().accent)),
-            Span::styled(" Help ", Style::default().fg(self.c().text_muted)),
-        ];
+        if let Some(agent) = self.agents.selected() {
+            // Agent status with color
+            let (status_text, status_color) = match agent.status {
+                AgentDisplayStatus::Working => ("WORKING", self.c().success),
+                AgentDisplayStatus::Idle => ("IDLE", self.c().text_muted),
+                AgentDisplayStatus::Waiting => ("WAITING", self.c().warning),
+                AgentDisplayStatus::Paused => ("PAUSED", self.c().info),
+                AgentDisplayStatus::Error => ("ERROR", self.c().error),
+            };
+
+            status_spans.push(Span::styled(
+                format!(" {} ", status_text),
+                Style::default().fg(Color::White).bg(status_color).add_modifier(Modifier::BOLD),
+            ));
+            status_spans.push(Span::styled("  ", Style::default()));
+
+            // Token usage
+            let tokens_k = agent.tokens_used / 1000;
+            let limit_k = agent.token_limit / 1000;
+            let remaining_pct = if agent.token_limit > 0 {
+                ((agent.token_limit - agent.tokens_used.min(agent.token_limit)) * 100 / agent.token_limit) as u32
+            } else {
+                100
+            };
+
+            let token_color = if remaining_pct < 10 {
+                self.c().error
+            } else if remaining_pct < 25 {
+                self.c().warning
+            } else {
+                self.c().text_muted
+            };
+
+            status_spans.push(Span::styled(
+                format!("{}k/{}k tokens ({}% left)", tokens_k, limit_k, remaining_pct),
+                Style::default().fg(token_color),
+            ));
+        } else {
+            status_spans.push(Span::styled(
+                " No agent selected ",
+                Style::default().fg(self.c().text_muted),
+            ));
+        }
+
+        let hint_spans = status_spans;
 
         // Right side: mode indicator (vim/helix style)
         let (mode_text, mode_color) = self.current_mode();

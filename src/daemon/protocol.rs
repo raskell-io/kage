@@ -453,6 +453,9 @@ pub struct AgentInfo {
     pub started_at: i64,
     /// PID of the process
     pub pid: Option<u32>,
+    /// Tokens used (approximate, from output parsing)
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
 }
 
 /// Output line

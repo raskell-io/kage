@@ -338,6 +338,7 @@ impl Supervisor {
             max_iterations: max_iterations.unwrap_or(self.config.claude.max_iterations),
             started_at: chrono::Utc::now().timestamp(),
             pid,
+            tokens_used: None,
         };
 
         // Create managed agent with vt100 parser and shared output history
