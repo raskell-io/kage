@@ -2562,7 +2562,7 @@ impl Dashboard {
         let status_line = Line::from(vec![
             Span::styled(left_status, Style::default().fg(self.c().text_muted).bg(self.c().bg_surface)),
             Span::styled(" ".repeat(spacing), Style::default().bg(self.c().bg_surface)),
-            Span::styled(mode_indicator, Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD)),
+            Span::styled(mode_indicator, Style::default().fg(Color::White).bg(mode_color).add_modifier(Modifier::BOLD)),
         ]);
 
         let status_bar = Paragraph::new(status_line);
@@ -2823,32 +2823,38 @@ impl Dashboard {
 
     /// Render the footer with mode indicator
     fn render_footer(&self, f: &mut Frame, area: Rect) {
-        // Left side: key hints
-        let panel_hint = match self.focus {
-            Panel::Agents => "1:Agents",
-            Panel::Stream => "2:Stream",
-            Panel::Tasks => "3:Tasks",
-            Panel::Logs => "4:Logs",
+        // Panel indicators - group related panels together
+        let agents_style = if self.focus == Panel::Agents {
+            Style::default().fg(self.c().bg).bg(self.c().accent)
+        } else {
+            Style::default().fg(self.c().text_muted)
+        };
+        let tasks_style = if self.focus == Panel::Tasks {
+            Style::default().fg(self.c().bg).bg(self.c().accent)
+        } else {
+            Style::default().fg(self.c().text_muted)
+        };
+        let stream_style = if self.focus == Panel::Stream {
+            Style::default().fg(self.c().bg).bg(self.c().accent)
+        } else {
+            Style::default().fg(self.c().text_muted)
+        };
+        let logs_style = if self.focus == Panel::Logs {
+            Style::default().fg(self.c().bg).bg(self.c().accent)
+        } else {
+            Style::default().fg(self.c().text_muted)
         };
 
-        let hints = vec![
-            ("n", "New"),
-            ("F", "Filter"),
-            ("t/L", "Toggle"),
-            (panel_hint, ""),
-            ("?", "Help"),
-            ("q", "Quit"),
+        let hint_spans: Vec<Span> = vec![
+            Span::styled(" 1:Agents ", agents_style),
+            Span::styled(" 3:Tasks ", tasks_style),
+            Span::styled("  ", Style::default()),
+            Span::styled(" 2:Stream ", stream_style),
+            Span::styled(" 4:Logs ", logs_style),
+            Span::styled("  ", Style::default()),
+            Span::styled(" ? ", Style::default().fg(self.c().bg).bg(self.c().accent)),
+            Span::styled(" Help ", Style::default().fg(self.c().text_muted)),
         ];
-
-        let hint_spans: Vec<Span> = hints
-            .iter()
-            .flat_map(|(key, desc)| {
-                vec![
-                    Span::styled(format!(" {} ", key), Style::default().fg(self.c().bg).bg(self.c().accent)),
-                    Span::styled(format!(" {}  ", desc), Style::default().fg(self.c().text_muted)),
-                ]
-            })
-            .collect();
 
         // Right side: mode indicator (vim/helix style)
         let (mode_text, mode_color) = self.current_mode();
@@ -2877,7 +2883,7 @@ impl Dashboard {
         let mode_widget = Paragraph::new(Line::from(Span::styled(
             mode_indicator,
             Style::default()
-                .fg(Color::Black)
+                .fg(Color::White)
                 .bg(mode_color)
                 .add_modifier(Modifier::BOLD),
         )));
