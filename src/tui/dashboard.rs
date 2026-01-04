@@ -19,7 +19,7 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
@@ -2489,16 +2489,21 @@ impl Dashboard {
 
     /// Render fullscreen stream (no decorations, just output)
     fn render_fullscreen_stream(&self, f: &mut Frame, area: Rect) {
-        let inner_height = area.height as usize;
+        // Content area (leave 1 line for status bar)
+        let content_area = Rect {
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        let inner_height = content_area.height as usize;
 
         if self.stream.lines.is_empty() {
-            let empty_msg = "Passthrough mode - type to interact │ ^B: menu";
+            let empty_msg = "Passthrough mode - type to interact";
             let content = Paragraph::new(Line::from(Span::styled(
                 empty_msg,
                 Style::default().fg(self.c().text_muted),
             )))
             .alignment(Alignment::Center);
-            f.render_widget(content, area);
+            f.render_widget(content, content_area);
         } else {
             // Calculate visible range
             let total_lines = self.stream.lines.len();
@@ -2517,29 +2522,42 @@ impl Dashboard {
             let content = Paragraph::new(visible_lines)
                 .style(Style::default().bg(self.c().bg));
 
-            f.render_widget(content, area);
+            f.render_widget(content, content_area);
 
-            // Show minimal status bar at bottom
-            if self.stream.scroll > 0 || self.prefix_active {
-                let status = if self.prefix_active {
-                    " ^B-? ".to_string()
-                } else {
-                    format!(" ↑{} │ ^B: menu ", self.stream.scroll)
-                };
-                let status_area = Rect {
-                    x: area.x,
-                    y: area.y + area.height - 1,
-                    width: area.width,
-                    height: 1,
-                };
-                let status_bar = Paragraph::new(Line::from(Span::styled(
-                    status,
-                    Style::default().fg(self.c().text_muted).bg(self.c().bg_surface),
-                )))
-                .alignment(Alignment::Right);
-                f.render_widget(status_bar, status_area);
-            }
         }
+
+        // Always show minimal status bar with mode indicator at bottom
+        let status_area = Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        };
+
+        // Get mode info
+        let (mode_name, mode_color) = self.current_mode();
+        let mode_indicator = format!(" {} ", mode_name);
+
+        // Build status line: left side hints, right side mode
+        let left_status = if self.stream.scroll > 0 {
+            format!(" ↑{} │ ^B: menu", self.stream.scroll)
+        } else {
+            " ^B: menu".to_string()
+        };
+
+        // Calculate spacing
+        let mode_width = mode_indicator.len() as u16;
+        let left_width = left_status.len() as u16;
+        let spacing = (area.width.saturating_sub(left_width + mode_width)) as usize;
+
+        let status_line = Line::from(vec![
+            Span::styled(left_status, Style::default().fg(self.c().text_muted).bg(self.c().bg_surface)),
+            Span::styled(" ".repeat(spacing), Style::default().bg(self.c().bg_surface)),
+            Span::styled(mode_indicator, Style::default().fg(Color::Black).bg(mode_color).add_modifier(Modifier::BOLD)),
+        ]);
+
+        let status_bar = Paragraph::new(status_line);
+        f.render_widget(status_bar, status_area);
     }
 
     /// Render fullscreen logs (no decorations, just log entries)
@@ -2773,8 +2791,30 @@ impl Dashboard {
         f.render_widget(list, content_area);
     }
 
-    /// Render the footer
+    /// Get current mode for status bar
+    fn current_mode(&self) -> (&'static str, Color) {
+        // Check if we're in passthrough mode (keystrokes go to agent)
+        let in_passthrough = (self.focus == Panel::Stream || self.fullscreen_stream)
+            && self.stream.agent_id.is_some()
+            && !self.show_help
+            && !self.show_agent_details
+            && !self.show_task_details
+            && !self.show_approvals
+            && !self.show_spawn_dialog
+            && !self.setup_wizard.needs_setup;
+
+        if self.prefix_active {
+            ("PENDING", Color::Rgb(250, 180, 100))  // Orange - waiting for command
+        } else if in_passthrough {
+            ("INSERT", Color::Rgb(130, 200, 130))   // Green - input goes to agent
+        } else {
+            ("NORMAL", Color::Rgb(130, 170, 230))   // Blue - navigating UI
+        }
+    }
+
+    /// Render the footer with mode indicator
     fn render_footer(&self, f: &mut Frame, area: Rect) {
+        // Left side: key hints
         let panel_hint = match self.focus {
             Panel::Agents => "1:Agents",
             Panel::Stream => "2:Stream",
@@ -2801,8 +2841,38 @@ impl Dashboard {
             })
             .collect();
 
+        // Right side: mode indicator (vim/helix style)
+        let (mode_text, mode_color) = self.current_mode();
+        let mode_indicator = format!(" {} ", mode_text);
+        let mode_width = mode_indicator.len() as u16;
+
+        // Split area for hints (left) and mode (right)
+        let hints_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(mode_width + 1),
+            height: area.height,
+        };
+        let mode_area = Rect {
+            x: area.x + area.width.saturating_sub(mode_width),
+            y: area.y,
+            width: mode_width,
+            height: area.height,
+        };
+
+        // Render hints on left
         let footer = Paragraph::new(Line::from(hint_spans));
-        f.render_widget(footer, area);
+        f.render_widget(footer, hints_area);
+
+        // Render mode indicator on right
+        let mode_widget = Paragraph::new(Line::from(Span::styled(
+            mode_indicator,
+            Style::default()
+                .fg(Color::Black)
+                .bg(mode_color)
+                .add_modifier(Modifier::BOLD),
+        )));
+        f.render_widget(mode_widget, mode_area);
     }
 
     /// Render help popup
