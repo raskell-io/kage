@@ -1392,21 +1392,34 @@ impl Dashboard {
             }
 
             // Scroll keys are intercepted (not sent to agent)
-            match key {
-                KeyCode::PageUp => {
+            // Note: PageUp/PageDown may be intercepted by terminal emulators on macOS
+            // Use Ctrl+U/D as reliable alternatives
+            match (key, modifiers.contains(KeyModifiers::CONTROL)) {
+                // Ctrl+U = scroll up half page (vim style, always works)
+                (KeyCode::Char('u'), true) => {
+                    self.stream.scroll_up(15);
+                    return;
+                }
+                // Ctrl+D = scroll down half page (vim style, always works)
+                (KeyCode::Char('d'), true) => {
+                    self.stream.scroll_down(15);
+                    return;
+                }
+                // PageUp/PageDown (may not work on all terminals)
+                (KeyCode::PageUp, _) => {
                     self.stream.scroll_up(20);
                     return;
                 }
-                KeyCode::PageDown => {
+                (KeyCode::PageDown, _) => {
                     self.stream.scroll_down(20);
                     return;
                 }
                 // Shift+Up/Down for single line scroll
-                KeyCode::Up if modifiers.contains(KeyModifiers::SHIFT) => {
+                _ if key == KeyCode::Up && modifiers.contains(KeyModifiers::SHIFT) => {
                     self.stream.scroll_up(1);
                     return;
                 }
-                KeyCode::Down if modifiers.contains(KeyModifiers::SHIFT) => {
+                _ if key == KeyCode::Down && modifiers.contains(KeyModifiers::SHIFT) => {
                     self.stream.scroll_down(1);
                     return;
                 }
@@ -2645,9 +2658,9 @@ impl Dashboard {
 
         // Build status line: left side hints, right side mode
         let left_status = if self.stream.scroll > 0 {
-            format!(" ↑{} │ PgUp/Dn: scroll │ ^B: menu", self.stream.scroll)
+            format!(" ↑{} │ ^U/^D: scroll │ ^B: menu", self.stream.scroll)
         } else {
-            " PgUp/Dn: scroll │ ^B: menu".to_string()
+            " ^U/^D: scroll │ ^B: menu".to_string()
         };
 
         // Calculate spacing
