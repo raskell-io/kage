@@ -2660,10 +2660,16 @@ impl Dashboard {
             )));
             f.render_widget(content, content_area);
         } else {
-            // Calculate visible range (scroll is from bottom, 0 = at bottom)
+            // Calculate visible range (scroll is offset from bottom)
             let total_lines = self.stream.lines.len();
-            let end_idx = total_lines.saturating_sub(self.stream.scroll);
-            let start_idx = end_idx.saturating_sub(content_height);
+
+            // Cap scroll to valid range (can't scroll past the beginning)
+            let max_scroll = total_lines.saturating_sub(content_height);
+            let effective_scroll = self.stream.scroll.min(max_scroll);
+
+            // Calculate window: always show content_height lines (or all if fewer)
+            let start_idx = max_scroll.saturating_sub(effective_scroll);
+            let end_idx = (start_idx + content_height).min(total_lines);
 
             let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
@@ -2713,10 +2719,16 @@ impl Dashboard {
             .alignment(Alignment::Center);
             f.render_widget(content, content_area);
         } else {
-            // Calculate visible range
+            // Calculate visible range (scroll is offset from bottom)
             let total_lines = self.stream.lines.len();
-            let end_idx = total_lines.saturating_sub(self.stream.scroll);
-            let start_idx = end_idx.saturating_sub(inner_height);
+
+            // Cap scroll to valid range (can't scroll past the beginning)
+            let max_scroll = total_lines.saturating_sub(inner_height);
+            let effective_scroll = self.stream.scroll.min(max_scroll);
+
+            // Calculate window: always show inner_height lines (or all if fewer)
+            let start_idx = max_scroll.saturating_sub(effective_scroll);
+            let end_idx = (start_idx + inner_height).min(total_lines);
 
             let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
@@ -2731,7 +2743,6 @@ impl Dashboard {
                 .style(Style::default().bg(self.c().bg));
 
             f.render_widget(content, content_area);
-
         }
 
         // Always show minimal status bar with mode indicator at bottom
