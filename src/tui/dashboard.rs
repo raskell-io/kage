@@ -29,6 +29,7 @@ use ansi_to_tui::IntoText;
 
 use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
 use crate::secrets::{self, ClaudeCodeAuth};
+use super::input::TextInput;
 use super::theme::{Theme, ColorPalette, StatusSymbols};
 
 /// Message from background data fetcher
@@ -128,11 +129,9 @@ struct SetupWizardState {
     /// Whether user dismissed the wizard
     dismissed: bool,
     /// Subscription name input
-    sub_name: String,
+    sub_name: TextInput,
     /// API key input (masked)
-    api_key: String,
-    /// Cursor position
-    cursor: usize,
+    api_key: TextInput,
     /// Which field is focused (0 = name, 1 = api_key)
     focus: usize,
     /// Error message to display
@@ -155,9 +154,8 @@ impl SetupWizardState {
             step: SetupStep::Welcome,
             needs_setup: false,
             dismissed: false,
-            sub_name: "claude".to_string(),
-            api_key: String::new(),
-            cursor: 0,
+            sub_name: TextInput::with_text("claude".to_string()),
+            api_key: TextInput::new(),
             focus: 1, // Start on API key field
             error: None,
             setup_complete: false,
@@ -168,9 +166,8 @@ impl SetupWizardState {
 
     fn reset(&mut self) {
         self.step = SetupStep::Welcome;
-        self.sub_name = "claude".to_string();
+        self.sub_name.set_text("claude".to_string());
         self.api_key.clear();
-        self.cursor = 0;
         self.focus = 1;
         self.error = None;
     }
@@ -181,66 +178,35 @@ impl SetupWizardState {
             SetupStep::AddApiKey => SetupStep::Complete,
             SetupStep::Complete => SetupStep::Complete,
         };
-        self.cursor = 0;
     }
 
-    fn current_field(&self) -> &str {
+    fn current_input(&self) -> &TextInput {
         match self.focus {
             0 => &self.sub_name,
             _ => &self.api_key,
         }
     }
 
-    fn current_field_mut(&mut self) -> &mut String {
+    fn current_input_mut(&mut self) -> &mut TextInput {
         match self.focus {
             0 => &mut self.sub_name,
             _ => &mut self.api_key,
         }
     }
 
-    fn insert_char(&mut self, c: char) {
-        let cursor = self.cursor;
-        let field = self.current_field_mut();
-        let char_count = field.chars().count();
-        if cursor <= char_count {
-            let byte_pos = field.char_indices()
-                .nth(cursor)
-                .map(|(i, _)| i)
-                .unwrap_or(field.len());
-            field.insert(byte_pos, c);
-            self.cursor += 1;
-        }
-    }
-
-    fn delete_char(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let cursor = self.cursor;
-            let field = self.current_field_mut();
-            let char_count = field.chars().count();
-            if !field.is_empty() && cursor < char_count {
-                let byte_pos = field.char_indices()
-                    .nth(cursor)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                field.remove(byte_pos);
-            }
-        }
-    }
-
     fn is_valid(&self) -> bool {
         if self.use_detected_auth && self.detected_auth.is_some() {
-            !self.sub_name.trim().is_empty()
+            !self.sub_name.text().trim().is_empty()
         } else {
-            !self.sub_name.trim().is_empty() && !self.api_key.trim().is_empty()
+            !self.sub_name.text().trim().is_empty() && !self.api_key.text().trim().is_empty()
         }
     }
 
     fn get_api_key(&self) -> Option<String> {
         if self.use_detected_auth {
             self.detected_auth.as_ref().map(|a| a.access_token.clone())
-        } else if !self.api_key.trim().is_empty() {
-            Some(self.api_key.trim().to_string())
+        } else if !self.api_key.text().trim().is_empty() {
+            Some(self.api_key.text().trim().to_string())
         } else {
             None
         }
@@ -759,13 +725,11 @@ struct SpawnDialogState {
     /// Which field is focused (0 = repo, 1 = provider, 2 = namespace)
     focus: usize,
     /// Repository path
-    repo: String,
+    repo: TextInput,
     /// Selected provider
     provider: AgentProvider,
     /// Namespace (optional)
-    namespace: String,
-    /// Cursor position in current text field
-    cursor: usize,
+    namespace: TextInput,
 }
 
 impl SpawnDialogState {
@@ -774,14 +738,12 @@ impl SpawnDialogState {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
-        let cursor = cwd.chars().count(); // Start cursor at end
 
         Self {
             focus: 0, // Start on repo field
-            repo: cwd,
+            repo: TextInput::with_text(cwd),
             provider: AgentProvider::default(),
-            namespace: String::new(),
-            cursor,
+            namespace: TextInput::new(),
         }
     }
 
@@ -791,14 +753,13 @@ impl SpawnDialogState {
             .unwrap_or_else(|_| ".".to_string());
 
         self.focus = 0;
-        self.cursor = cwd.chars().count(); // Start cursor at end
-        self.repo = cwd;
+        self.repo.set_text(cwd);
         self.provider = AgentProvider::default();
         self.namespace.clear();
     }
 
-    /// Get the current text field (repo or namespace, not provider which is a selector)
-    fn current_text_field(&self) -> Option<&str> {
+    /// Get the current text input (repo or namespace, not provider which is a selector)
+    fn current_input(&self) -> Option<&TextInput> {
         match self.focus {
             0 => Some(&self.repo),
             2 => Some(&self.namespace),
@@ -806,7 +767,7 @@ impl SpawnDialogState {
         }
     }
 
-    fn current_text_field_mut(&mut self) -> Option<&mut String> {
+    fn current_input_mut(&mut self) -> Option<&mut TextInput> {
         match self.focus {
             0 => Some(&mut self.repo),
             2 => Some(&mut self.namespace),
@@ -816,92 +777,31 @@ impl SpawnDialogState {
 
     fn next_field(&mut self) {
         self.focus = (self.focus + 1) % 3;
-        if let Some(field) = self.current_text_field() {
-            self.cursor = field.chars().count();
-        }
     }
 
     fn prev_field(&mut self) {
         self.focus = if self.focus == 0 { 2 } else { self.focus - 1 };
-        if let Some(field) = self.current_text_field() {
-            self.cursor = field.chars().count();
-        }
     }
 
-    fn insert_char(&mut self, c: char) {
-        let cursor = self.cursor;
-        // Edit the appropriate field based on focus (using char indices)
-        match self.focus {
-            0 => {
-                let char_count = self.repo.chars().count();
-                if cursor <= char_count {
-                    // Find byte position from char position
-                    let byte_pos = self.repo.char_indices()
-                        .nth(cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(self.repo.len());
-                    self.repo.insert(byte_pos, c);
-                    self.cursor += 1;
-                }
+    fn handle_left(&mut self, alt: bool) {
+        if let Some(input) = self.current_input_mut() {
+            if alt {
+                input.move_word_left();
+            } else {
+                input.move_left();
             }
-            2 => {
-                let char_count = self.namespace.chars().count();
-                if cursor <= char_count {
-                    let byte_pos = self.namespace.char_indices()
-                        .nth(cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(self.namespace.len());
-                    self.namespace.insert(byte_pos, c);
-                    self.cursor += 1;
-                }
-            }
-            _ => {} // Provider is a selector, not a text field
-        }
-    }
-
-    fn delete_char(&mut self) {
-        if self.cursor > 0 && self.focus != 1 {
-            self.cursor -= 1;
-            let cursor = self.cursor;
-            match self.focus {
-                0 => {
-                    let char_count = self.repo.chars().count();
-                    if !self.repo.is_empty() && cursor < char_count {
-                        let byte_pos = self.repo.char_indices()
-                            .nth(cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        self.repo.remove(byte_pos);
-                    }
-                }
-                2 => {
-                    let char_count = self.namespace.chars().count();
-                    if !self.namespace.is_empty() && cursor < char_count {
-                        let byte_pos = self.namespace.char_indices()
-                            .nth(cursor)
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        self.namespace.remove(byte_pos);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn move_cursor_left(&mut self) {
-        if self.current_text_field().is_some() {
-            self.cursor = self.cursor.saturating_sub(1);
         } else if self.focus == 1 {
             // Provider selector - cycle through options
             self.provider = self.provider.prev();
         }
     }
 
-    fn move_cursor_right(&mut self) {
-        if let Some(field) = self.current_text_field() {
-            if self.cursor < field.chars().count() {
-                self.cursor += 1;
+    fn handle_right(&mut self, alt: bool) {
+        if let Some(input) = self.current_input_mut() {
+            if alt {
+                input.move_word_right();
+            } else {
+                input.move_right();
             }
         } else if self.focus == 1 {
             // Provider selector - cycle through options
@@ -909,117 +809,37 @@ impl SpawnDialogState {
         }
     }
 
-    fn move_cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_cursor_end(&mut self) {
-        if let Some(field) = self.current_text_field() {
-            self.cursor = field.chars().count();
+    fn handle_backspace(&mut self, alt: bool) {
+        if let Some(input) = self.current_input_mut() {
+            if alt {
+                input.delete_word_left();
+            } else {
+                input.delete_char();
+            }
         }
     }
 
-    /// Move cursor to previous path segment boundary (Option+Left)
-    fn move_cursor_word_left(&mut self) {
-        if let Some(field) = self.current_text_field() {
-            if self.cursor == 0 {
-                return;
-            }
-            let chars: Vec<char> = field.chars().collect();
-            let mut pos = self.cursor.saturating_sub(1);
-
-            // Skip any trailing slashes at cursor position
-            while pos > 0 && chars[pos] == '/' {
-                pos -= 1;
-            }
-
-            // Find the previous slash or start
-            while pos > 0 && chars[pos - 1] != '/' {
-                pos -= 1;
-            }
-
-            self.cursor = pos;
+    fn handle_char(&mut self, c: char) {
+        if let Some(input) = self.current_input_mut() {
+            input.insert_char(c);
         }
     }
 
-    /// Move cursor to next path segment boundary (Option+Right)
-    fn move_cursor_word_right(&mut self) {
-        if let Some(field) = self.current_text_field() {
-            let chars: Vec<char> = field.chars().collect();
-            let len = chars.len();
-
-            if self.cursor >= len {
-                return;
-            }
-
-            let mut pos = self.cursor;
-
-            // Skip current character if it's a slash
-            if pos < len && chars[pos] == '/' {
-                pos += 1;
-            }
-
-            // Find the next slash or end
-            while pos < len && chars[pos] != '/' {
-                pos += 1;
-            }
-
-            self.cursor = pos;
+    fn handle_home(&mut self) {
+        if let Some(input) = self.current_input_mut() {
+            input.move_home();
         }
     }
 
-    /// Delete previous path segment (Option+Backspace)
-    fn delete_word_left(&mut self) {
-        if self.cursor == 0 {
-            return;
+    fn handle_end(&mut self) {
+        if let Some(input) = self.current_input_mut() {
+            input.move_end();
         }
-
-        let old_cursor = self.cursor;
-
-        // Find the new cursor position (same logic as move_cursor_word_left)
-        let field = match self.focus {
-            0 => &self.repo,
-            2 => &self.namespace,
-            _ => return,
-        };
-
-        let chars: Vec<char> = field.chars().collect();
-        let mut new_pos = self.cursor.saturating_sub(1);
-
-        // Skip any trailing slashes at cursor position
-        while new_pos > 0 && chars[new_pos] == '/' {
-            new_pos -= 1;
-        }
-
-        // Find the previous slash or start
-        while new_pos > 0 && chars[new_pos - 1] != '/' {
-            new_pos -= 1;
-        }
-
-        // Delete the range [new_pos, old_cursor)
-        let field_mut = match self.focus {
-            0 => &mut self.repo,
-            2 => &mut self.namespace,
-            _ => return,
-        };
-
-        // Convert char positions to byte positions
-        let start_byte = field_mut.char_indices()
-            .nth(new_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let end_byte = field_mut.char_indices()
-            .nth(old_cursor)
-            .map(|(i, _)| i)
-            .unwrap_or(field_mut.len());
-
-        field_mut.replace_range(start_byte..end_byte, "");
-        self.cursor = new_pos;
     }
 
     fn is_valid(&self) -> bool {
         // Only repo is required - we just run claude in that directory
-        !self.repo.trim().is_empty()
+        !self.repo.text().trim().is_empty()
     }
 }
 
@@ -1682,6 +1502,7 @@ impl Dashboard {
                     }
                 }
                 SetupStep::AddApiKey => {
+                    let alt = modifiers.contains(KeyModifiers::ALT);
                     match key {
                         KeyCode::Esc => {
                             // Skip setup
@@ -1693,29 +1514,42 @@ impl Dashboard {
                                 self.handle_add_subscription();
                             }
                         }
-                        KeyCode::Tab => {
+                        KeyCode::Tab | KeyCode::BackTab => {
                             self.setup_wizard.focus = if self.setup_wizard.focus == 0 { 1 } else { 0 };
-                            self.setup_wizard.cursor = self.setup_wizard.current_field().len();
-                        }
-                        KeyCode::BackTab => {
-                            self.setup_wizard.focus = if self.setup_wizard.focus == 0 { 1 } else { 0 };
-                            self.setup_wizard.cursor = self.setup_wizard.current_field().len();
                         }
                         KeyCode::Backspace => {
                             if self.setup_wizard.use_detected_auth {
                                 // Switch to manual mode when deleting
                                 self.setup_wizard.use_detected_auth = false;
                             }
-                            self.setup_wizard.delete_char();
+                            let input = self.setup_wizard.current_input_mut();
+                            if alt {
+                                input.delete_word_left();
+                            } else {
+                                input.delete_char();
+                            }
                         }
                         KeyCode::Left => {
-                            self.setup_wizard.cursor = self.setup_wizard.cursor.saturating_sub(1);
+                            let input = self.setup_wizard.current_input_mut();
+                            if alt {
+                                input.move_word_left();
+                            } else {
+                                input.move_left();
+                            }
                         }
                         KeyCode::Right => {
-                            let len = self.setup_wizard.current_field().len();
-                            if self.setup_wizard.cursor < len {
-                                self.setup_wizard.cursor += 1;
+                            let input = self.setup_wizard.current_input_mut();
+                            if alt {
+                                input.move_word_right();
+                            } else {
+                                input.move_right();
                             }
+                        }
+                        KeyCode::Home => {
+                            self.setup_wizard.current_input_mut().move_home();
+                        }
+                        KeyCode::End => {
+                            self.setup_wizard.current_input_mut().move_end();
                         }
                         KeyCode::Char('d') if self.setup_wizard.detected_auth.is_some() && self.setup_wizard.focus == 1 => {
                             // Toggle between detected and manual API key
@@ -1723,14 +1557,13 @@ impl Dashboard {
                             if self.setup_wizard.use_detected_auth {
                                 self.setup_wizard.api_key.clear();
                             }
-                            self.setup_wizard.cursor = 0;
                         }
                         KeyCode::Char(c) => {
                             // Typing in API key field disables detected auth
                             if self.setup_wizard.use_detected_auth && self.setup_wizard.focus == 1 {
                                 self.setup_wizard.use_detected_auth = false;
                             }
-                            self.setup_wizard.insert_char(c);
+                            self.setup_wizard.current_input_mut().insert_char(c);
                         }
                         _ => {}
                     }
@@ -1810,6 +1643,7 @@ impl Dashboard {
         }
 
         if self.show_spawn_dialog {
+            let alt = modifiers.contains(KeyModifiers::ALT);
             match key {
                 KeyCode::Esc => {
                     self.show_spawn_dialog = false;
@@ -1822,42 +1656,14 @@ impl Dashboard {
                         self.spawn_dialog.reset();
                     }
                 }
-                KeyCode::Tab => {
-                    self.spawn_dialog.next_field();
-                }
-                KeyCode::BackTab => {
-                    self.spawn_dialog.prev_field();
-                }
-                KeyCode::Backspace => {
-                    if modifiers.contains(KeyModifiers::ALT) {
-                        self.spawn_dialog.delete_word_left();
-                    } else {
-                        self.spawn_dialog.delete_char();
-                    }
-                }
-                KeyCode::Left => {
-                    if modifiers.contains(KeyModifiers::ALT) {
-                        self.spawn_dialog.move_cursor_word_left();
-                    } else {
-                        self.spawn_dialog.move_cursor_left();
-                    }
-                }
-                KeyCode::Right => {
-                    if modifiers.contains(KeyModifiers::ALT) {
-                        self.spawn_dialog.move_cursor_word_right();
-                    } else {
-                        self.spawn_dialog.move_cursor_right();
-                    }
-                }
-                KeyCode::Home => {
-                    self.spawn_dialog.move_cursor_home();
-                }
-                KeyCode::End => {
-                    self.spawn_dialog.move_cursor_end();
-                }
-                KeyCode::Char(c) => {
-                    self.spawn_dialog.insert_char(c);
-                }
+                KeyCode::Tab => self.spawn_dialog.next_field(),
+                KeyCode::BackTab => self.spawn_dialog.prev_field(),
+                KeyCode::Backspace => self.spawn_dialog.handle_backspace(alt),
+                KeyCode::Left => self.spawn_dialog.handle_left(alt),
+                KeyCode::Right => self.spawn_dialog.handle_right(alt),
+                KeyCode::Home => self.spawn_dialog.handle_home(),
+                KeyCode::End => self.spawn_dialog.handle_end(),
+                KeyCode::Char(c) => self.spawn_dialog.handle_char(c),
                 _ => {}
             }
             return;
@@ -2062,7 +1868,7 @@ impl Dashboard {
 
     /// Handle add subscription from setup wizard
     fn handle_add_subscription(&mut self) {
-        let name = self.setup_wizard.sub_name.trim().to_string();
+        let name = self.setup_wizard.sub_name.text().trim().to_string();
         let api_key = match self.setup_wizard.get_api_key() {
             Some(key) => key,
             None => {
@@ -2077,11 +1883,11 @@ impl Dashboard {
 
     /// Handle spawn agent from dialog
     fn handle_spawn_agent(&mut self) {
-        let repo = self.spawn_dialog.repo.trim().to_string();
-        let namespace = if self.spawn_dialog.namespace.trim().is_empty() {
+        let repo = self.spawn_dialog.repo.text().trim().to_string();
+        let namespace = if self.spawn_dialog.namespace.text().trim().is_empty() {
             None
         } else {
-            Some(self.spawn_dialog.namespace.trim().to_string())
+            Some(self.spawn_dialog.namespace.text().trim().to_string())
         };
 
         // Calculate initial PTY size based on current terminal size
@@ -3720,15 +3526,9 @@ impl Dashboard {
 
                 // Show name with cursor if focused
                 let name_display = if name_focused {
-                    let cursor = self.setup_wizard.cursor;
-                    let name = &self.setup_wizard.sub_name;
-                    if cursor < name.len() {
-                        format!("  {}│{}", &name[..cursor], &name[cursor..])
-                    } else {
-                        format!("  {}│", name)
-                    }
+                    self.setup_wizard.sub_name.render_with_cursor("  ", '│')
                 } else {
-                    format!("  {}", self.setup_wizard.sub_name)
+                    format!("  {}", self.setup_wizard.sub_name.text())
                 };
 
                 // Show API key - either detected or manual entry
@@ -3744,19 +3544,17 @@ impl Dashboard {
                         ("  (no detected credentials)".to_string(), Style::default().fg(self.c().text_muted))
                     }
                 } else {
-                    // Manual entry mode
-                    let masked_key: String = "*".repeat(self.setup_wizard.api_key.len());
+                    // Manual entry mode - mask the API key for display
+                    let api_key_text = self.setup_wizard.api_key.text();
+                    let cursor = self.setup_wizard.api_key.cursor;
+                    let masked_before: String = "*".repeat(cursor);
+                    let masked_after: String = "*".repeat(api_key_text.chars().count().saturating_sub(cursor));
                     let display = if key_focused {
-                        let cursor = self.setup_wizard.cursor;
-                        if cursor < masked_key.len() {
-                            format!("  {}│{}", &masked_key[..cursor], &masked_key[cursor..])
-                        } else {
-                            format!("  {}│", masked_key)
-                        }
-                    } else if masked_key.is_empty() {
+                        format!("  {}│{}", masked_before, masked_after)
+                    } else if api_key_text.is_empty() {
                         "  (paste your API key)".to_string()
                     } else {
-                        format!("  {}", masked_key)
+                        format!("  {}", "*".repeat(api_key_text.chars().count()))
                     };
                     let style = if self.setup_wizard.api_key.is_empty() && !key_focused {
                         Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
@@ -3938,19 +3736,9 @@ impl Dashboard {
 
         // Show repo value with cursor if focused
         let repo_display = if repo_focused {
-            let cursor_pos = self.spawn_dialog.cursor;
-            let repo = &self.spawn_dialog.repo;
-            let char_count = repo.chars().count();
-            if cursor_pos < char_count {
-                // Split at char index
-                let before: String = repo.chars().take(cursor_pos).collect();
-                let after: String = repo.chars().skip(cursor_pos).collect();
-                format!("  {}│{}", before, after)
-            } else {
-                format!("  {}│", repo)
-            }
+            self.spawn_dialog.repo.render_with_cursor("  ", '│')
         } else {
-            format!("  {}", self.spawn_dialog.repo)
+            format!("  {}", self.spawn_dialog.repo.text())
         };
         lines.push(Line::from(Span::styled(repo_display, repo_value_style)));
         lines.push(Line::from(""));
@@ -4001,20 +3789,11 @@ impl Dashboard {
 
         // Show namespace value with cursor if focused
         let ns_display = if ns_focused {
-            let cursor_pos = self.spawn_dialog.cursor;
-            let ns = &self.spawn_dialog.namespace;
-            let char_count = ns.chars().count();
-            if cursor_pos < char_count {
-                let before: String = ns.chars().take(cursor_pos).collect();
-                let after: String = ns.chars().skip(cursor_pos).collect();
-                format!("  {}│{}", before, after)
-            } else {
-                format!("  {}│", ns)
-            }
+            self.spawn_dialog.namespace.render_with_cursor("  ", '│')
         } else if self.spawn_dialog.namespace.is_empty() {
             "  (default)".to_string()
         } else {
-            format!("  {}", self.spawn_dialog.namespace)
+            format!("  {}", self.spawn_dialog.namespace.text())
         };
         let ns_display_style = if self.spawn_dialog.namespace.is_empty() && !ns_focused {
             Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)

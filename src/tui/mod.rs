@@ -3,10 +3,15 @@
 //! This module contains:
 //! - Splash screen and branding
 //! - Theme system for customizable styling
+//! - Reusable input components
 //! - First-run onboarding wizard (requires `tui` feature)
 //! - Dashboard for monitoring agents (requires `tui` feature)
 
 pub mod splash;
+
+/// Reusable text input component
+#[cfg(feature = "tui")]
+pub mod input;
 
 /// Theme system for TUI styling
 #[cfg(feature = "tui")]
