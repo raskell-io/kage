@@ -1522,6 +1522,19 @@ impl Dashboard {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                     self.show_agent_details = false;
                 }
+                KeyCode::Char('k') => {
+                    self.handle_kill_agent();
+                    self.show_agent_details = false;
+                }
+                KeyCode::Char('p') => {
+                    self.handle_pause_agent();
+                }
+                KeyCode::Char('a') => {
+                    self.focus = Panel::Stream;
+                    self.fullscreen_stream = true;
+                    self.last_stream_size = (0, 0);
+                    self.show_agent_details = false;
+                }
                 _ => {}
             }
             return;
@@ -1874,6 +1887,24 @@ impl Dashboard {
             let id = agent.id.clone();
             self.logs.add_info("dashboard", &format!("Killing agent {}...", &id[..8.min(id.len())]));
             self.send_action(Action::KillAgent { id });
+        }
+    }
+
+    /// Handle pause agent
+    fn handle_pause_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let id = agent.id.clone();
+            self.logs.add_info("dashboard", &format!("Pausing agent {}...", &id[..8.min(id.len())]));
+            self.send_action(Action::PauseAgent { id });
+        }
+    }
+
+    /// Handle resume agent
+    fn handle_resume_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let id = agent.id.clone();
+            self.logs.add_info("dashboard", &format!("Resuming agent {}...", &id[..8.min(id.len())]));
+            self.send_action(Action::ResumeAgent { id });
         }
     }
 
@@ -2917,8 +2948,13 @@ impl Dashboard {
             height: area.height,
         };
 
-        // Render hints on left
-        let footer = Paragraph::new(Line::from(hint_spans));
+        // Fill status bar background
+        let bg_block = Block::default().style(Style::default().bg(self.c().bg_surface));
+        f.render_widget(bg_block, area);
+
+        // Render status on left
+        let footer = Paragraph::new(Line::from(hint_spans))
+            .style(Style::default().bg(self.c().bg_surface));
         f.render_widget(footer, hints_area);
 
         // Render mode indicator on right

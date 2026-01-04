@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,6 +18,109 @@ use crate::subscription::{SubscriptionId, SubscriptionRegistry};
 use crate::task::{ApprovalAction, ApprovalId, ApprovalLevel, ApprovalRequest, TaskId};
 
 use super::protocol::{AgentInfo, ApprovalInfo, OutputLine};
+
+/// Detected workspace configuration for AI agents
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceConfig {
+    /// Claude Code specific config (.claude/)
+    pub claude_dir: Option<PathBuf>,
+    /// CLAUDE.md instructions file
+    pub claude_md: Option<PathBuf>,
+    /// settings.json in .claude/
+    pub claude_settings: Option<PathBuf>,
+    /// OpenAI Codex config (.codex/)
+    pub codex_dir: Option<PathBuf>,
+    /// Cursor config (.cursor/)
+    pub cursor_dir: Option<PathBuf>,
+    /// Generic .ai/ or .agent/ config
+    pub generic_ai_dir: Option<PathBuf>,
+}
+
+impl WorkspaceConfig {
+    /// Detect workspace configuration from a directory
+    pub fn detect(working_dir: &Path) -> Self {
+        let mut config = Self::default();
+
+        // Claude Code: .claude/ folder
+        let claude_dir = working_dir.join(".claude");
+        if claude_dir.is_dir() {
+            config.claude_dir = Some(claude_dir.clone());
+
+            // Check for CLAUDE.md in .claude/
+            let claude_md = claude_dir.join("CLAUDE.md");
+            if claude_md.is_file() {
+                config.claude_md = Some(claude_md);
+            }
+
+            // Check for settings.json
+            let settings = claude_dir.join("settings.json");
+            if settings.is_file() {
+                config.claude_settings = Some(settings);
+            }
+        }
+
+        // Also check for CLAUDE.md in root (some projects use this)
+        if config.claude_md.is_none() {
+            let root_claude_md = working_dir.join("CLAUDE.md");
+            if root_claude_md.is_file() {
+                config.claude_md = Some(root_claude_md);
+            }
+        }
+
+        // OpenAI Codex: .codex/ folder
+        let codex_dir = working_dir.join(".codex");
+        if codex_dir.is_dir() {
+            config.codex_dir = Some(codex_dir);
+        }
+
+        // Cursor: .cursor/ folder
+        let cursor_dir = working_dir.join(".cursor");
+        if cursor_dir.is_dir() {
+            config.cursor_dir = Some(cursor_dir);
+        }
+
+        // Generic: .ai/ or .agent/
+        let ai_dir = working_dir.join(".ai");
+        let agent_dir = working_dir.join(".agent");
+        if ai_dir.is_dir() {
+            config.generic_ai_dir = Some(ai_dir);
+        } else if agent_dir.is_dir() {
+            config.generic_ai_dir = Some(agent_dir);
+        }
+
+        config
+    }
+
+    /// Check if this is a Claude Code configured workspace
+    pub fn has_claude_config(&self) -> bool {
+        self.claude_dir.is_some() || self.claude_md.is_some()
+    }
+
+    /// Get a description of detected configs
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if self.claude_dir.is_some() {
+            parts.push(".claude/");
+        }
+        if self.claude_md.is_some() {
+            parts.push("CLAUDE.md");
+        }
+        if self.codex_dir.is_some() {
+            parts.push(".codex/");
+        }
+        if self.cursor_dir.is_some() {
+            parts.push(".cursor/");
+        }
+        if self.generic_ai_dir.is_some() {
+            parts.push(".ai/");
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
 
 /// Screen update notification (just signals that screen changed)
 #[derive(Clone, Debug)]
@@ -228,6 +331,21 @@ impl Supervisor {
             working_dir,
             namespace
         );
+
+        // Detect workspace configuration
+        let workspace_config = WorkspaceConfig::detect(&working_dir);
+        if workspace_config.has_claude_config() {
+            tracing::info!(
+                "Detected workspace config for {}: {}",
+                name,
+                workspace_config.describe()
+            );
+        } else {
+            tracing::debug!(
+                "No workspace config found in {:?} (will use defaults)",
+                working_dir
+            );
+        }
 
         // Try to acquire a subscription from the pool
         let (subscription_id, api_key) = if let Some(ref pool) = self.subscription_pool {
