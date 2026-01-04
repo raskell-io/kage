@@ -2399,68 +2399,45 @@ impl Dashboard {
         let is_stream_focused = self.focus == Panel::Stream;
         let is_logs_focused = self.focus == Panel::Logs;
 
-        let filter_text = match self.agent_filter {
-            AgentFilter::All => "all",
-            AgentFilter::Working => "working",
-            AgentFilter::Idle => "idle",
-            AgentFilter::Waiting => "waiting",
-        };
-        let (working, idle, waiting) = self.agent_counts();
-        let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
-        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
-        let log_count = self.logs.entries.len();
-
-        let stream_info = if let Some(ref agent_id) = self.stream.agent_id {
-            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
-            short_id.to_string()
-        } else {
-            "−".to_string()
-        };
-
         let total_width = area.width as usize;
-        let left_panel_width = (total_width * 30) / 100;
+        // -1 to align with the vertical separator below (which starts after the 30% mark)
+        let left_panel_width = (total_width * 30) / 100 - 1;
         let right_panel_width = total_width - left_panel_width - 1; // -1 for center separator
 
-        // Build left section spans
-        let mut left_spans = vec![
+        // Build left section spans (just panel names, metadata is in header)
+        let mut spans = vec![
             Span::styled(
-                format!("Agents [1] {} ", filter_text),
+                "Agents [1] ",
                 Style::default().fg(if is_agents_focused { self.c().accent } else { self.c().text_muted }),
             ),
-            Span::styled(self.s().working, Style::default().fg(self.c().status_working)),
-            Span::styled(format!("{} ", working), Style::default().fg(self.c().status_working)),
-            Span::styled(self.s().idle, Style::default().fg(self.c().status_idle)),
-            Span::styled(format!("{} ", idle), Style::default().fg(self.c().status_idle)),
-            Span::styled(self.s().waiting, Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
-            Span::styled(format!("{}", waiting), Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled("│ ", Style::default().fg(self.c().border)),
             Span::styled(
-                format!("Tasks [3] ({}/{}) ", running_tasks, pending_tasks + running_tasks),
+                "Tasks [3] ",
                 Style::default().fg(if is_tasks_focused { self.c().accent } else { self.c().text_muted }),
             ),
         ];
 
         // Calculate left section length and add dashes to fill
-        let left_len: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+        let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
         let left_dashes = left_panel_width.saturating_sub(left_len);
         if left_dashes > 0 {
-            left_spans.push(Span::styled("─".repeat(left_dashes), Style::default().fg(self.c().border)));
+            spans.push(Span::styled("─".repeat(left_dashes), Style::default().fg(self.c().border)));
         }
 
         // Center separator
-        left_spans.push(Span::styled("│", Style::default().fg(self.c().border)));
+        spans.push(Span::styled("│", Style::default().fg(self.c().border)));
 
         // Build right section
-        let right_text_stream = format!("Stream [2] {} ", stream_info);
-        let right_text_logs = format!("Logs [4] ({}) ", log_count);
+        let right_text_stream = "Stream [2] ";
+        let right_text_logs = "Logs [4] ";
         let right_content_len = right_text_stream.len() + 3 + right_text_logs.len(); // +3 for " │ "
 
-        left_spans.push(Span::styled(
+        spans.push(Span::styled(
             right_text_stream,
             Style::default().fg(if is_stream_focused { self.c().accent } else { self.c().text_muted }),
         ));
-        left_spans.push(Span::styled(" │ ", Style::default().fg(self.c().border)));
-        left_spans.push(Span::styled(
+        spans.push(Span::styled("│ ", Style::default().fg(self.c().border)));
+        spans.push(Span::styled(
             right_text_logs,
             Style::default().fg(if is_logs_focused { self.c().accent } else { self.c().text_muted }),
         ));
@@ -2468,10 +2445,10 @@ impl Dashboard {
         // Add dashes to fill remaining width
         let right_dashes = right_panel_width.saturating_sub(right_content_len);
         if right_dashes > 0 {
-            left_spans.push(Span::styled("─".repeat(right_dashes), Style::default().fg(self.c().border)));
+            spans.push(Span::styled("─".repeat(right_dashes), Style::default().fg(self.c().border)));
         }
 
-        let header_line = Paragraph::new(Line::from(left_spans));
+        let header_line = Paragraph::new(Line::from(spans));
         f.render_widget(header_line, area);
     }
 
