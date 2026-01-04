@@ -2289,50 +2289,32 @@ impl Dashboard {
 
     /// Render the main content area
     fn render_main(&self, f: &mut Frame, area: Rect) {
-        // Determine bottom row height based on collapse state
-        let both_collapsed = self.tasks_collapsed && self.logs_collapsed;
-        let bottom_height = if both_collapsed { 2 } else { 45 };  // 2 lines when collapsed (just header)
-
-        // Split into top and bottom rows with horizontal separator
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
+        // Two-column layout: Left (Agents/Tasks) + separator + Right (Stream/Logs)
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(100 - bottom_height), // Top: Agents + Stream
-                Constraint::Length(1),                        // Horizontal separator
-                Constraint::Percentage(bottom_height),        // Bottom: Tasks + Logs
+                Constraint::Percentage(30), // Left panel
+                Constraint::Length(1),      // Vertical separator
+                Constraint::Percentage(70), // Right panel
             ])
             .split(area);
 
-        // Top row: Agents (left) + separator + Stream (right)
-        let top_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(30), // Agents
-                Constraint::Length(1),      // Vertical separator
-                Constraint::Percentage(70), // Stream
-            ])
-            .split(rows[0]);
+        // Left panel: Agents (default) or Tasks (when focused)
+        if self.focus == Panel::Tasks {
+            self.render_tasks_panel(f, cols[0]);
+        } else {
+            self.render_agents_panel(f, cols[0]);
+        }
 
-        // Bottom row: Tasks (left) + separator + Logs (right)
-        let bottom_cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50), // Tasks
-                Constraint::Length(1),      // Vertical separator
-                Constraint::Percentage(50), // Logs
-            ])
-            .split(rows[2]);
+        // Right panel: Stream (default) or Logs (when focused)
+        if self.focus == Panel::Logs {
+            self.render_logs_panel(f, cols[2]);
+        } else {
+            self.render_stream_panel(f, cols[2]);
+        }
 
-        // Render panels
-        self.render_agents_panel(f, top_cols[0]);
-        self.render_stream_panel(f, top_cols[2]);
-        self.render_tasks_panel(f, bottom_cols[0]);
-        self.render_logs_panel(f, bottom_cols[2]);
-
-        // Draw separators
-        self.render_vertical_separator(f, top_cols[1]);
-        self.render_horizontal_separator(f, rows[1]);
-        self.render_vertical_separator(f, bottom_cols[1]);
+        // Draw separator
+        self.render_vertical_separator(f, cols[1]);
     }
 
     /// Render a vertical separator line
@@ -2385,22 +2367,26 @@ impl Dashboard {
             ])
         }).collect();
 
-        // Title shows filter and counts
+        // Title with tabs: Agents [1] | Tasks [3]
         let (working, idle, waiting) = self.agent_counts();
-        let title = format!(
-            "Agents [1] {} {}{} {}{} {}{}",
-            filter_text,
-            self.s().working, working,
-            self.s().idle, idle,
-            self.s().waiting, waiting
-        );
+        let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
+        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+
+        let title_spans = vec![
+            Span::styled(
+                format!("Agents [1] {} {}{} {}{} {}{}", filter_text, self.s().working, working, self.s().idle, idle, self.s().waiting, waiting),
+                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Tasks [3] ({}/{})", running_tasks, pending_tasks + running_tasks),
+                Style::default().fg(self.c().text_muted),
+            ),
+        ];
 
         // Render title line
         let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(Span::styled(
-            title,
-            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-        )));
+        let title_widget = Paragraph::new(Line::from(title_spans));
         f.render_widget(title_widget, title_area);
 
         // Render list below title
@@ -2419,46 +2405,53 @@ impl Dashboard {
     /// Render the stream panel (agent output)
     fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
         let is_focused = self.focus == Panel::Stream;
+        let log_count = self.logs.entries.len();
 
-        let title = if self.prefix_active {
-            "Stream [2] ^B-".to_string()  // Waiting for command
+        // Build stream title part
+        let stream_info = if self.prefix_active {
+            "^B-".to_string()  // Waiting for command
         } else if let Some(ref agent_id) = self.stream.agent_id {
-            let short_id = if agent_id.len() > 8 {
-                &agent_id[..8]
-            } else {
-                agent_id
-            };
+            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
             if is_focused {
-                format!("Stream [2] {} │ ^B: menu", short_id)
+                format!("{} │ ^B: menu", short_id)
             } else {
-                format!("Stream [2] {}", short_id)
+                short_id.to_string()
             }
         } else {
-            "Stream [2]".to_string()
+            String::new()
         };
 
-        // Render title line
-        let title_area = Rect { height: 1, ..area };
         let scroll_info = if self.stream.scroll > 0 {
             format!(" ↑{}", self.stream.scroll)
         } else {
             String::new()
         };
+
         let title_color = if self.prefix_active {
-            self.c().warning  // Highlight prefix mode
+            self.c().warning
         } else if is_focused {
             self.c().accent
         } else {
             self.c().text_dim
         };
-        let title_line = Line::from(vec![
+
+        // Title with tabs: Stream [2] | Logs [4]
+        let title_spans = vec![
             Span::styled(
-                title,
+                format!("Stream [2] {}", stream_info),
                 Style::default().fg(title_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(scroll_info, Style::default().fg(self.c().text_muted)),
-        ]);
-        f.render_widget(Paragraph::new(title_line), title_area);
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Logs [4] ({})", log_count),
+                Style::default().fg(self.c().text_muted),
+            ),
+        ];
+
+        // Render title line
+        let title_area = Rect { height: 1, ..area };
+        f.render_widget(Paragraph::new(Line::from(title_spans)), title_area);
 
         let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
         let inner_height = content_area.height as usize;
@@ -2665,22 +2658,24 @@ impl Dashboard {
 
         let pending = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
         let running = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+        let (working, idle, waiting) = self.agent_counts();
 
-        // Collapsed title
-        let collapse_symbol = if self.tasks_collapsed { self.s().collapsed } else { self.s().expanded };
-        let title = format!(
-            "{} Tasks [3] ({} pending, {} running)",
-            collapse_symbol,
-            pending,
-            running
-        );
+        // Title with tabs: Agents [1] | Tasks [3] (Tasks highlighted)
+        let title_spans = vec![
+            Span::styled(
+                format!("Agents [1] ({})", working + idle + waiting),
+                Style::default().fg(self.c().text_muted),
+            ),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Tasks [3] ({} pending, {} running)", pending, running),
+                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+            ),
+        ];
 
         // Render title line
         let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(Span::styled(
-            title,
-            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-        )));
+        let title_widget = Paragraph::new(Line::from(title_spans));
         f.render_widget(title_widget, title_area);
 
         // If collapsed, just render the header
@@ -2739,20 +2734,25 @@ impl Dashboard {
 
         let errors = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Error)).count();
 
-        // Collapsed title
-        let collapse_symbol = if self.logs_collapsed { self.s().collapsed } else { self.s().expanded };
-        let title = if errors > 0 {
-            format!("{} Logs [4] ({} entries, {} errors)", collapse_symbol, self.logs.entries.len(), errors)
+        // Title with tabs: Stream [2] | Logs [4] (Logs highlighted)
+        let logs_info = if errors > 0 {
+            format!("Logs [4] ({} entries, {} errors)", self.logs.entries.len(), errors)
         } else {
-            format!("{} Logs [4] ({} entries)", collapse_symbol, self.logs.entries.len())
+            format!("Logs [4] ({} entries)", self.logs.entries.len())
         };
+
+        let title_spans = vec![
+            Span::styled("Stream [2]", Style::default().fg(self.c().text_muted)),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                logs_info,
+                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+            ),
+        ];
 
         // Render title line
         let title_area = Rect { height: 1, ..area };
-        let title_widget = Paragraph::new(Line::from(Span::styled(
-            title,
-            Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
-        )));
+        let title_widget = Paragraph::new(Line::from(title_spans));
         f.render_widget(title_widget, title_area);
 
         // If collapsed, just render the header
