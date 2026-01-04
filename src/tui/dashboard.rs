@@ -968,6 +968,55 @@ impl SpawnDialogState {
         }
     }
 
+    /// Delete previous path segment (Option+Backspace)
+    fn delete_word_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+
+        let old_cursor = self.cursor;
+
+        // Find the new cursor position (same logic as move_cursor_word_left)
+        let field = match self.focus {
+            0 => &self.repo,
+            2 => &self.namespace,
+            _ => return,
+        };
+
+        let chars: Vec<char> = field.chars().collect();
+        let mut new_pos = self.cursor.saturating_sub(1);
+
+        // Skip any trailing slashes at cursor position
+        while new_pos > 0 && chars[new_pos] == '/' {
+            new_pos -= 1;
+        }
+
+        // Find the previous slash or start
+        while new_pos > 0 && chars[new_pos - 1] != '/' {
+            new_pos -= 1;
+        }
+
+        // Delete the range [new_pos, old_cursor)
+        let field_mut = match self.focus {
+            0 => &mut self.repo,
+            2 => &mut self.namespace,
+            _ => return,
+        };
+
+        // Convert char positions to byte positions
+        let start_byte = field_mut.char_indices()
+            .nth(new_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let end_byte = field_mut.char_indices()
+            .nth(old_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(field_mut.len());
+
+        field_mut.replace_range(start_byte..end_byte, "");
+        self.cursor = new_pos;
+    }
+
     fn is_valid(&self) -> bool {
         // Only repo is required - we just run claude in that directory
         !self.repo.trim().is_empty()
@@ -1780,7 +1829,11 @@ impl Dashboard {
                     self.spawn_dialog.prev_field();
                 }
                 KeyCode::Backspace => {
-                    self.spawn_dialog.delete_char();
+                    if modifiers.contains(KeyModifiers::ALT) {
+                        self.spawn_dialog.delete_word_left();
+                    } else {
+                        self.spawn_dialog.delete_char();
+                    }
                 }
                 KeyCode::Left => {
                     if modifiers.contains(KeyModifiers::ALT) {
