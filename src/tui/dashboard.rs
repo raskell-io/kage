@@ -2151,6 +2151,10 @@ impl Dashboard {
         // Fullscreen stream mode - no decorations
         if self.fullscreen_stream {
             self.render_fullscreen_stream(f, area);
+            // Show prefix menu on top if active
+            if self.prefix_active {
+                self.render_prefix_menu(f, area);
+            }
             return;
         }
 
@@ -2194,6 +2198,11 @@ impl Dashboard {
         // Setup wizard renders on top of everything
         if self.setup_wizard.needs_setup && !self.setup_wizard.dismissed {
             self.render_setup_wizard(f, area);
+        }
+
+        // Prefix command menu (renders on top)
+        if self.prefix_active {
+            self.render_prefix_menu(f, area);
         }
     }
 
@@ -2873,6 +2882,71 @@ impl Dashboard {
                 .add_modifier(Modifier::BOLD),
         )));
         f.render_widget(mode_widget, mode_area);
+    }
+
+    /// Render prefix command menu (Helix-style which-key popup)
+    fn render_prefix_menu(&self, f: &mut Frame, area: Rect) {
+        // Menu items: key -> description
+        let items = vec![
+            ("k", "kill agent"),
+            ("d", "detach"),
+            ("f", "fullscreen"),
+            ("n", "new agent"),
+            ("q", "quit"),
+            ("?", "help"),
+            ("1-4", "panel"),
+            ("[/]", "scroll"),
+            ("^B", "send ^B"),
+        ];
+
+        // Calculate popup size
+        let item_width = 14u16; // "k  kill agent" width
+        let cols = 3u16;
+        let rows = ((items.len() as u16) + cols - 1) / cols;
+        let popup_width = item_width * cols + 4; // padding
+        let popup_height = rows + 2; // border
+
+        // Position at bottom-right, above footer
+        let popup_area = Rect {
+            x: area.width.saturating_sub(popup_width + 1),
+            y: area.height.saturating_sub(popup_height + 3),
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear background
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Rgb(250, 180, 100))) // Orange like PENDING
+            .style(Style::default().bg(self.c().bg_surface));
+        f.render_widget(block, popup_area);
+
+        // Render items in grid
+        let inner = Rect {
+            x: popup_area.x + 1,
+            y: popup_area.y + 1,
+            width: popup_area.width - 2,
+            height: popup_area.height - 2,
+        };
+
+        for (i, (key, desc)) in items.iter().enumerate() {
+            let col = (i as u16) % cols;
+            let row = (i as u16) / cols;
+
+            if row >= inner.height {
+                break;
+            }
+
+            let x = inner.x + col * item_width;
+            let y = inner.y + row;
+
+            let item_area = Rect { x, y, width: item_width, height: 1 };
+            let item = Line::from(vec![
+                Span::styled(format!("{:<3}", key), Style::default().fg(Color::Rgb(250, 180, 100)).add_modifier(Modifier::BOLD)),
+                Span::styled(*desc, Style::default().fg(self.c().text)),
+            ]);
+            f.render_widget(Paragraph::new(item), item_area);
+        }
     }
 
     /// Render help popup
