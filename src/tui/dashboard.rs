@@ -3208,7 +3208,17 @@ impl Dashboard {
                 Line::from(Span::styled(format!("  {}", agent.current_action), Style::default().fg(self.c().accent_bright))),
                 Line::from(""),
                 Line::from(""),
-                Line::from(Span::styled("  [Enter/Esc] Close   [k] Kill   [p] Pause   [a] Attach", Style::default().fg(self.c().text_muted))),
+                Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled("Esc", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(" Close  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled("k", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(" Kill  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled("p", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(" Pause  ", Style::default().fg(self.c().text_muted)),
+                    Span::styled("a", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+                    Span::styled(" Attach", Style::default().fg(self.c().text_muted)),
+                ]),
             ]
         } else {
             vec![Line::from(Span::styled("No agent selected", Style::default().fg(self.c().text_muted)))]
