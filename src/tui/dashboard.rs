@@ -2267,22 +2267,33 @@ impl Dashboard {
 
     /// Render the header
     fn render_header(&self, f: &mut Frame, area: Rect) {
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
+        // Split header into two rows: top info + bottom separator with panel headers
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(20), // Logo
-                Constraint::Min(20),    // Status
-                Constraint::Length(25), // Stats
+                Constraint::Length(1), // Top row: logo, status, metadata
+                Constraint::Length(1), // Bottom row: panel headers (separator line)
             ])
             .split(area);
 
-        // Logo
+        // Top row layout
+        let top_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(22), // Logo with version
+                Constraint::Min(20),    // Status
+                Constraint::Length(30), // Context-specific metadata
+            ])
+            .split(rows[0]);
+
+        // Logo with version
+        let version = env!("CARGO_PKG_VERSION");
         let logo = Paragraph::new(Line::from(vec![
             Span::styled("  影 ", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
             Span::styled("KAGE", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
-        ]))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
-        f.render_widget(logo, chunks[0]);
+            Span::styled(format!(" ({})", version), Style::default().fg(self.c().text_muted)),
+        ]));
+        f.render_widget(logo, top_chunks[0]);
 
         // Daemon status
         let status_color = match self.daemon_status {
@@ -2295,72 +2306,180 @@ impl Dashboard {
             DaemonStatus::Disconnected => "○ Disconnected",
             DaemonStatus::Connecting => "◐ Connecting...",
         };
-
         let status = Paragraph::new(Line::from(vec![
             Span::styled("Daemon: ", Style::default().fg(self.c().text_muted)),
             Span::styled(status_text, Style::default().fg(status_color)),
-        ]))
-        .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
-        f.render_widget(status, chunks[1]);
+        ]));
+        f.render_widget(status, top_chunks[1]);
 
-        // Stats - Show agent counts by status
+        // Context-specific metadata based on focused panel
+        let metadata_spans = self.get_focused_panel_metadata();
+        let metadata = Paragraph::new(Line::from(metadata_spans))
+            .alignment(Alignment::Right);
+        f.render_widget(metadata, top_chunks[2]);
+
+        // Bottom row: panel headers on separator line
+        self.render_panel_header_separator(f, rows[1]);
+    }
+
+    /// Get metadata spans for the currently focused panel
+    fn get_focused_panel_metadata(&self) -> Vec<Span> {
+        match self.focus {
+            Panel::Agents => {
+                let (working, idle, waiting) = self.agent_counts();
+                vec![
+                    Span::styled(self.s().working, Style::default().fg(self.c().status_working)),
+                    Span::styled(format!("{}", working), Style::default().fg(self.c().status_working)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(self.s().idle, Style::default().fg(self.c().status_idle)),
+                    Span::styled(format!("{}", idle), Style::default().fg(self.c().status_idle)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled(self.s().waiting, Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
+                    Span::styled(format!("{}", waiting), Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
+                ]
+            }
+            Panel::Tasks => {
+                let pending = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
+                let running = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+                let completed = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Completed).count();
+                vec![
+                    Span::styled("○", Style::default().fg(self.c().text_muted)),
+                    Span::styled(format!("{}", pending), Style::default().fg(self.c().text_muted)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled("▶", Style::default().fg(self.c().success)),
+                    Span::styled(format!("{}", running), Style::default().fg(self.c().success)),
+                    Span::styled(" ", Style::default()),
+                    Span::styled("✓", Style::default().fg(self.c().info)),
+                    Span::styled(format!("{}", completed), Style::default().fg(self.c().info)),
+                ]
+            }
+            Panel::Stream => {
+                let lines = self.stream.lines.len();
+                let scroll = self.stream.scroll;
+                if let Some(ref agent_id) = self.stream.agent_id {
+                    let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
+                    vec![
+                        Span::styled(short_id, Style::default().fg(self.c().accent_bright)),
+                        Span::styled(format!(" {}L", lines), Style::default().fg(self.c().text_muted)),
+                        if scroll > 0 {
+                            Span::styled(format!(" ↑{}", scroll), Style::default().fg(self.c().warning))
+                        } else {
+                            Span::styled("", Style::default())
+                        },
+                    ]
+                } else {
+                    vec![Span::styled("no agent", Style::default().fg(self.c().text_muted))]
+                }
+            }
+            Panel::Logs => {
+                let total = self.logs.entries.len();
+                let errors = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Error)).count();
+                let warnings = self.logs.entries.iter().filter(|e| matches!(e.level, LogLevel::Warning)).count();
+                vec![
+                    Span::styled(format!("{} ", total), Style::default().fg(self.c().text_muted)),
+                    if errors > 0 {
+                        Span::styled(format!("✗{} ", errors), Style::default().fg(self.c().error))
+                    } else {
+                        Span::styled("", Style::default())
+                    },
+                    if warnings > 0 {
+                        Span::styled(format!("⚠{}", warnings), Style::default().fg(self.c().warning))
+                    } else {
+                        Span::styled("", Style::default())
+                    },
+                ]
+            }
+        }
+    }
+
+    /// Render panel headers on the separator line
+    fn render_panel_header_separator(&self, f: &mut Frame, area: Rect) {
+        // Build the full separator line with panel headers embedded
+        let is_agents_focused = self.focus == Panel::Agents;
+        let is_tasks_focused = self.focus == Panel::Tasks;
+        let is_stream_focused = self.focus == Panel::Stream;
+        let is_logs_focused = self.focus == Panel::Logs;
+
+        let filter_text = match self.agent_filter {
+            AgentFilter::All => "all",
+            AgentFilter::Working => "working",
+            AgentFilter::Idle => "idle",
+            AgentFilter::Waiting => "waiting",
+        };
         let (working, idle, waiting) = self.agent_counts();
         let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
-        let pending_approvals = self.approvals.items.len();
+        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
+        let log_count = self.logs.entries.len();
 
-        let mut stats_spans = vec![
-            // Working agents
+        let stream_info = if let Some(ref agent_id) = self.stream.agent_id {
+            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
+            short_id.to_string()
+        } else {
+            "−".to_string()
+        };
+
+        // Calculate widths for proper alignment
+        let left_width = (area.width as usize * 30) / 100;
+
+        // Build left side: Agents [1] ... │ Tasks [3] ...
+        let left_text = format!(
+            "Agents [1] {} {}{} {}{} {}{} │ Tasks [3] ({}/{})",
+            filter_text, self.s().working, working, self.s().idle, idle, self.s().waiting, waiting,
+            running_tasks, pending_tasks + running_tasks
+        );
+
+        // Build right side: Stream [2] ... │ Logs [4] ...
+        let right_text = format!(
+            "Stream [2] {} │ Logs [4] ({})",
+            stream_info, log_count
+        );
+
+        // Pad left text to align with panel width
+        let left_padded = format!("{:<width$}", left_text, width = left_width);
+
+        let mut spans = vec![
+            Span::styled(
+                format!("Agents [1] {} ", filter_text),
+                Style::default().fg(if is_agents_focused { self.c().accent } else { self.c().text_muted }),
+            ),
             Span::styled(self.s().working, Style::default().fg(self.c().status_working)),
-            Span::styled(format!("{}", working), Style::default().fg(self.c().status_working)),
-            Span::styled(" ", Style::default()),
-            // Idle agents
+            Span::styled(format!("{} ", working), Style::default().fg(self.c().status_working)),
             Span::styled(self.s().idle, Style::default().fg(self.c().status_idle)),
-            Span::styled(format!("{}", idle), Style::default().fg(self.c().status_idle)),
-            Span::styled(" ", Style::default()),
-            // Waiting agents (highlight if any)
+            Span::styled(format!("{} ", idle), Style::default().fg(self.c().status_idle)),
             Span::styled(self.s().waiting, Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
             Span::styled(format!("{}", waiting), Style::default().fg(if waiting > 0 { self.c().status_waiting } else { self.c().text_muted })),
+            Span::styled(" │ ", Style::default().fg(self.c().border)),
+            Span::styled(
+                format!("Tasks [3] ({}/{})", running_tasks, pending_tasks + running_tasks),
+                Style::default().fg(if is_tasks_focused { self.c().accent } else { self.c().text_muted }),
+            ),
         ];
 
-        // Add pending tasks
-        if pending_tasks > 0 {
-            stats_spans.push(Span::styled("  ", Style::default()));
-            stats_spans.push(Span::styled(
-                format!("󰄬 {}", pending_tasks),
-                Style::default().fg(self.c().info),
-            ));
+        // Calculate padding to push right side to correct position
+        let left_len: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        let right_start = left_width.saturating_sub(left_len);
+        if right_start > 0 {
+            spans.push(Span::styled(" ".repeat(right_start), Style::default()));
         }
 
-        // Add approvals indicator if there are pending approvals
-        if pending_approvals > 0 {
-            stats_spans.push(Span::styled("  ", Style::default()));
-            stats_spans.push(Span::styled(
-                format!("⚠ {}", pending_approvals),
-                Style::default().fg(self.c().error).add_modifier(Modifier::BOLD),
-            ));
-        }
+        spans.push(Span::styled("│", Style::default().fg(self.c().border)));
+        spans.push(Span::styled(
+            format!("Stream [2] {}", stream_info),
+            Style::default().fg(if is_stream_focused { self.c().accent } else { self.c().text_muted }),
+        ));
+        spans.push(Span::styled(" │ ", Style::default().fg(self.c().border)));
+        spans.push(Span::styled(
+            format!("Logs [4] ({})", log_count),
+            Style::default().fg(if is_logs_focused { self.c().accent } else { self.c().text_muted }),
+        ));
 
-        let stats = Paragraph::new(Line::from(stats_spans))
-            .alignment(Alignment::Right)
-            .block(Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(self.c().border)));
-        f.render_widget(stats, chunks[2]);
+        let header_line = Paragraph::new(Line::from(spans));
+        f.render_widget(header_line, area);
     }
 
     /// Render the main content area
     fn render_main(&self, f: &mut Frame, area: Rect) {
-        // Vertical layout: panel headers row + content
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),  // Panel headers
-                Constraint::Min(5),     // Panel content
-            ])
-            .split(area);
-
-        // Render panel header row
-        self.render_panel_headers(f, rows[0]);
-
-        // Two-column layout for content: Left + separator + Right
+        // Two-column layout: Left + separator + Right
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -2368,7 +2487,7 @@ impl Dashboard {
                 Constraint::Length(1),      // Vertical separator
                 Constraint::Percentage(70), // Right panel
             ])
-            .split(rows[1]);
+            .split(area);
 
         // Left panel: Agents (default) or Tasks (when focused)
         if self.focus == Panel::Tasks {
@@ -2386,83 +2505,6 @@ impl Dashboard {
 
         // Draw separator
         self.render_vertical_separator(f, cols[1]);
-    }
-
-    /// Render the panel headers row (Agents/Tasks | Stream/Logs)
-    fn render_panel_headers(&self, f: &mut Frame, area: Rect) {
-        // Split into left and right parts matching the panel widths
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(30), // Left header
-                Constraint::Length(1),      // Separator
-                Constraint::Percentage(70), // Right header
-            ])
-            .split(area);
-
-        // Left header: Agents [1] info │ Tasks [3] info
-        let is_agents_focused = self.focus == Panel::Agents;
-        let is_tasks_focused = self.focus == Panel::Tasks;
-
-        let filter_text = match self.agent_filter {
-            AgentFilter::All => "all",
-            AgentFilter::Working => "working",
-            AgentFilter::Idle => "idle",
-            AgentFilter::Waiting => "waiting",
-        };
-        let (working, idle, waiting) = self.agent_counts();
-        let pending_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Pending).count();
-        let running_tasks = self.tasks.items.iter().filter(|t| t.status == TaskDisplayStatus::Running).count();
-
-        let left_spans = vec![
-            Span::styled(
-                format!("Agents [1] {} {}{} {}{} {}{}", filter_text, self.s().working, working, self.s().idle, idle, self.s().waiting, waiting),
-                Style::default().fg(if is_agents_focused { self.c().accent } else { self.c().text_muted }),
-            ),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                format!("Tasks [3] ({}/{})", running_tasks, pending_tasks + running_tasks),
-                Style::default().fg(if is_tasks_focused { self.c().accent } else { self.c().text_muted }),
-            ),
-        ];
-        let left_header = Paragraph::new(Line::from(left_spans));
-        f.render_widget(left_header, cols[0]);
-
-        // Separator
-        let sep = Paragraph::new("│").style(Style::default().fg(self.c().border));
-        f.render_widget(sep, cols[1]);
-
-        // Right header: Stream [2] info │ Logs [4] info
-        let is_stream_focused = self.focus == Panel::Stream;
-        let is_logs_focused = self.focus == Panel::Logs;
-        let log_count = self.logs.entries.len();
-
-        let stream_info = if self.prefix_active {
-            "^B-".to_string()
-        } else if let Some(ref agent_id) = self.stream.agent_id {
-            let short_id = if agent_id.len() > 8 { &agent_id[..8] } else { agent_id };
-            if is_stream_focused {
-                format!("{} │ ^B: menu", short_id)
-            } else {
-                short_id.to_string()
-            }
-        } else {
-            "no agent".to_string()
-        };
-
-        let right_spans = vec![
-            Span::styled(
-                format!("Stream [2] {}", stream_info),
-                Style::default().fg(if is_stream_focused { self.c().accent } else { self.c().text_muted }),
-            ),
-            Span::styled(" │ ", Style::default().fg(self.c().border)),
-            Span::styled(
-                format!("Logs [4] ({})", log_count),
-                Style::default().fg(if is_logs_focused { self.c().accent } else { self.c().text_muted }),
-            ),
-        ];
-        let right_header = Paragraph::new(Line::from(right_spans));
-        f.render_widget(right_header, cols[2]);
     }
 
     /// Render a vertical separator line
