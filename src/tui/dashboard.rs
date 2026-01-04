@@ -366,6 +366,7 @@ struct AgentInfo {
     status: AgentDisplayStatus,
     namespace: String,
     repository: String,
+    working_dir: String,
     iterations: u32,
     max_iterations: u32,
     current_action: String,
@@ -430,6 +431,7 @@ impl AgentListState {
                 status,
                 namespace: a.namespace.unwrap_or_else(|| "default".to_string()),
                 repository: repo_name,
+                working_dir: a.working_dir.display().to_string(),
                 iterations: a.iteration,
                 max_iterations: a.max_iterations,
                 current_action: format!("Iteration {}/{}", a.iteration, a.max_iterations),
@@ -3192,8 +3194,11 @@ impl Dashboard {
                     Span::styled(&agent.namespace, Style::default().fg(self.c().text)),
                 ]),
                 Line::from(vec![
-                    Span::styled("  Repository: ", Style::default().fg(self.c().text_muted)),
-                    Span::styled(&agent.repository, Style::default().fg(self.c().text)),
+                    Span::styled("  Working Dir:", Style::default().fg(self.c().text_muted)),
+                ]),
+                Line::from(vec![
+                    Span::styled("    ", Style::default()),
+                    Span::styled(&agent.working_dir, Style::default().fg(self.c().accent_bright)),
                 ]),
                 Line::from(vec![
                     Span::styled("  Iterations: ", Style::default().fg(self.c().text_muted)),
