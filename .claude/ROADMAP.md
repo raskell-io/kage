@@ -6,6 +6,73 @@ This roadmap outlines the implementation phases for Kage, from MVP to full ecosy
 
 ---
 
+## Immediate Actions (Agent Deck Features)
+
+**Goal:** Make Kage the ultimate multi-session manager for Claude Code and other AI CLI tools. Built on tmux for session persistence.
+
+### Session Overview Dashboard
+- [ ] See all sessions at a glance with status indicators:
+  - **Running** (green) - Agent actively working
+  - **Waiting for input** (yellow) - Agent needs user response
+  - **Idle** (gray) - Session inactive
+- [ ] No more checking each tab - unified view of all sessions
+- [ ] Real-time status updates via daemon events
+
+### MCP Manager (Press M)
+- [ ] Interactive MCP configuration overlay
+- [ ] Toggle MCPs on/off with spacebar
+- [ ] Choose scope: LOCAL (session) or GLOBAL (all sessions)
+- [ ] Session auto-restarts with new MCP config
+- [ ] No more editing JSON files manually
+- [ ] Show MCP health status (connected/disconnected/error)
+
+### MCP Socket Pool
+- [ ] Shared MCP server processes via Unix sockets
+- [ ] Running 20+ sessions normally spawns separate MCP processes per session
+- [ ] Pool MCPs: one shared memory server, one shared exa server, etc.
+- [ ] Target: 85-90% reduction in MCP memory usage
+- [ ] Auto-spawn pooled MCP servers on daemon start
+- [ ] Reference counting for clean shutdown
+
+### Fork Sessions (Press F)
+- [ ] Fork any Claude conversation into two sessions
+- [ ] Both sessions keep full context history
+- [ ] Useful for trying two different approaches to same problem
+- [ ] Fork creates new tmux pane/window with cloned session
+- [ ] Track fork relationships (parent/child)
+
+### Session Groups
+- [ ] Organize sessions by project/client/purpose
+- [ ] Collapsible groups in dashboard
+- [ ] `kage group create <name>` / `kage group add <session> <group>`
+- [ ] Filter dashboard by group
+- [ ] Group-level MCP and settings overrides
+
+### Global Search
+- [ ] Search across ALL Claude conversations (not just current session)
+- [ ] Index conversation history for fast lookup
+- [ ] `kage search "<query>"` CLI command
+- [ ] Search overlay in TUI (Press /)
+- [ ] Filter by date range, session, group
+
+### tmux Integration
+- [ ] Sessions persist through terminal disconnects/crashes
+- [ ] `kage attach` reconnects to existing sessions
+- [ ] tmux session naming: `kage-<agent-id>`
+- [ ] Support for tmux session groups
+- [ ] Detach/reattach without losing state
+
+### Multi-Provider Support
+- [ ] Works with Gemini CLI, OpenCode, Codex - any terminal-based AI
+- [ ] Provider-agnostic session management
+- [ ] Claude Code gets full integration:
+  - [ ] Session state detection (working/waiting/idle)
+  - [ ] MCP management
+  - [ ] Conversation forking
+- [ ] Basic support for other providers (spawn/attach/kill)
+
+---
+
 ## Phase 1: Foundation (MVP)
 
 **Goal:** Basic daemon that can spawn and manage Claude Code agents via CLI.
