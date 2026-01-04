@@ -722,26 +722,9 @@ impl Supervisor {
             .get(&id)
             .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
 
-        let parser = agent.vt_parser.lock().unwrap();
-        let screen = parser.screen();
-        let timestamp = chrono::Utc::now().timestamp();
-        let (_, cols) = screen.size();
-
-        // Get visible screen rows with ANSI formatting preserved
-        let lines: Vec<OutputLine> = screen
-            .rows_formatted(0, cols)
-            .map(|bytes| {
-                // Convert bytes to string, preserving ANSI codes
-                let text = String::from_utf8_lossy(&bytes).to_string();
-                OutputLine {
-                    text,
-                    is_error: false,
-                    timestamp,
-                }
-            })
-            .collect();
-
-        Ok(lines)
+        // Return full output history for scrollback support
+        let history = agent.output_history.lock().unwrap();
+        Ok(history.clone())
     }
 
     /// Subscribe to screen update notifications
