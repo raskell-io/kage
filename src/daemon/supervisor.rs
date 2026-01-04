@@ -19,6 +19,13 @@ use crate::task::{ApprovalAction, ApprovalId, ApprovalLevel, ApprovalRequest, Ta
 
 use super::protocol::{AgentInfo, ApprovalInfo, OutputLine};
 
+/// Screen update notification (just signals that screen changed)
+#[derive(Clone, Debug)]
+pub struct ScreenUpdate {
+    pub agent_id: AgentId,
+    pub timestamp: i64,
+}
+
 /// Supervisor manages all active agents
 pub struct Supervisor {
     config: Config,
@@ -36,7 +43,7 @@ pub struct Supervisor {
     agent_tasks: HashMap<AgentId, TaskId>,
 }
 
-/// A managed agent with PTY and output tracking
+/// A managed agent with PTY and virtual terminal
 struct ManagedAgent {
     /// Agent info
     info: AgentInfo,
@@ -44,9 +51,13 @@ struct ManagedAgent {
     pty_master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     /// Writer for PTY input - wrapped in Mutex for Sync
     writer: Mutex<Option<Box<dyn Write + Send>>>,
-    /// Output history
-    output_history: Vec<OutputLine>,
-    /// Broadcast sender for live output
+    /// Virtual terminal parser - maintains screen state
+    vt_parser: Arc<Mutex<vt100::Parser>>,
+    /// Broadcast sender for screen update notifications
+    screen_tx: broadcast::Sender<ScreenUpdate>,
+    /// Legacy output history for compatibility - shared with reader thread
+    output_history: Arc<std::sync::Mutex<Vec<OutputLine>>>,
+    /// Legacy broadcast sender for live output (used by attach)
     output_tx: broadcast::Sender<OutputLine>,
     /// Child process handle - wrapped in Mutex for Sync
     child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
@@ -98,30 +109,49 @@ impl Supervisor {
 
     /// Initialize subscription pool from config
     ///
-    /// This loads all subscriptions from the database and caches their API keys
-    /// in memory. Keychain access happens ONCE here, never during agent spawn.
+    /// API keys are loaded from the database (subscription.api_key field).
+    /// Keychain is only accessed as fallback for legacy subscriptions.
     pub fn init_subscription_pool(&mut self) -> Result<()> {
         use crate::secrets::{SecretScope, get as get_secret};
 
         let db_path = self.config.daemon.state_dir.join("subscriptions.redb");
         let registry = Arc::new(SubscriptionRegistry::open(db_path)?);
-        let pool = Arc::new(SubscriptionPool::new(registry));
+        let pool = Arc::new(SubscriptionPool::new(registry.clone()));
 
-        // Pre-load all API keys from keychain into memory cache
-        // This is the ONLY time we access keychain for spawning
+        // Load API keys into memory cache
         let subscriptions = pool.list_subscriptions();
+        let mut needs_migration = Vec::new();
+
         for sub in &subscriptions {
-            match get_secret(&sub.api_key_ref, &SecretScope::Global) {
-                Ok(Some(key)) => {
-                    tracing::debug!("Cached API key for subscription: {}", sub.name);
-                    self.api_key_cache.insert(sub.id, key);
+            // First: try to get from subscription.api_key (stored in database)
+            if let Some(ref key) = sub.api_key {
+                tracing::debug!("Loaded API key from database for: {}", sub.name);
+                self.api_key_cache.insert(sub.id, key.clone());
+            } else {
+                // Fallback: try keychain (legacy subscriptions)
+                match get_secret(&sub.api_key_ref, &SecretScope::Global) {
+                    Ok(Some(key)) => {
+                        tracing::debug!("Loaded API key from keychain for: {} (will migrate to database)", sub.name);
+                        self.api_key_cache.insert(sub.id, key.clone());
+                        // Mark for migration to database
+                        needs_migration.push((sub.id, sub.name.clone(), key));
+                    }
+                    Ok(None) => {
+                        tracing::warn!("API key not found for subscription: {}", sub.name);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to load API key for {}: {}", sub.name, e);
+                    }
                 }
-                Ok(None) => {
-                    tracing::warn!("API key not found in keychain for subscription: {} (ref: {})", sub.name, sub.api_key_ref);
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to load API key for subscription {}: {}", sub.name, e);
-                }
+            }
+        }
+
+        // Migrate legacy subscriptions to store key in database
+        for (id, name, key) in needs_migration {
+            if let Err(e) = registry.update_api_key(id, &key) {
+                tracing::warn!("Failed to migrate API key for {} to database: {}", name, e);
+            } else {
+                tracing::info!("Migrated API key for {} to database (no more keychain prompts)", name);
             }
         }
 
@@ -132,7 +162,7 @@ impl Supervisor {
         if total == 0 {
             tracing::info!("No subscriptions in pool. Add credentials via 'kage subscription add' or the setup wizard.");
         } else {
-            tracing::info!("Subscription pool initialized: {}/{} subscriptions with cached keys", cached, total);
+            tracing::info!("Subscription pool initialized: {}/{} subscriptions ready", cached, total);
         }
         Ok(())
     }
@@ -153,25 +183,24 @@ impl Supervisor {
 
     /// Add a new subscription
     ///
-    /// Stores the API key in both keychain (for persistence) and memory cache (for spawning).
+    /// Stores the API key directly in the subscription database (no keychain needed).
+    /// The key is also cached in memory for spawning agents.
     pub fn add_subscription(&mut self, name: String, api_key: String) -> Result<()> {
         use crate::subscription::{ProviderType, Subscription};
-        use crate::secrets::{SecretScope, set as set_secret};
 
-        // Store API key in keychain (for persistence across daemon restarts)
-        let key_name = format!("subscription:{}", name);
-        set_secret(&key_name, &api_key, &SecretScope::Global)?;
-
-        // Create subscription (name, api_key_ref) then set provider
-        let subscription = Subscription::new(&name, &key_name)
-            .with_provider(ProviderType::ClaudeCode);
+        // Create subscription with API key stored directly in database
+        // No keychain storage needed - the database persists across restarts
+        let key_ref = format!("subscription:{}", name);
+        let subscription = Subscription::new(&name, &key_ref)
+            .with_provider(ProviderType::ClaudeCode)
+            .with_api_key(&api_key);
 
         // Add to pool/registry and cache the API key in memory
         if let Some(ref pool) = self.subscription_pool {
             let sub_id = pool.add_subscription(subscription)?;
-            // Cache the API key so spawn() never needs to touch keychain
+            // Cache the API key so spawn() uses it directly
             self.api_key_cache.insert(sub_id, api_key);
-            tracing::info!("Added subscription: {} (cached)", name);
+            tracing::info!("Added subscription: {} (stored in database)", name);
             Ok(())
         } else {
             anyhow::bail!("Subscription pool not initialized")
@@ -186,6 +215,8 @@ impl Supervisor {
         prompt: Option<String>,
         model: Option<String>,
         max_iterations: Option<u32>,
+        pty_rows: Option<u16>,
+        pty_cols: Option<u16>,
     ) -> Result<AgentId> {
         let id = AgentId::new();
         self.agent_counter += 1;
@@ -238,12 +269,19 @@ impl Supervisor {
             (None, None)
         };
 
-        // Create PTY
+        // Create PTY with specified size or defaults
+        let actual_rows = pty_rows.unwrap_or(24);
+        let actual_cols = pty_cols.unwrap_or(80);
+        tracing::info!(
+            "Creating PTY with size {}x{} (requested: {:?}x{:?})",
+            actual_cols, actual_rows, pty_cols, pty_rows
+        );
+
         let pty_system = native_pty_system();
         let pty_pair = pty_system
             .openpty(PtySize {
-                rows: 24,
-                cols: 80,
+                rows: actual_rows,
+                cols: actual_cols,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -302,12 +340,18 @@ impl Supervisor {
             pid,
         };
 
-        // Create managed agent
+        // Create managed agent with vt100 parser and shared output history
+        let output_history = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let vt_parser = Arc::new(Mutex::new(vt100::Parser::new(actual_rows, actual_cols, 1000)));
+        let (screen_tx, _) = broadcast::channel(16);
+
         let agent = ManagedAgent {
             info,
             pty_master: Mutex::new(Some(pty_pair.master)),
             writer: Mutex::new(Some(writer)),
-            output_history: Vec::new(),
+            vt_parser,
+            screen_tx,
+            output_history,
             output_tx: output_tx.clone(),
             child: Mutex::new(Some(child)),
             started_at: Instant::now(),
@@ -329,19 +373,26 @@ impl Supervisor {
     /// Spawn a task to read agent output
     fn spawn_output_reader(&mut self, id: AgentId) {
         if let Some(agent) = self.agents.get(&id) {
-            let master = agent.pty_master.lock().unwrap().take();
-            if let Some(master) = master {
+            // Get the reader from the master without taking ownership
+            // The master stays in the agent for resizing
+            let reader = {
+                let guard = agent.pty_master.lock().unwrap();
+                if let Some(ref master) = *guard {
+                    master.try_clone_reader().ok()
+                } else {
+                    None
+                }
+            };
+
+            if let Some(mut reader) = reader {
                 let output_tx = agent.output_tx.clone();
+                let output_history = agent.output_history.clone();
+                let vt_parser = agent.vt_parser.clone();
+                let screen_tx = agent.screen_tx.clone();
+                let max_history = agent.max_history;
 
                 // Spawn blocking task to read PTY output
                 std::thread::spawn(move || {
-                    let mut reader = master.try_clone_reader().ok();
-                    if reader.is_none() {
-                        tracing::warn!("Failed to get PTY reader for agent {}", id);
-                        return;
-                    }
-                    let reader = reader.as_mut().unwrap();
-
                     let mut buf = [0u8; 4096];
                     loop {
                         match reader.read(&mut buf) {
@@ -351,13 +402,36 @@ impl Supervisor {
                                 break;
                             }
                             Ok(n) => {
+                                // Feed raw bytes to vt100 parser for proper terminal emulation
+                                if let Ok(mut parser) = vt_parser.lock() {
+                                    parser.process(&buf[..n]);
+                                }
+
+                                // Notify about screen update
+                                let _ = screen_tx.send(ScreenUpdate {
+                                    agent_id: id,
+                                    timestamp: chrono::Utc::now().timestamp(),
+                                });
+
+                                // Legacy: also store as text for compatibility
                                 let text = String::from_utf8_lossy(&buf[..n]).to_string();
                                 let line = OutputLine {
                                     text,
                                     is_error: false,
                                     timestamp: chrono::Utc::now().timestamp(),
                                 };
-                                // Ignore send errors (no receivers)
+
+                                // Store in history (legacy)
+                                if let Ok(mut history) = output_history.lock() {
+                                    history.push(line.clone());
+                                    // Trim to max history size
+                                    let len = history.len();
+                                    if len > max_history {
+                                        history.drain(0..len - max_history);
+                                    }
+                                }
+
+                                // Send to live subscribers (legacy - for attach)
                                 let _ = output_tx.send(line);
                             }
                             Err(e) => {
@@ -367,6 +441,8 @@ impl Supervisor {
                         }
                     }
                 });
+            } else {
+                tracing::warn!("Failed to get PTY reader for agent {}", id);
             }
         }
     }
@@ -481,10 +557,17 @@ impl Supervisor {
             anyhow::bail!("Agent {} is not running", id);
         }
 
-        // We need mutable access to the writer, but we're in an immutable context
-        // This is a limitation - we'd need interior mutability for proper input handling
-        // For now, bail out
-        anyhow::bail!("Input requires mutable access - use attach instead")
+        // Get the writer and write input
+        let mut writer_guard = agent.writer.lock().unwrap();
+        if let Some(ref mut writer) = *writer_guard {
+            writer.write_all(input.as_bytes())
+                .context("Failed to write to agent PTY")?;
+            writer.flush()
+                .context("Failed to flush agent PTY")?;
+            Ok(())
+        } else {
+            anyhow::bail!("Agent {} has no writer available", id)
+        }
     }
 
     /// Get agent output
@@ -498,7 +581,7 @@ impl Supervisor {
             .get(&id)
             .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
 
-        let history = &agent.output_history;
+        let history = agent.output_history.lock().unwrap();
         let total = history.len();
 
         if lines == 0 || lines >= total {
@@ -507,6 +590,46 @@ impl Supervisor {
             let start = total - lines;
             Ok((history[start..].to_vec(), start > 0))
         }
+    }
+
+    /// Get agent screen content from vt100 parser
+    /// Returns Vec of screen lines with ANSI color codes preserved
+    pub fn get_screen_content(&self, id: AgentId) -> Result<Vec<OutputLine>> {
+        let agent = self
+            .agents
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
+
+        let parser = agent.vt_parser.lock().unwrap();
+        let screen = parser.screen();
+        let timestamp = chrono::Utc::now().timestamp();
+        let (_, cols) = screen.size();
+
+        // Get visible screen rows with ANSI formatting preserved
+        let lines: Vec<OutputLine> = screen
+            .rows_formatted(0, cols)
+            .map(|bytes| {
+                // Convert bytes to string, preserving ANSI codes
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                OutputLine {
+                    text,
+                    is_error: false,
+                    timestamp,
+                }
+            })
+            .collect();
+
+        Ok(lines)
+    }
+
+    /// Subscribe to screen update notifications
+    pub fn subscribe_screen_updates(&self, id: AgentId) -> Result<broadcast::Receiver<ScreenUpdate>> {
+        let agent = self
+            .agents
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
+
+        Ok(agent.screen_tx.subscribe())
     }
 
     /// Attach to agent output stream
@@ -522,11 +645,38 @@ impl Supervisor {
         Ok(agent.output_tx.subscribe())
     }
 
+    /// Resize agent PTY and vt100 parser
+    pub fn resize(&self, id: AgentId, rows: u16, cols: u16) -> Result<()> {
+        let agent = self
+            .agents
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("Agent {} not found", id))?;
+
+        // Get the PTY master and resize it
+        if let Some(ref master) = *agent.pty_master.lock().unwrap() {
+            master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            }).context("Failed to resize PTY")?;
+            tracing::debug!("Resized agent {} PTY to {}x{}", agent.info.name, cols, rows);
+        }
+
+        // Also resize the vt100 parser to match
+        if let Ok(mut parser) = agent.vt_parser.lock() {
+            parser.set_size(rows, cols);
+        }
+
+        Ok(())
+    }
+
     /// Get agent output as text lines (for criteria checking)
     pub fn get_output_lines(&self, id: AgentId) -> Vec<String> {
         self.agents
             .get(&id)
-            .map(|a| a.output_history.iter().map(|l| l.text.clone()).collect())
+            .and_then(|a| a.output_history.lock().ok())
+            .map(|history| history.iter().map(|l| l.text.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -735,8 +885,9 @@ impl Supervisor {
     fn get_output_context(&self, agent_id: AgentId, lines: usize) -> Vec<String> {
         self.agents
             .get(&agent_id)
-            .map(|a| {
-                a.output_history
+            .and_then(|a| a.output_history.lock().ok())
+            .map(|history| {
+                history
                     .iter()
                     .rev()
                     .take(lines)
@@ -927,16 +1078,22 @@ impl Supervisor {
 
         for (id, agent) in self.agents.iter_mut() {
             let start_idx = agent.memory_processed_idx;
-            let history_len = agent.output_history.len();
 
-            if start_idx >= history_len {
+            // Lock output history and process new lines
+            let (new_lines, history_len) = if let Ok(history) = agent.output_history.lock() {
+                let len = history.len();
+                if start_idx >= len {
+                    continue;
+                }
+                // Clone the lines we need to process
+                let lines: Vec<String> = history[start_idx..].iter().map(|l| l.text.clone()).collect();
+                (lines, len)
+            } else {
                 continue;
-            }
+            };
 
-            // Process new lines
-            for i in start_idx..history_len {
-                let line = &agent.output_history[i].text;
-
+            // Process new lines (outside of lock)
+            for line in &new_lines {
                 // Detect file discovery
                 if let Some(content) = Self::detect_file_discovery(line) {
                     let entry = MemoryEntry::new(*id, content)

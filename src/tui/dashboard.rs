@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -24,6 +24,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame, Terminal,
 };
+
+use ansi_to_tui::IntoText;
 
 use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
 use crate::secrets::{self, ClaudeCodeAuth};
@@ -70,11 +72,12 @@ struct OutputLineDisplay {
 /// Action request from TUI to daemon
 #[derive(Debug, Clone)]
 enum Action {
-    /// Spawn a new agent
+    /// Spawn a new agent (runs interactive claude session like tmux)
     SpawnAgent {
         repo: String,
-        prompt: String,
         namespace: Option<String>,
+        pty_rows: u16,
+        pty_cols: u16,
     },
     /// Kill an agent
     KillAgent { id: String },
@@ -94,6 +97,17 @@ enum Action {
     AddSubscription {
         name: String,
         api_key: String,
+    },
+    /// Resize agent PTY
+    ResizeAgent {
+        id: String,
+        rows: u16,
+        cols: u16,
+    },
+    /// Send input to agent
+    SendInput {
+        id: String,
+        input: String,
     },
 }
 
@@ -297,6 +311,14 @@ pub struct Dashboard {
     data_rx: Option<mpsc::Receiver<DataUpdate>>,
     /// Channel to send actions to daemon
     action_tx: Option<mpsc::Sender<Action>>,
+    /// Last stream panel size for PTY resize tracking (rows, cols)
+    last_stream_size: (u16, u16),
+    /// Last agent ID for which we sent a resize
+    last_resized_agent: Option<String>,
+    /// Current terminal size (for spawning agents with correct initial size)
+    terminal_size: (u16, u16),
+    /// Prefix key active (Ctrl+B was pressed, waiting for command)
+    prefix_active: bool,
 }
 
 /// Which panel is focused
@@ -676,17 +698,55 @@ struct LogState {
     max_entries: usize,
 }
 
+/// Available agent providers
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum AgentProvider {
+    #[default]
+    ClaudeCode,
+    // Future providers can be added here
+}
+
+impl AgentProvider {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+        }
+    }
+
+    fn command(&self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+        }
+    }
+
+    fn all() -> &'static [AgentProvider] {
+        &[AgentProvider::ClaudeCode]
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            Self::ClaudeCode => Self::ClaudeCode, // Only one for now
+        }
+    }
+
+    fn prev(&self) -> Self {
+        match self {
+            Self::ClaudeCode => Self::ClaudeCode, // Only one for now
+        }
+    }
+}
+
 /// Spawn dialog state for creating new agents
 struct SpawnDialogState {
-    /// Which field is focused (0 = repo, 1 = prompt, 2 = namespace)
+    /// Which field is focused (0 = repo, 1 = provider, 2 = namespace)
     focus: usize,
     /// Repository path
     repo: String,
-    /// Initial prompt/goal
-    prompt: String,
+    /// Selected provider
+    provider: AgentProvider,
     /// Namespace (optional)
     namespace: String,
-    /// Cursor position in current field
+    /// Cursor position in current text field
     cursor: usize,
 }
 
@@ -698,9 +758,9 @@ impl SpawnDialogState {
             .unwrap_or_else(|_| ".".to_string());
 
         Self {
-            focus: 1, // Start on prompt field (most important)
+            focus: 0, // Start on repo field
             repo: cwd,
-            prompt: String::new(),
+            provider: AgentProvider::default(),
             namespace: String::new(),
             cursor: 0,
         }
@@ -711,67 +771,101 @@ impl SpawnDialogState {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
-        self.focus = 1;
+        self.focus = 0;
         self.repo = cwd;
-        self.prompt.clear();
+        self.provider = AgentProvider::default();
         self.namespace.clear();
         self.cursor = 0;
     }
 
-    fn current_field(&self) -> &str {
+    /// Get the current text field (repo or namespace, not provider which is a selector)
+    fn current_text_field(&self) -> Option<&str> {
         match self.focus {
-            0 => &self.repo,
-            1 => &self.prompt,
-            _ => &self.namespace,
+            0 => Some(&self.repo),
+            2 => Some(&self.namespace),
+            _ => None, // Provider is a selector, not a text field
         }
     }
 
-    fn current_field_mut(&mut self) -> &mut String {
+    fn current_text_field_mut(&mut self) -> Option<&mut String> {
         match self.focus {
-            0 => &mut self.repo,
-            1 => &mut self.prompt,
-            _ => &mut self.namespace,
+            0 => Some(&mut self.repo),
+            2 => Some(&mut self.namespace),
+            _ => None, // Provider is a selector, not a text field
         }
     }
 
     fn next_field(&mut self) {
         self.focus = (self.focus + 1) % 3;
-        self.cursor = self.current_field().len();
+        if let Some(field) = self.current_text_field() {
+            self.cursor = field.len();
+        }
     }
 
     fn prev_field(&mut self) {
         self.focus = if self.focus == 0 { 2 } else { self.focus - 1 };
-        self.cursor = self.current_field().len();
+        if let Some(field) = self.current_text_field() {
+            self.cursor = field.len();
+        }
     }
 
     fn insert_char(&mut self, c: char) {
         let cursor = self.cursor;
-        let field = self.current_field_mut();
-        if cursor <= field.len() {
-            field.insert(cursor, c);
-            self.cursor += 1;
+        // Edit the appropriate field based on focus
+        match self.focus {
+            0 => {
+                if cursor <= self.repo.len() {
+                    self.repo.insert(cursor, c);
+                    self.cursor += 1;
+                }
+            }
+            2 => {
+                if cursor <= self.namespace.len() {
+                    self.namespace.insert(cursor, c);
+                    self.cursor += 1;
+                }
+            }
+            _ => {} // Provider is a selector, not a text field
         }
     }
 
     fn delete_char(&mut self) {
-        if self.cursor > 0 {
+        if self.cursor > 0 && self.focus != 1 {
             self.cursor -= 1;
             let cursor = self.cursor;
-            let field = self.current_field_mut();
-            if !field.is_empty() && cursor < field.len() {
-                field.remove(cursor);
+            match self.focus {
+                0 => {
+                    if !self.repo.is_empty() && cursor < self.repo.len() {
+                        self.repo.remove(cursor);
+                    }
+                }
+                2 => {
+                    if !self.namespace.is_empty() && cursor < self.namespace.len() {
+                        self.namespace.remove(cursor);
+                    }
+                }
+                _ => {}
             }
         }
     }
 
     fn move_cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        if self.current_text_field().is_some() {
+            self.cursor = self.cursor.saturating_sub(1);
+        } else if self.focus == 1 {
+            // Provider selector - cycle through options
+            self.provider = self.provider.prev();
+        }
     }
 
     fn move_cursor_right(&mut self) {
-        let len = self.current_field().len();
-        if self.cursor < len {
-            self.cursor += 1;
+        if let Some(field) = self.current_text_field() {
+            if self.cursor < field.len() {
+                self.cursor += 1;
+            }
+        } else if self.focus == 1 {
+            // Provider selector - cycle through options
+            self.provider = self.provider.next();
         }
     }
 
@@ -780,11 +874,14 @@ impl SpawnDialogState {
     }
 
     fn move_cursor_end(&mut self) {
-        self.cursor = self.current_field().len();
+        if let Some(field) = self.current_text_field() {
+            self.cursor = field.len();
+        }
     }
 
     fn is_valid(&self) -> bool {
-        !self.repo.trim().is_empty() && !self.prompt.trim().is_empty()
+        // Only repo is required - we just run claude in that directory
+        !self.repo.trim().is_empty()
     }
 }
 
@@ -948,6 +1045,10 @@ impl Dashboard {
             should_quit: false,
             data_rx: None,
             action_tx: None,
+            last_stream_size: (0, 0),
+            last_resized_agent: None,
+            terminal_size: (24, 80),  // Default, updated on first draw
+            prefix_active: false,
         }
     }
 
@@ -972,6 +1073,53 @@ impl Dashboard {
     fn send_action(&self, action: Action) {
         if let Some(ref tx) = self.action_tx {
             let _ = tx.send(action);
+        }
+    }
+
+    /// Convert a key event to a string to send to the PTY
+    fn key_to_string(&self, key: KeyCode, modifiers: KeyModifiers) -> String {
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+
+        match key {
+            KeyCode::Char(c) => {
+                if ctrl {
+                    // Ctrl+letter = ASCII control code
+                    let code = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+                    String::from(code as char)
+                } else {
+                    c.to_string()
+                }
+            }
+            KeyCode::Enter => "\r".to_string(),
+            KeyCode::Backspace => "\x7f".to_string(),
+            KeyCode::Tab => "\t".to_string(),
+            KeyCode::Esc => "\x1b".to_string(),
+            KeyCode::Up => "\x1b[A".to_string(),
+            KeyCode::Down => "\x1b[B".to_string(),
+            KeyCode::Right => "\x1b[C".to_string(),
+            KeyCode::Left => "\x1b[D".to_string(),
+            KeyCode::Home => "\x1b[H".to_string(),
+            KeyCode::End => "\x1b[F".to_string(),
+            KeyCode::PageUp => "\x1b[5~".to_string(),
+            KeyCode::PageDown => "\x1b[6~".to_string(),
+            KeyCode::Delete => "\x1b[3~".to_string(),
+            KeyCode::Insert => "\x1b[2~".to_string(),
+            KeyCode::F(n) => match n {
+                1 => "\x1bOP".to_string(),
+                2 => "\x1bOQ".to_string(),
+                3 => "\x1bOR".to_string(),
+                4 => "\x1bOS".to_string(),
+                5 => "\x1b[15~".to_string(),
+                6 => "\x1b[17~".to_string(),
+                7 => "\x1b[18~".to_string(),
+                8 => "\x1b[19~".to_string(),
+                9 => "\x1b[20~".to_string(),
+                10 => "\x1b[21~".to_string(),
+                11 => "\x1b[23~".to_string(),
+                12 => "\x1b[24~".to_string(),
+                _ => String::new(),
+            },
+            _ => String::new(),
         }
     }
 
@@ -1047,22 +1195,24 @@ impl Dashboard {
     /// Run the dashboard
     pub fn run(&mut self) -> Result<()> {
         // Setup terminal
+        // NOTE: Mouse capture is disabled to allow normal terminal copy/paste
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
+
+        // Initialize terminal size immediately
+        if let Ok(size) = terminal.size() {
+            self.terminal_size = (size.height, size.width);
+        }
 
         // Run the event loop
         let result = self.run_loop(&mut terminal);
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
 
         result
@@ -1075,15 +1225,24 @@ impl Dashboard {
         loop {
             terminal.draw(|f| self.render(f))?;
 
+            // Check if we need to resize the agent PTY
+            self.check_and_resize_pty(terminal);
+
             let timeout = tick_rate
                 .checked_sub(self.last_tick.elapsed())
                 .unwrap_or(Duration::ZERO);
 
             if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        self.handle_input(key.code, key.modifiers);
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            self.handle_input(key.code, key.modifiers);
+                        }
                     }
+                    Event::Resize(_cols, _rows) => {
+                        // Terminal resized - PTY resize will be handled on next draw cycle
+                    }
+                    _ => {}
                 }
             }
 
@@ -1098,43 +1257,157 @@ impl Dashboard {
         }
     }
 
+    /// Check if the stream panel size changed and resize the agent PTY if needed
+    fn check_and_resize_pty(&mut self, terminal: &Terminal<CrosstermBackend<Stdout>>) {
+        let term_size = terminal.size().unwrap_or_default();
+
+        // Store terminal size for spawning new agents
+        self.terminal_size = (term_size.height, term_size.width);
+
+        // Calculate stream panel size based on actual layout from render_main():
+        // - Header: 3 lines, Footer: 2 lines
+        // - Main area = term_size.height - 5
+        // - When collapsed: top row is 98% of main, otherwise 55%
+        // - Stream panel is 70% of top row width (minus separator)
+        // - Stream panel has 1 line for title, so content area is height - 1
+
+        let main_height = term_size.height.saturating_sub(5); // header(3) + footer(2)
+
+        let (stream_height, stream_width) = if self.fullscreen_stream {
+            // Fullscreen uses entire terminal
+            (term_size.height, term_size.width)
+        } else {
+            // Calculate based on layout
+            let both_collapsed = self.tasks_collapsed && self.logs_collapsed;
+            let top_row_percent = if both_collapsed { 98 } else { 55 };
+
+            // Top row height (minus 1 for horizontal separator)
+            let top_row_height = (main_height as u32 * top_row_percent / 100) as u16;
+
+            // Stream panel content height (minus 1 for title line)
+            let panel_height = top_row_height.saturating_sub(1);
+
+            // Stream panel is 70% of width (minus 1 for vertical separator)
+            let available_width = term_size.width.saturating_sub(1);
+            let panel_width = (available_width as u32 * 70 / 100) as u16;
+
+            (panel_height, panel_width)
+        };
+
+        let new_size = (stream_height, stream_width);
+
+        // Check if we need to send a resize
+        let current_agent = self.stream.agent_id.clone();
+        let size_changed = new_size != self.last_stream_size;
+        let agent_changed = current_agent != self.last_resized_agent;
+
+        if let Some(ref agent_id) = current_agent {
+            if size_changed || agent_changed {
+                self.send_action(Action::ResizeAgent {
+                    id: agent_id.clone(),
+                    rows: new_size.0,
+                    cols: new_size.1,
+                });
+                self.last_stream_size = new_size;
+                self.last_resized_agent = current_agent;
+            }
+        }
+    }
+
     /// Handle keyboard input
     fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) {
-        // Fullscreen stream mode - Esc or 'f' to exit
-        if self.fullscreen_stream {
+        // Check if we're in passthrough mode (Stream panel focused with agent, or fullscreen stream)
+        let in_passthrough = (self.focus == Panel::Stream || self.fullscreen_stream)
+            && self.stream.agent_id.is_some()
+            && !self.show_help
+            && !self.show_agent_details
+            && !self.show_task_details
+            && !self.show_approvals
+            && !self.show_spawn_dialog
+            && !self.setup_wizard.needs_setup;
+
+        // Handle prefix mode (Ctrl+B was pressed)
+        if self.prefix_active {
+            self.prefix_active = false;
             match key {
-                KeyCode::Esc | KeyCode::Char('f') | KeyCode::Char('q') | KeyCode::Char('2') => {
-                    self.fullscreen_stream = false;
+                // Ctrl+B, Ctrl+B = send literal Ctrl+B to agent
+                KeyCode::Char('b') if modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(ref agent_id) = self.stream.agent_id {
+                        self.send_action(Action::SendInput {
+                            id: agent_id.clone(),
+                            input: "\x02".to_string(),
+                        });
+                    }
                 }
-                // Allow scrolling in fullscreen
-                KeyCode::Up | KeyCode::Char('k') => self.stream.scroll_up(1),
-                KeyCode::Down | KeyCode::Char('j') => self.stream.scroll_down(1),
-                KeyCode::Char('g') => self.stream.scroll_to_top(),
-                KeyCode::Char('G') => self.stream.scroll_to_bottom(),
-                KeyCode::PageUp => self.stream.scroll_up(20),
-                KeyCode::PageDown => self.stream.scroll_down(20),
+                // Ctrl+B, d = detach (exit fullscreen or unfocus stream)
+                KeyCode::Char('d') => {
+                    if self.fullscreen_stream {
+                        self.fullscreen_stream = false;
+                    } else {
+                        self.focus = Panel::Agents;
+                    }
+                }
+                // Ctrl+B, f = fullscreen toggle
+                KeyCode::Char('f') => {
+                    self.fullscreen_stream = !self.fullscreen_stream;
+                    // Force resize on next frame by resetting last size
+                    self.last_stream_size = (0, 0);
+                }
+                // Ctrl+B, 1-4 = switch panels
+                KeyCode::Char('1') => { self.focus = Panel::Agents; self.fullscreen_stream = false; }
+                KeyCode::Char('2') => { self.focus = Panel::Stream; }
+                KeyCode::Char('3') => { self.focus = Panel::Tasks; self.fullscreen_stream = false; }
+                KeyCode::Char('4') => { self.focus = Panel::Logs; self.fullscreen_stream = false; }
+                // Ctrl+B, n = new agent
+                KeyCode::Char('n') => { self.show_spawn_dialog = true; self.fullscreen_stream = false; }
+                // Ctrl+B, k = kill agent
+                KeyCode::Char('k') => self.handle_kill_agent(),
+                // Ctrl+B, ? = help
+                KeyCode::Char('?') => self.show_help = true,
+                // Ctrl+B, q = quit
+                KeyCode::Char('q') => self.should_quit = true,
+                // Ctrl+B, [ = scroll mode (PageUp)
+                KeyCode::Char('[') => self.stream.scroll_up(10),
+                // Ctrl+B, ] = scroll down
+                KeyCode::Char(']') => self.stream.scroll_down(10),
                 _ => {}
             }
             return;
         }
 
-        // Fullscreen logs mode - Esc or '4' to exit
-        if self.fullscreen_logs {
-            match key {
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('4') => {
-                    self.fullscreen_logs = false;
+        // In passthrough mode, send keystrokes directly to agent
+        if in_passthrough {
+            // Ctrl+B activates prefix mode
+            if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('b') {
+                self.prefix_active = true;
+                return;
+            }
+
+            // Send keystroke to agent
+            if let Some(ref agent_id) = self.stream.agent_id {
+                let input = self.key_to_string(key, modifiers);
+                if !input.is_empty() {
+                    self.send_action(Action::SendInput {
+                        id: agent_id.clone(),
+                        input,
+                    });
                 }
-                // Allow scrolling in fullscreen
+            }
+            return;
+        }
+
+        // Fullscreen logs mode - Ctrl+B or Esc to exit
+        if self.fullscreen_logs {
+            if modifiers.contains(KeyModifiers::CONTROL) && key == KeyCode::Char('b') {
+                self.prefix_active = true;
+                return;
+            }
+            match key {
+                KeyCode::Esc => self.fullscreen_logs = false,
                 KeyCode::Up | KeyCode::Char('k') => self.logs.scroll_up(),
                 KeyCode::Down | KeyCode::Char('j') => self.logs.scroll_down(),
-                KeyCode::Char('g') => self.logs.scroll = self.logs.entries.len().saturating_sub(1),
-                KeyCode::Char('G') => self.logs.scroll = 0,
-                KeyCode::PageUp => {
-                    for _ in 0..20 { self.logs.scroll_up(); }
-                }
-                KeyCode::PageDown => {
-                    for _ in 0..20 { self.logs.scroll_down(); }
-                }
+                KeyCode::PageUp => { for _ in 0..20 { self.logs.scroll_up(); } }
+                KeyCode::PageDown => { for _ in 0..20 { self.logs.scroll_down(); } }
                 _ => {}
             }
             return;
@@ -1363,6 +1636,8 @@ impl Dashboard {
             KeyCode::Char('2') => {
                 if self.focus == Panel::Stream {
                     self.fullscreen_stream = !self.fullscreen_stream;
+                    // Force resize on next frame by resetting last size
+                    self.last_stream_size = (0, 0);
                 } else {
                     self.focus = Panel::Stream;
                 }
@@ -1404,8 +1679,8 @@ impl Dashboard {
             KeyCode::Char('r') => self.refresh(),              // Refresh
             KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
-            // Fullscreen toggle (when on Stream panel)
-            KeyCode::Char('f') if self.focus == Panel::Stream => {
+            // Fullscreen toggle (when on Stream panel - only if no agent, otherwise passthrough handles it)
+            KeyCode::Char('f') if self.focus == Panel::Stream && self.stream.agent_id.is_none() => {
                 self.fullscreen_stream = true;
             }
 
@@ -1521,15 +1796,50 @@ impl Dashboard {
     /// Handle spawn agent from dialog
     fn handle_spawn_agent(&mut self) {
         let repo = self.spawn_dialog.repo.trim().to_string();
-        let prompt = self.spawn_dialog.prompt.trim().to_string();
         let namespace = if self.spawn_dialog.namespace.trim().is_empty() {
             None
         } else {
             Some(self.spawn_dialog.namespace.trim().to_string())
         };
 
-        self.logs.add_info("dashboard", &format!("Spawning agent: {}...", truncate(&prompt, 30)));
-        self.send_action(Action::SpawnAgent { repo, prompt, namespace });
+        // Calculate initial PTY size based on current terminal size
+        let (pty_rows, pty_cols) = self.calculate_stream_panel_size();
+
+        self.logs.add_info("dashboard", &format!(
+            "Spawning {} in {} (PTY: {}x{}, term: {}x{})",
+            self.spawn_dialog.provider.name(),
+            truncate(&repo, 20),
+            pty_cols, pty_rows,
+            self.terminal_size.1, self.terminal_size.0
+        ));
+        self.send_action(Action::SpawnAgent { repo, namespace, pty_rows, pty_cols });
+    }
+
+    /// Calculate the stream panel size based on current terminal dimensions
+    fn calculate_stream_panel_size(&self) -> (u16, u16) {
+        let (term_height, term_width) = self.terminal_size;
+
+        if self.fullscreen_stream {
+            return (term_height, term_width);
+        }
+
+        // Based on layout from render_main():
+        // - Header: 3 lines, Footer: 2 lines
+        // - Main area = term_height - 5
+        // - When collapsed: top row is 98% of main, otherwise 55%
+        // - Stream panel is 70% of width
+
+        let main_height = term_height.saturating_sub(5);
+        let both_collapsed = self.tasks_collapsed && self.logs_collapsed;
+        let top_row_percent = if both_collapsed { 98 } else { 55 };
+
+        let top_row_height = (main_height as u32 * top_row_percent / 100) as u16;
+        let panel_height = top_row_height.saturating_sub(1); // minus title line
+
+        let available_width = term_width.saturating_sub(1);
+        let panel_width = (available_width as u32 * 70 / 100) as u16;
+
+        (panel_height.max(10), panel_width.max(40))
     }
 
     /// Handle Ctrl+K - kill selected agent
@@ -2101,14 +2411,16 @@ impl Dashboard {
     fn render_stream_panel(&self, f: &mut Frame, area: Rect) {
         let is_focused = self.focus == Panel::Stream;
 
-        let title = if let Some(ref agent_id) = self.stream.agent_id {
+        let title = if self.prefix_active {
+            "Stream [2] ^B-".to_string()  // Waiting for command
+        } else if let Some(ref agent_id) = self.stream.agent_id {
             let short_id = if agent_id.len() > 8 {
                 &agent_id[..8]
             } else {
                 agent_id
             };
             if is_focused {
-                format!("Stream [2] {} │ f: fullscreen", short_id)
+                format!("Stream [2] {} │ ^B: menu", short_id)
             } else {
                 format!("Stream [2] {}", short_id)
             }
@@ -2123,16 +2435,22 @@ impl Dashboard {
         } else {
             String::new()
         };
+        let title_color = if self.prefix_active {
+            self.c().warning  // Highlight prefix mode
+        } else if is_focused {
+            self.c().accent
+        } else {
+            self.c().text_dim
+        };
         let title_line = Line::from(vec![
             Span::styled(
                 title,
-                Style::default().fg(if is_focused { self.c().accent } else { self.c().text_dim }).add_modifier(Modifier::BOLD),
+                Style::default().fg(title_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(scroll_info, Style::default().fg(self.c().text_muted)),
         ]);
         f.render_widget(Paragraph::new(title_line), title_area);
 
-        // Content area below title
         let content_area = Rect { y: area.y + 1, height: area.height.saturating_sub(1), ..area };
         let inner_height = content_area.height as usize;
 
@@ -2157,25 +2475,14 @@ impl Dashboard {
 
             let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
                 .iter()
-                .map(|line| {
-                    let text_style = if line.is_error {
-                        Style::default().fg(self.c().error)
-                    } else {
-                        Style::default().fg(self.c().text)
-                    };
-
-                    let display_text = if line.text.len() > max_width {
-                        format!("{}…", &line.text[..max_width.saturating_sub(1)])
-                    } else {
-                        line.text.clone()
-                    };
-
-                    Line::from(Span::styled(display_text, text_style))
+                .filter_map(|line| {
+                    // Convert ANSI codes to ratatui styles
+                    line.text.as_bytes().into_text().ok().and_then(|text| text.lines.into_iter().next())
                 })
                 .collect();
 
-            let content = Paragraph::new(visible_lines)
-                .wrap(ratatui::widgets::Wrap { trim: false });
+            // Don't wrap - PTY already wrapped at correct width
+            let content = Paragraph::new(visible_lines);
             f.render_widget(content, content_area);
         }
     }
@@ -2185,54 +2492,53 @@ impl Dashboard {
         let inner_height = area.height as usize;
 
         if self.stream.lines.is_empty() {
-            let empty_msg = "No output - press Esc or f to exit fullscreen";
+            let empty_msg = "Passthrough mode - type to interact │ ^B: menu";
             let content = Paragraph::new(Line::from(Span::styled(
                 empty_msg,
                 Style::default().fg(self.c().text_muted),
             )))
             .alignment(Alignment::Center);
             f.render_widget(content, area);
-            return;
-        }
+        } else {
+            // Calculate visible range
+            let total_lines = self.stream.lines.len();
+            let end_idx = total_lines.saturating_sub(self.stream.scroll);
+            let start_idx = end_idx.saturating_sub(inner_height);
 
-        // Calculate visible range
-        let total_lines = self.stream.lines.len();
-        let end_idx = total_lines.saturating_sub(self.stream.scroll);
-        let start_idx = end_idx.saturating_sub(inner_height);
+            let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
+                .iter()
+                .filter_map(|line| {
+                    // Convert ANSI codes to ratatui styles
+                    line.text.as_bytes().into_text().ok().and_then(|text| text.lines.into_iter().next())
+                })
+                .collect();
 
-        let visible_lines: Vec<Line> = self.stream.lines[start_idx..end_idx]
-            .iter()
-            .map(|line| {
-                let style = if line.is_error {
-                    Style::default().fg(self.c().error)
+            // Don't wrap - PTY already wrapped at correct width
+            let content = Paragraph::new(visible_lines)
+                .style(Style::default().bg(self.c().bg));
+
+            f.render_widget(content, area);
+
+            // Show minimal status bar at bottom
+            if self.stream.scroll > 0 || self.prefix_active {
+                let status = if self.prefix_active {
+                    " ^B-? ".to_string()
                 } else {
-                    Style::default().fg(self.c().text)
+                    format!(" ↑{} │ ^B: menu ", self.stream.scroll)
                 };
-                Line::from(Span::styled(&line.text, style))
-            })
-            .collect();
-
-        let content = Paragraph::new(visible_lines)
-            .style(Style::default().bg(self.c().bg))
-            .wrap(ratatui::widgets::Wrap { trim: false });
-
-        f.render_widget(content, area);
-
-        // Show minimal status bar at bottom
-        if self.stream.scroll > 0 {
-            let status = format!(" ↑{} lines | Esc/f: exit fullscreen ", self.stream.scroll);
-            let status_area = Rect {
-                x: area.x,
-                y: area.y + area.height - 1,
-                width: area.width,
-                height: 1,
-            };
-            let status_bar = Paragraph::new(Line::from(Span::styled(
-                status,
-                Style::default().fg(self.c().text_muted).bg(self.c().bg_surface),
-            )))
-            .alignment(Alignment::Right);
-            f.render_widget(status_bar, status_area);
+                let status_area = Rect {
+                    x: area.x,
+                    y: area.y + area.height - 1,
+                    width: area.width,
+                    height: 1,
+                };
+                let status_bar = Paragraph::new(Line::from(Span::styled(
+                    status,
+                    Style::default().fg(self.c().text_muted).bg(self.c().bg_surface),
+                )))
+                .alignment(Alignment::Right);
+                f.render_widget(status_bar, status_area);
+            }
         }
     }
 
@@ -3067,13 +3373,13 @@ impl Dashboard {
 
     /// Render spawn agent dialog
     fn render_spawn_dialog(&self, f: &mut Frame, area: Rect) {
-        let popup_area = centered_rect(70, 50, area);
+        let popup_area = centered_rect(70, 40, area);
 
         // Build the dialog content
         let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
-                "  Spawn a new Claude Code agent to work on a task.",
+                "  Start an interactive agent session (like tmux)",
                 Style::default().fg(self.c().text_muted),
             )),
             Line::from(""),
@@ -3093,7 +3399,7 @@ impl Dashboard {
         };
 
         lines.push(Line::from(vec![
-            Span::styled("  Repository: ", repo_style),
+            Span::styled("  Directory: ", repo_style),
         ]));
 
         // Show repo value with cursor if focused
@@ -3111,44 +3417,30 @@ impl Dashboard {
         lines.push(Line::from(Span::styled(repo_display, repo_value_style)));
         lines.push(Line::from(""));
 
-        // Prompt field (required)
-        let prompt_focused = self.spawn_dialog.focus == 1;
-        let prompt_style = if prompt_focused {
+        // Provider selector
+        let provider_focused = self.spawn_dialog.focus == 1;
+        let provider_style = if provider_focused {
             Style::default().fg(self.c().accent)
         } else {
             Style::default().fg(self.c().text_muted)
         };
-        let prompt_value_style = if prompt_focused {
+
+        lines.push(Line::from(vec![
+            Span::styled("  Provider: ", provider_style),
+        ]));
+
+        // Show provider options
+        let provider_display = if provider_focused {
+            format!("  ◀ {} ▶", self.spawn_dialog.provider.name())
+        } else {
+            format!("  {}", self.spawn_dialog.provider.name())
+        };
+        let provider_value_style = if provider_focused {
             Style::default().fg(self.c().text).bg(self.c().bg_highlight)
         } else {
             Style::default().fg(self.c().text)
         };
-
-        lines.push(Line::from(vec![
-            Span::styled("  Prompt: ", prompt_style),
-            Span::styled("*", Style::default().fg(self.c().error)),
-        ]));
-
-        // Show prompt value with cursor if focused
-        let prompt_display = if prompt_focused {
-            let cursor_pos = self.spawn_dialog.cursor;
-            let prompt = &self.spawn_dialog.prompt;
-            if cursor_pos < prompt.len() {
-                format!("  {}│{}", &prompt[..cursor_pos], &prompt[cursor_pos..])
-            } else {
-                format!("  {}│", prompt)
-            }
-        } else if self.spawn_dialog.prompt.is_empty() {
-            "  (enter a goal for the agent)".to_string()
-        } else {
-            format!("  {}", self.spawn_dialog.prompt)
-        };
-        let prompt_display_style = if self.spawn_dialog.prompt.is_empty() && !prompt_focused {
-            Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)
-        } else {
-            prompt_value_style
-        };
-        lines.push(Line::from(Span::styled(prompt_display, prompt_display_style)));
+        lines.push(Line::from(Span::styled(provider_display, provider_value_style)));
         lines.push(Line::from(""));
 
         // Namespace field (optional)
@@ -3347,12 +3639,14 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Truncate string with ellipsis
+/// Truncate string with ellipsis (handles multi-byte UTF-8 characters)
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
     } else {
-        format!("{}…", &s[..max_len.saturating_sub(1)])
+        let truncated: String = s.chars().take(max_len.saturating_sub(1)).collect();
+        format!("{}…", truncated)
     }
 }
 
@@ -3437,9 +3731,11 @@ async fn data_fetcher(
                 // Process pending actions
                 for action in pending_actions.drain(..) {
                     match action {
-                        Action::SpawnAgent { repo, prompt, namespace } => {
+                        Action::SpawnAgent { repo, namespace, pty_rows, pty_cols } => {
                             let repo_path = std::path::PathBuf::from(&repo);
-                            match client.spawn_agent(repo_path, namespace, Some(prompt), None, None).await {
+                            // No prompt - just run interactive claude session like tmux
+                            // Pass PTY size so output is correctly sized from the start
+                            match client.spawn_agent(repo_path, namespace, None, None, None, Some(pty_rows), Some(pty_cols)).await {
                                 Ok(Response::AgentSpawned { id }) => {
                                     let _ = tx.send(DataUpdate::Log(LogEntry {
                                         timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
@@ -3518,6 +3814,16 @@ async fn data_fetcher(
                                 }
                             }
                         }
+                        Action::ResizeAgent { id, rows, cols } => {
+                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
+                                let _ = client.resize_agent(agent_id, rows, cols).await;
+                            }
+                        }
+                        Action::SendInput { id, input } => {
+                            if let Ok(agent_id) = id.parse::<crate::agent::AgentId>() {
+                                let _ = client.send_input(agent_id, input).await;
+                            }
+                        }
                     }
                 }
 
@@ -3533,10 +3839,10 @@ async fn data_fetcher(
                     _ => {}
                 }
 
-                // Fetch output for current agent
+                // Fetch screen content for current agent (uses vt100 parser for proper terminal emulation)
                 if let Some(ref agent_id) = current_agent_id {
                     if let Ok(id) = agent_id.parse::<crate::agent::AgentId>() {
-                        match client.get_output(id, 500).await {
+                        match client.get_screen_content(id).await {
                             Ok(Response::AgentOutput { lines, has_more }) => {
                                 let display_lines: Vec<OutputLineDisplay> = lines
                                     .into_iter()
@@ -3595,8 +3901,8 @@ async fn data_fetcher(
             }
         }
 
-        // Wait before next fetch (can be longer now since events are real-time)
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // Fast polling for responsive terminal - screen content needs frequent updates
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 }
 

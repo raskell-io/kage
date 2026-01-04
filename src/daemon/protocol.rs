@@ -31,6 +31,10 @@ pub enum Request {
         model: Option<String>,
         /// Maximum iterations (optional, defaults to config)
         max_iterations: Option<u32>,
+        /// Initial PTY rows (optional, defaults to 24)
+        pty_rows: Option<u16>,
+        /// Initial PTY cols (optional, defaults to 80)
+        pty_cols: Option<u16>,
     },
 
     /// Kill an agent
@@ -63,12 +67,18 @@ pub enum Request {
         input: String,
     },
 
-    /// Get agent output
+    /// Get agent output (legacy - raw chunks)
     GetOutput {
         /// Agent ID
         id: AgentId,
         /// Number of lines (0 = all available)
         lines: usize,
+    },
+
+    /// Get agent screen content (parsed terminal output)
+    GetScreenContent {
+        /// Agent ID
+        id: AgentId,
     },
 
     /// Attach to agent (stream output)
@@ -93,6 +103,16 @@ pub enum Request {
     ResumeAgent {
         /// Agent ID
         id: AgentId,
+    },
+
+    /// Resize agent PTY
+    ResizeAgent {
+        /// Agent ID
+        id: AgentId,
+        /// Number of rows
+        rows: u16,
+        /// Number of columns
+        cols: u16,
     },
 
     /// Add a task

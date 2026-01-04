@@ -67,9 +67,6 @@ async fn add_subscription(
     tags: Option<String>,
     description: Option<String>,
 ) -> Result<()> {
-    let registry = get_registry()?;
-    let provider_type = parse_provider(&provider)?;
-
     // Prompt for API key
     print!("Enter API key for '{}': ", name);
     io::stdout().flush()?;
@@ -82,14 +79,36 @@ async fn add_subscription(
         anyhow::bail!("API key cannot be empty");
     }
 
-    // Store API key in keychain
-    let key_ref = format!("kage-subscription-{}", name);
-    crate::secrets::set(&key_ref, &api_key, &crate::secrets::SecretScope::Global)?;
+    let socket_path = client::default_socket_path();
 
-    // Create subscription
+    // Use daemon if running (preferred - avoids DB lock issues and stores key in database)
+    if client::is_daemon_running(&socket_path).await {
+        let mut daemon_client = DaemonClient::connect(&socket_path).await?;
+        match daemon_client.add_subscription(name.clone(), api_key).await? {
+            Response::SubscriptionAdded { name: added_name } => {
+                println!("Subscription '{}' added successfully", added_name);
+                println!("API key stored securely in subscription database");
+                return Ok(());
+            }
+            Response::Error { message } => {
+                anyhow::bail!("Daemon error: {}", message);
+            }
+            _ => {
+                anyhow::bail!("Unexpected response from daemon");
+            }
+        }
+    }
+
+    // Fallback: open database directly (only works if daemon is not running)
+    let registry = get_registry()?;
+    let provider_type = parse_provider(&provider)?;
+
+    // Create subscription with API key stored directly in database
+    let key_ref = format!("subscription:{}", name);
     let mut subscription = Subscription::new(&name, &key_ref)
         .with_provider(provider_type)
-        .with_priority(priority);
+        .with_priority(priority)
+        .with_api_key(&api_key);
 
     if let Some(tags_str) = tags {
         let tag_list: Vec<String> = tags_str.split(',').map(|s| s.trim().to_string()).collect();
@@ -104,7 +123,7 @@ async fn add_subscription(
 
     println!("Subscription '{}' added successfully", name);
     println!("ID: {}", id);
-    println!("API key stored securely in OS keychain");
+    println!("API key stored securely in subscription database");
 
     Ok(())
 }

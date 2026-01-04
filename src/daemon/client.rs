@@ -70,6 +70,8 @@ impl DaemonClient {
         prompt: Option<String>,
         model: Option<String>,
         max_iterations: Option<u32>,
+        pty_rows: Option<u16>,
+        pty_cols: Option<u16>,
     ) -> Result<Response> {
         self.request(&Request::SpawnAgent {
             working_dir,
@@ -77,6 +79,8 @@ impl DaemonClient {
             prompt,
             model,
             max_iterations,
+            pty_rows,
+            pty_cols,
         })
         .await
     }
@@ -109,9 +113,14 @@ impl DaemonClient {
         self.request(&Request::SendInput { id, input }).await
     }
 
-    /// Get agent output
+    /// Get agent output (legacy - raw chunks)
     pub async fn get_output(&mut self, id: crate::agent::AgentId, lines: usize) -> Result<Response> {
         self.request(&Request::GetOutput { id, lines }).await
+    }
+
+    /// Get agent screen content (parsed terminal output)
+    pub async fn get_screen_content(&mut self, id: crate::agent::AgentId) -> Result<Response> {
+        self.request(&Request::GetScreenContent { id }).await
     }
 
     /// Attach to agent (returns stream for reading)
@@ -156,6 +165,11 @@ impl DaemonClient {
     /// Resume an agent
     pub async fn resume_agent(&mut self, id: crate::agent::AgentId) -> Result<Response> {
         self.request(&Request::ResumeAgent { id }).await
+    }
+
+    /// Resize agent PTY
+    pub async fn resize_agent(&mut self, id: crate::agent::AgentId, rows: u16, cols: u16) -> Result<Response> {
+        self.request(&Request::ResizeAgent { id, rows, cols }).await
     }
 
     /// Cancel a task

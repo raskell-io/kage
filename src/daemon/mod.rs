@@ -161,6 +161,8 @@ impl Daemon {
                                 Some(task.goal.clone()),
                                 None, // Use default model
                                 Some(task.config.max_iterations),
+                                None, // Use default PTY rows
+                                None, // Use default PTY cols
                             ).await {
                                 Ok(agent_id) => {
                                     // Assign task to agent
@@ -563,10 +565,12 @@ async fn handle_request(
             prompt,
             model,
             max_iterations,
+            pty_rows,
+            pty_cols,
         } => {
             let mut sup = supervisor.write().await;
             match sup
-                .spawn(working_dir.clone(), namespace.clone(), prompt, model, max_iterations)
+                .spawn(working_dir.clone(), namespace.clone(), prompt, model, max_iterations, pty_rows, pty_cols)
                 .await
             {
                 Ok(id) => {
@@ -642,6 +646,19 @@ async fn handle_request(
             }
         }
 
+        Request::GetScreenContent { id } => {
+            let sup = supervisor.read().await;
+            match sup.get_screen_content(id) {
+                Ok(lines) => Some(Response::AgentOutput {
+                    lines,
+                    has_more: false,
+                }),
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
         Request::Attach { id } => {
             // Stream output to client
             let sup = supervisor.read().await;
@@ -706,6 +723,16 @@ async fn handle_request(
         Request::ResumeAgent { id } => {
             let mut sup = supervisor.write().await;
             match sup.resume(id).await {
+                Ok(()) => Some(Response::Ok),
+                Err(e) => Some(Response::Error {
+                    message: e.to_string(),
+                }),
+            }
+        }
+
+        Request::ResizeAgent { id, rows, cols } => {
+            let sup = supervisor.read().await;
+            match sup.resize(id, rows, cols) {
                 Ok(()) => Some(Response::Ok),
                 Err(e) => Some(Response::Error {
                     message: e.to_string(),

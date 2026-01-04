@@ -82,9 +82,11 @@ pub async fn handle_spawn_agent(
     prompt: Option<String>,
     model: Option<String>,
     max_iterations: Option<u32>,
+    pty_rows: Option<u16>,
+    pty_cols: Option<u16>,
 ) -> Result<AgentId> {
     let mut sup = state.supervisor.write().await;
-    sup.spawn(working_dir, namespace, prompt, model, max_iterations)
+    sup.spawn(working_dir, namespace, prompt, model, max_iterations, pty_rows, pty_cols)
         .await
 }
 

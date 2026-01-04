@@ -303,8 +303,12 @@ pub struct Subscription {
     pub id: SubscriptionId,
     /// User-friendly name (e.g., "work-account", "personal")
     pub name: String,
-    /// Reference to keychain entry for API key
+    /// Reference to keychain entry for API key (legacy, kept for compatibility)
     pub api_key_ref: String,
+    /// Actual API key (stored directly in database for persistence)
+    /// This avoids repeated keychain access on daemon restart
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Provider type
     pub provider: ProviderType,
     /// Current status
@@ -333,6 +337,7 @@ impl Subscription {
             id: SubscriptionId::new(),
             name: name.to_string(),
             api_key_ref: api_key_ref.to_string(),
+            api_key: None,
             provider: ProviderType::default(),
             status: SubscriptionStatus::default(),
             rate_limit_state: RateLimitState::default(),
@@ -366,6 +371,12 @@ impl Subscription {
     /// Set description
     pub fn with_description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
+        self
+    }
+
+    /// Set the API key directly (stored in database, no keychain needed)
+    pub fn with_api_key(mut self, api_key: &str) -> Self {
+        self.api_key = Some(api_key.to_string());
         self
     }
 

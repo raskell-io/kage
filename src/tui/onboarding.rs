@@ -2,7 +2,7 @@
 //!
 //! Guides new users through initial setup:
 //! - Welcome screen with mascot
-//! - API key configuration (stored in OS keychain)
+//! - API key configuration (stored in subscription database)
 //! - Default namespace setup
 //! - Feature tour
 //! - Completion
@@ -25,7 +25,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::secrets::{self, ClaudeCodeAuth, SecretScope};
+use crate::secrets::{self, ClaudeCodeAuth};
 use crate::subscription::{ProviderType, Subscription};
 use crate::subscription::registry::SubscriptionRegistry;
 
@@ -456,12 +456,8 @@ impl OnboardingWizard {
         }
     }
 
-    /// Add a subscription to the pool (keychain + database)
+    /// Add a subscription to the pool (stored directly in database, no keychain)
     fn add_subscription_to_pool(&self, name: &str, api_key: &str) -> anyhow::Result<()> {
-        // Store API key in keychain
-        let key_ref = format!("subscription:{}", name);
-        secrets::set(&key_ref, api_key, &SecretScope::Global)?;
-
         // Open subscription registry and add record
         let config = crate::config::load()?;
         let db_path = config.daemon.state_dir.join("subscriptions.redb");
@@ -478,10 +474,15 @@ impl OnboardingWizard {
             ProviderType::AnthropicApi
         };
 
-        let subscription = Subscription::new(name, &key_ref).with_provider(provider);
+        // Store API key directly in subscription database (no keychain needed)
+        // This avoids keychain prompts on daemon restart
+        let key_ref = format!("subscription:{}", name);
+        let subscription = Subscription::new(name, &key_ref)
+            .with_provider(provider)
+            .with_api_key(api_key);
         registry.add(subscription)?;
 
-        tracing::info!("Added subscription '{}' to pool", name);
+        tracing::info!("Added subscription '{}' to pool (stored in database)", name);
         Ok(())
     }
 

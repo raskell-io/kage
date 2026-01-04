@@ -292,6 +292,14 @@ impl SubscriptionRegistry {
         subscription.mark_unhealthy(reason);
         self.update(subscription)
     }
+
+    /// Update the API key for a subscription (stores directly in database)
+    pub fn update_api_key(&self, id: SubscriptionId, api_key: &str) -> Result<()> {
+        let mut subscription = self.get(id).ok_or_else(|| anyhow::anyhow!("Subscription {} not found", id))?;
+        subscription.api_key = Some(api_key.to_string());
+        subscription.updated_at = chrono::Utc::now().timestamp();
+        self.update(subscription)
+    }
 }
 
 #[cfg(test)]

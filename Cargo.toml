@@ -61,6 +61,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # PTY for agent process management
 portable-pty = "0.8"
+vt100 = "0.15"                        # Terminal emulator for parsing PTY output
 
 # File system
 notify = "6.1"                        # File watching
@@ -78,8 +79,9 @@ regex = "1.10"
 chrono = { version = "0.4", features = ["serde"] }
 
 # TUI (optional, enabled by default for onboarding)
-ratatui = { version = "0.26", optional = true }
-crossterm = { version = "0.27", optional = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
+ansi-to-tui = "7.0"                   # Convert ANSI escape codes to ratatui styles
 
 # gRPC (optional, for server/multi-user mode)
 tonic = { version = "0.11", optional = true }

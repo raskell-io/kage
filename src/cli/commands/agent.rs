@@ -58,7 +58,7 @@ async fn spawn_agent(
     println!("Spawning agent in {:?}...", working_dir);
 
     let response = client
-        .spawn_agent(working_dir, namespace.clone(), prompt, None, None)
+        .spawn_agent(working_dir, namespace.clone(), prompt, None, None, None, None)
         .await?;
 
     match response {
