@@ -919,6 +919,55 @@ impl SpawnDialogState {
         }
     }
 
+    /// Move cursor to previous path segment boundary (Option+Left)
+    fn move_cursor_word_left(&mut self) {
+        if let Some(field) = self.current_text_field() {
+            if self.cursor == 0 {
+                return;
+            }
+            let chars: Vec<char> = field.chars().collect();
+            let mut pos = self.cursor.saturating_sub(1);
+
+            // Skip any trailing slashes at cursor position
+            while pos > 0 && chars[pos] == '/' {
+                pos -= 1;
+            }
+
+            // Find the previous slash or start
+            while pos > 0 && chars[pos - 1] != '/' {
+                pos -= 1;
+            }
+
+            self.cursor = pos;
+        }
+    }
+
+    /// Move cursor to next path segment boundary (Option+Right)
+    fn move_cursor_word_right(&mut self) {
+        if let Some(field) = self.current_text_field() {
+            let chars: Vec<char> = field.chars().collect();
+            let len = chars.len();
+
+            if self.cursor >= len {
+                return;
+            }
+
+            let mut pos = self.cursor;
+
+            // Skip current character if it's a slash
+            if pos < len && chars[pos] == '/' {
+                pos += 1;
+            }
+
+            // Find the next slash or end
+            while pos < len && chars[pos] != '/' {
+                pos += 1;
+            }
+
+            self.cursor = pos;
+        }
+    }
+
     fn is_valid(&self) -> bool {
         // Only repo is required - we just run claude in that directory
         !self.repo.trim().is_empty()
@@ -1734,10 +1783,18 @@ impl Dashboard {
                     self.spawn_dialog.delete_char();
                 }
                 KeyCode::Left => {
-                    self.spawn_dialog.move_cursor_left();
+                    if modifiers.contains(KeyModifiers::ALT) {
+                        self.spawn_dialog.move_cursor_word_left();
+                    } else {
+                        self.spawn_dialog.move_cursor_left();
+                    }
                 }
                 KeyCode::Right => {
-                    self.spawn_dialog.move_cursor_right();
+                    if modifiers.contains(KeyModifiers::ALT) {
+                        self.spawn_dialog.move_cursor_word_right();
+                    } else {
+                        self.spawn_dialog.move_cursor_right();
+                    }
                 }
                 KeyCode::Home => {
                     self.spawn_dialog.move_cursor_home();
