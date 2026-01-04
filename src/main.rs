@@ -11,6 +11,7 @@ mod agent;
 mod cli;
 mod config;
 mod daemon;
+mod mcp;
 mod memory;
 mod namespace;
 mod secrets;

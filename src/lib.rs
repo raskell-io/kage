@@ -24,6 +24,7 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod daemon;
+pub mod mcp;
 pub mod memory;
 pub mod namespace;
 pub mod secrets;

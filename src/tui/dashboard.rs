@@ -28,6 +28,7 @@ use ratatui::{
 use ansi_to_tui::IntoText;
 
 use crate::daemon::protocol::{AgentInfo as DaemonAgentInfo, ApprovalInfo as DaemonApprovalInfo, TaskInfo as DaemonTaskInfo};
+use crate::mcp::{McpConfig, McpScope};
 use crate::secrets::{self, ClaudeCodeAuth};
 use super::input::TextInput;
 use super::theme::{Theme, ColorPalette, StatusSymbols};
@@ -275,6 +276,16 @@ pub struct Dashboard {
     spawn_dialog: SpawnDialogState,
     /// Setup wizard state
     setup_wizard: SetupWizardState,
+    /// Show MCP Manager overlay
+    show_mcp_manager: bool,
+    /// MCP Manager state
+    mcp_manager: McpManagerState,
+    /// Session groups state (for collapsible namespace grouping)
+    session_groups: SessionGroupsState,
+    /// Show global search overlay
+    show_search: bool,
+    /// Global search state
+    search: GlobalSearchState,
     /// Last tick time (for animations)
     last_tick: Instant,
     /// Last data refresh
@@ -365,6 +376,40 @@ enum AgentDisplayStatus {
     Paused,
     /// Agent encountered an error
     Error,
+}
+
+/// Session group state for organizing agents by namespace
+#[derive(Debug, Clone, Default)]
+struct SessionGroupsState {
+    /// Set of collapsed group names (namespaces)
+    collapsed: std::collections::HashSet<String>,
+    /// Whether grouping is enabled
+    enabled: bool,
+}
+
+impl SessionGroupsState {
+    fn new() -> Self {
+        Self {
+            collapsed: std::collections::HashSet::new(),
+            enabled: true,
+        }
+    }
+
+    fn is_collapsed(&self, namespace: &str) -> bool {
+        self.collapsed.contains(namespace)
+    }
+
+    fn toggle_collapse(&mut self, namespace: &str) {
+        if self.collapsed.contains(namespace) {
+            self.collapsed.remove(namespace);
+        } else {
+            self.collapsed.insert(namespace.to_string());
+        }
+    }
+
+    fn toggle_enabled(&mut self) {
+        self.enabled = !self.enabled;
+    }
 }
 
 /// Agent list state
@@ -843,6 +888,116 @@ impl SpawnDialogState {
     }
 }
 
+/// MCP Manager overlay state
+struct McpManagerState {
+    /// MCP configuration
+    config: McpConfig,
+    /// Selected server index
+    selected: usize,
+    /// Current scope for changes
+    scope: McpScope,
+    /// Session ID for local scope changes
+    session_id: Option<String>,
+    /// Whether changes were made that require restart
+    needs_restart: bool,
+}
+
+impl McpManagerState {
+    fn new() -> Self {
+        // Try to load from Claude settings, fall back to defaults
+        let config = McpConfig::load_from_claude_settings()
+            .unwrap_or_else(McpConfig::new);
+
+        Self {
+            config,
+            selected: 0,
+            scope: McpScope::Local,
+            session_id: None,
+            needs_restart: false,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.config.servers.is_empty() {
+            self.selected = (self.selected + 1) % self.config.servers.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.config.servers.is_empty() {
+            self.selected = self.selected.checked_sub(1)
+                .unwrap_or(self.config.servers.len() - 1);
+        }
+    }
+
+    fn toggle_selected(&mut self) {
+        if let Some(server) = self.config.servers.get(self.selected) {
+            let name = server.name.clone();
+            self.config.toggle(&name, self.scope, self.session_id.as_deref());
+            self.needs_restart = true;
+        }
+    }
+
+    fn toggle_scope(&mut self) {
+        self.scope = self.scope.toggle();
+    }
+
+    fn selected_server(&self) -> Option<&crate::mcp::McpServer> {
+        self.config.servers.get(self.selected)
+    }
+
+    fn is_server_enabled(&self, name: &str) -> bool {
+        self.config.is_enabled(name, self.session_id.as_deref())
+    }
+}
+
+/// Global search overlay state
+struct GlobalSearchState {
+    /// Search input
+    input: TextInput,
+    /// Search results (agent indices that match)
+    results: Vec<usize>,
+    /// Selected result index
+    selected: usize,
+    /// Whether search is active
+    active: bool,
+}
+
+impl GlobalSearchState {
+    fn new() -> Self {
+        Self {
+            input: TextInput::new(),
+            results: Vec::new(),
+            selected: 0,
+            active: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.input.clear();
+        self.results.clear();
+        self.selected = 0;
+        self.active = false;
+    }
+
+    fn select_next(&mut self) {
+        if !self.results.is_empty() {
+            self.selected = (self.selected + 1) % self.results.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.results.is_empty() {
+            self.selected = self.selected.checked_sub(1)
+                .unwrap_or(self.results.len() - 1);
+        }
+    }
+
+    fn selected_agent_index(&self) -> Option<usize> {
+        self.results.get(self.selected).copied()
+    }
+}
+
 /// Agent output state
 struct OutputState {
     /// Current agent ID being viewed
@@ -948,6 +1103,15 @@ impl LogState {
         });
     }
 
+    fn add_error(&mut self, source: &str, message: &str) {
+        self.add(LogEntry {
+            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            level: LogLevel::Error,
+            source: source.to_string(),
+            message: message.to_string(),
+        });
+    }
+
     fn scroll_down(&mut self) {
         if self.scroll < self.entries.len().saturating_sub(1) {
             self.scroll += 1;
@@ -997,6 +1161,11 @@ impl Dashboard {
             logs_collapsed: true,   // Collapsed by default
             spawn_dialog: SpawnDialogState::new(),
             setup_wizard: SetupWizardState::new(),
+            show_mcp_manager: false,
+            mcp_manager: McpManagerState::new(),
+            session_groups: SessionGroupsState::new(),
+            show_search: false,
+            search: GlobalSearchState::new(),
             last_tick: Instant::now(),
             last_refresh: Instant::now(),
             spinner_frame: 0,
@@ -1327,6 +1496,7 @@ impl Dashboard {
             && !self.show_task_details
             && !self.show_approvals
             && !self.show_spawn_dialog
+            && !self.show_mcp_manager
             && !self.setup_wizard.needs_setup;
 
         // Handle prefix mode (Ctrl+B was pressed)
@@ -1363,8 +1533,17 @@ impl Dashboard {
                 KeyCode::Char('4') => { self.focus = Panel::Logs; self.fullscreen_stream = false; }
                 // Ctrl+B, n = new agent
                 KeyCode::Char('n') => { self.show_spawn_dialog = true; self.fullscreen_stream = false; }
+                // Ctrl+B, m = MCP manager
+                KeyCode::Char('m') => {
+                    // Set session ID to current agent for local scope
+                    self.mcp_manager.session_id = self.stream.agent_id.clone();
+                    self.show_mcp_manager = true;
+                    self.fullscreen_stream = false;
+                }
                 // Ctrl+B, k = kill agent
                 KeyCode::Char('k') => self.handle_kill_agent(),
+                // Ctrl+B, Shift+F = fork agent (new session in same dir)
+                KeyCode::Char('F') => { self.handle_fork_agent(); self.fullscreen_stream = false; }
                 // Ctrl+B, ? = help
                 KeyCode::Char('?') => self.show_help = true,
                 // Ctrl+B, q = quit
@@ -1669,6 +1848,78 @@ impl Dashboard {
             return;
         }
 
+        // MCP Manager overlay
+        if self.show_mcp_manager {
+            match key {
+                KeyCode::Esc | KeyCode::Char('m') => {
+                    self.show_mcp_manager = false;
+                }
+                KeyCode::Enter => {
+                    // Apply and close
+                    if self.mcp_manager.needs_restart {
+                        // Save config based on scope
+                        if let Err(e) = self.mcp_manager.config.save_to_claude_settings(self.mcp_manager.scope) {
+                            self.logs.add_error("mcp", &format!("Failed to save MCP config: {}", e));
+                        } else {
+                            self.logs.add_info("mcp", "MCP configuration saved. Restart session to apply changes.");
+                        }
+                    }
+                    self.show_mcp_manager = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.mcp_manager.select_prev();
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.mcp_manager.select_next();
+                }
+                KeyCode::Char(' ') => {
+                    // Toggle selected MCP
+                    self.mcp_manager.toggle_selected();
+                }
+                KeyCode::Tab => {
+                    // Toggle scope
+                    self.mcp_manager.toggle_scope();
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Global search overlay
+        if self.show_search {
+            match key {
+                KeyCode::Esc => {
+                    self.show_search = false;
+                    self.search.reset();
+                }
+                KeyCode::Enter => {
+                    // Jump to selected result
+                    if let Some(idx) = self.search.selected_agent_index() {
+                        self.agents.state.select(Some(idx));
+                        self.sync_stream_to_selected_agent();
+                        self.show_search = false;
+                        self.search.reset();
+                    }
+                }
+                KeyCode::Up | KeyCode::BackTab => {
+                    self.search.select_prev();
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    self.search.select_next();
+                }
+                KeyCode::Backspace => {
+                    self.search.input.delete_char();
+                    self.update_search_results();
+                }
+                KeyCode::Char(c) => {
+                    self.search.input.insert_char(c);
+                    self.update_search_results();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Global keys - Ctrl combinations first (they need priority)
         match (key, modifiers.contains(KeyModifiers::CONTROL)) {
             // Ctrl+C or Ctrl+Q to quit
@@ -1744,6 +1995,11 @@ impl Dashboard {
             KeyCode::Char('c') => self.handle_cancel(),        // Cancel task
             KeyCode::Char('a') => self.show_approvals = true,  // Open approvals popup
             KeyCode::Char('n') => self.show_spawn_dialog = true, // New agent
+            KeyCode::Char('M') => {
+                // Open MCP manager
+                self.mcp_manager.session_id = self.stream.agent_id.clone();
+                self.show_mcp_manager = true;
+            }
             KeyCode::Char('r') => self.refresh(),              // Refresh
             KeyCode::Esc => self.handle_escape(),              // Clear selection / close
 
@@ -1758,6 +2014,31 @@ impl Dashboard {
             // Panel collapse toggles
             KeyCode::Char('t') => self.tasks_collapsed = !self.tasks_collapsed,
             KeyCode::Char('L') => self.logs_collapsed = !self.logs_collapsed,
+
+            // Session grouping
+            KeyCode::Char('g') if self.focus == Panel::Agents => {
+                // Toggle collapse of selected agent's group
+                if let Some(agent) = self.agents.selected() {
+                    let namespace = agent.namespace.clone();
+                    self.session_groups.toggle_collapse(&namespace);
+                }
+            }
+            KeyCode::Char('G') => {
+                // Toggle grouping on/off
+                self.session_groups.toggle_enabled();
+            }
+
+            // Fork session - spawn new agent in same directory
+            KeyCode::Char('F') if self.focus == Panel::Agents => {
+                self.handle_fork_agent();
+            }
+
+            // Global search
+            KeyCode::Char('/') => {
+                self.show_search = true;
+                self.search.reset();
+                self.update_search_results();
+            }
 
             _ => {}
         }
@@ -1936,6 +2217,25 @@ impl Dashboard {
             let id = agent.id.clone();
             self.logs.add_info("dashboard", &format!("Killing agent {}...", &id[..8.min(id.len())]));
             self.send_action(Action::KillAgent { id });
+        }
+    }
+
+    /// Handle fork agent - spawn a new agent in the same working directory
+    fn handle_fork_agent(&mut self) {
+        if let Some(agent) = self.agents.selected() {
+            let repo = agent.working_dir.clone();
+            let namespace = Some(agent.namespace.clone());
+            let (pty_rows, pty_cols) = self.calculate_stream_panel_size();
+
+            self.logs.add_info("dashboard", &format!(
+                "Forking agent {} → new session in {} (PTY: {}x{})",
+                &agent.id[..8.min(agent.id.len())],
+                truncate(&repo, 20),
+                pty_cols, pty_rows
+            ));
+            self.send_action(Action::SpawnAgent { repo, namespace, pty_rows, pty_cols });
+        } else {
+            self.logs.add_error("dashboard", "No agent selected to fork");
         }
     }
 
@@ -2128,6 +2428,31 @@ impl Dashboard {
             self.logs.add_info("dashboard", &format!("Approving {} action(s)...", count));
             for approval in &self.approvals.items {
                 self.send_action(Action::Approve { id: approval.id.clone() });
+            }
+        }
+    }
+
+    /// Update search results based on current query
+    fn update_search_results(&mut self) {
+        let query = self.search.input.text().to_lowercase();
+        self.search.results.clear();
+        self.search.selected = 0;
+
+        if query.is_empty() {
+            // Show all agents when query is empty
+            for (idx, _) in self.agents.items.iter().enumerate() {
+                self.search.results.push(idx);
+            }
+        } else {
+            // Filter agents by name, namespace, or repository
+            for (idx, agent) in self.agents.items.iter().enumerate() {
+                let matches = agent.name.to_lowercase().contains(&query)
+                    || agent.namespace.to_lowercase().contains(&query)
+                    || agent.repository.to_lowercase().contains(&query)
+                    || agent.working_dir.to_lowercase().contains(&query);
+                if matches {
+                    self.search.results.push(idx);
+                }
             }
         }
     }
@@ -2375,6 +2700,12 @@ impl Dashboard {
         }
         if self.show_spawn_dialog {
             self.render_spawn_dialog(f, area);
+        }
+        if self.show_mcp_manager {
+            self.render_mcp_manager(f, area);
+        }
+        if self.show_search {
+            self.render_search(f, area);
         }
 
         // Setup wizard renders on top of everything
@@ -2650,26 +2981,62 @@ impl Dashboard {
         // Filter agents
         let filtered: Vec<&AgentInfo> = self.filtered_agents();
 
-        let items: Vec<ListItem> = filtered.iter().map(|agent| {
-            let status_color = self.agent_status_color(agent.status);
-            let status_symbol = self.agent_status_symbol(agent.status);
+        if !self.session_groups.enabled {
+            // Simple flat list (no grouping)
+            let items: Vec<ListItem> = filtered.iter().map(|agent| {
+                self.render_agent_list_item(agent)
+            }).collect();
 
-            let line = Line::from(vec![
-                Span::styled(format!("{} ", status_symbol), Style::default().fg(status_color)),
-                Span::styled(&agent.name, Style::default().fg(self.c().text)),
-                Span::styled(format!(" ({})", agent.namespace), Style::default().fg(self.c().text_muted)),
+            let list = List::new(items)
+                .highlight_style(
+                    Style::default()
+                        .bg(self.c().bg_highlight)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("▸ ");
+
+            f.render_stateful_widget(list, area, &mut self.agents.state.clone());
+            return;
+        }
+
+        // Group agents by namespace
+        let mut groups: std::collections::BTreeMap<String, Vec<&AgentInfo>> = std::collections::BTreeMap::new();
+        for agent in &filtered {
+            groups.entry(agent.namespace.clone()).or_default().push(agent);
+        }
+
+        // Build grouped list items
+        let mut items: Vec<ListItem> = Vec::new();
+        let mut item_to_agent_idx: Vec<Option<usize>> = Vec::new();
+        let mut agent_idx = 0;
+
+        for (namespace, agents) in &groups {
+            let is_collapsed = self.session_groups.is_collapsed(namespace);
+            let collapse_symbol = if is_collapsed { "▶" } else { "▼" };
+            let count = agents.len();
+
+            // Group header
+            let header_line = Line::from(vec![
+                Span::styled(format!("{} ", collapse_symbol), Style::default().fg(self.c().accent)),
+                Span::styled(namespace, Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" ({})", count), Style::default().fg(self.c().text_muted)),
             ]);
+            items.push(ListItem::new(header_line));
+            item_to_agent_idx.push(None); // Header is not an agent
 
-            ListItem::new(vec![
-                line,
-                Line::from(Span::styled(
-                    format!("  {} • {}", truncate(&agent.repository, 20), agent.started_at),
-                    Style::default().fg(self.c().text_muted),
-                )),
-            ])
-        }).collect();
+            if !is_collapsed {
+                for agent in agents {
+                    items.push(self.render_agent_list_item(agent));
+                    item_to_agent_idx.push(Some(agent_idx));
+                    agent_idx += 1;
+                }
+            } else {
+                // Skip agents but count them
+                agent_idx += agents.len();
+            }
+        }
 
-        // Render list (title is rendered separately in render_panel_headers)
+        // Render list
         let list = List::new(items)
             .highlight_style(
                 Style::default()
@@ -2679,6 +3046,26 @@ impl Dashboard {
             .highlight_symbol("▸ ");
 
         f.render_stateful_widget(list, area, &mut self.agents.state.clone());
+    }
+
+    /// Render a single agent as a list item
+    fn render_agent_list_item<'a>(&self, agent: &AgentInfo) -> ListItem<'a> {
+        let status_color = self.agent_status_color(agent.status);
+        let status_symbol = self.agent_status_symbol(agent.status);
+
+        let line = Line::from(vec![
+            Span::styled("  ", Style::default()), // Indent for grouped agents
+            Span::styled(format!("{} ", status_symbol), Style::default().fg(status_color)),
+            Span::styled(agent.name.clone(), Style::default().fg(self.c().text)),
+        ]);
+
+        ListItem::new(vec![
+            line,
+            Line::from(Span::styled(
+                format!("    {} • {}", truncate(&agent.repository, 20), agent.started_at),
+                Style::default().fg(self.c().text_muted),
+            )),
+        ])
     }
 
     /// Render the stream panel (agent output)
@@ -3179,6 +3566,10 @@ impl Dashboard {
                 Span::styled("  Ctrl+P / Space   ", Style::default().fg(self.c().accent_bright)),
                 Span::styled("Pause/resume agent", Style::default().fg(self.c().text)),
             ]),
+            Line::from(vec![
+                Span::styled("  F                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Fork agent (new session in same dir)", Style::default().fg(self.c().text)),
+            ]),
             Line::from(""),
             Line::from(Span::styled("Task Actions", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
             Line::from(""),
@@ -3219,6 +3610,25 @@ impl Dashboard {
             Line::from(vec![
                 Span::styled("  Y                ", Style::default().fg(self.c().accent_bright)),
                 Span::styled("Approve all pending", Style::default().fg(self.c().text)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Session Groups", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  g                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Toggle group collapse (agents panel)", Style::default().fg(self.c().text)),
+            ]),
+            Line::from(vec![
+                Span::styled("  G                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Toggle grouping on/off", Style::default().fg(self.c().text)),
+            ]),
+            Line::from(vec![
+                Span::styled("  M                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Open MCP Manager", Style::default().fg(self.c().text)),
+            ]),
+            Line::from(vec![
+                Span::styled("  /                ", Style::default().fg(self.c().accent_bright)),
+                Span::styled("Search agents", Style::default().fg(self.c().text)),
             ]),
             Line::from(""),
             Line::from(Span::styled("General", Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD))),
@@ -3832,6 +4242,225 @@ impl Dashboard {
                     .border_style(Style::default().fg(self.c().accent))
                     .style(Style::default().bg(self.c().bg)),
             );
+
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+        f.render_widget(dialog, popup_area);
+    }
+
+    /// Render MCP Manager overlay
+    fn render_mcp_manager(&self, f: &mut Frame, area: Rect) {
+        let popup_area = centered_rect(70, 80, area);
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  MCP Servers ", Style::default().fg(self.c().text).add_modifier(Modifier::BOLD)),
+                Span::styled("─ Toggle with ", Style::default().fg(self.c().text_muted)),
+                Span::styled("Space", Style::default().fg(self.c().accent)),
+            ]),
+            Line::from(""),
+        ];
+
+        // Scope indicator
+        let scope_line = Line::from(vec![
+            Span::styled("  Scope: ", Style::default().fg(self.c().text_muted)),
+            Span::styled(
+                format!("[{}]", self.mcp_manager.scope.name()),
+                Style::default()
+                    .fg(match self.mcp_manager.scope {
+                        McpScope::Local => self.c().info,
+                        McpScope::Global => self.c().warning,
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  (Tab to toggle)", Style::default().fg(self.c().text_muted)),
+        ]);
+        lines.push(scope_line);
+        lines.push(Line::from(""));
+
+        // Session info for local scope
+        if self.mcp_manager.scope == McpScope::Local {
+            if let Some(ref session_id) = self.mcp_manager.session_id {
+                let short_id = if session_id.len() > 12 {
+                    &session_id[..12]
+                } else {
+                    session_id
+                };
+                lines.push(Line::from(vec![
+                    Span::styled("  Session: ", Style::default().fg(self.c().text_muted)),
+                    Span::styled(short_id, Style::default().fg(self.c().accent)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  Session: ", Style::default().fg(self.c().text_muted)),
+                    Span::styled("(none selected)", Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)),
+                ]));
+            }
+            lines.push(Line::from(""));
+        }
+
+        // Server list
+        for (idx, server) in self.mcp_manager.config.servers.iter().enumerate() {
+            let is_selected = idx == self.mcp_manager.selected;
+            let is_enabled = self.mcp_manager.is_server_enabled(&server.name);
+
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let checkbox = if is_enabled { "[✓]" } else { "[ ]" };
+            let checkbox_color = if is_enabled { self.c().success } else { self.c().text_muted };
+
+            let name_style = if is_selected {
+                Style::default().fg(self.c().text).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.c().text)
+            };
+
+            let row_style = if is_selected {
+                Style::default().bg(self.c().bg_highlight)
+            } else {
+                Style::default()
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled(prefix, Style::default().fg(self.c().accent)),
+                Span::styled(checkbox, Style::default().fg(checkbox_color)),
+                Span::styled(format!(" {}", server.name), name_style),
+            ]).style(row_style));
+
+            // Description on second line if selected
+            if is_selected && !server.description.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("     ", Style::default()),
+                    Span::styled(&server.description, Style::default().fg(self.c().text_muted).add_modifier(Modifier::ITALIC)),
+                ]));
+            }
+        }
+
+        lines.push(Line::from(""));
+
+        // Footer hints
+        lines.push(Line::from(vec![
+            Span::styled("  ↑↓", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Navigate  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Space", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Toggle  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Tab", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Scope  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Enter", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Apply  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Esc", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Close", Style::default().fg(self.c().text_dim)),
+        ]));
+
+        // Restart warning
+        if self.mcp_manager.needs_restart {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("  ⚠ ", Style::default().fg(self.c().warning)),
+                Span::styled("Changes require session restart to take effect", Style::default().fg(self.c().warning)),
+            ]));
+        }
+
+        let content = Paragraph::new(lines);
+
+        let dialog = content.block(
+            Block::default()
+                .title(Span::styled(
+                    " MCP Manager ",
+                    Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(self.c().accent))
+                .style(Style::default().bg(self.c().bg)),
+        );
+
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+        f.render_widget(dialog, popup_area);
+    }
+
+    /// Render global search overlay
+    fn render_search(&self, f: &mut Frame, area: Rect) {
+        // Small overlay at top of screen
+        let popup_area = Rect {
+            x: area.x + (area.width.saturating_sub(60)) / 2,
+            y: area.y + 2,
+            width: 60.min(area.width.saturating_sub(4)),
+            height: 15.min(area.height.saturating_sub(4)),
+        };
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled("/", Style::default().fg(self.c().accent)),
+                Span::styled(&self.search.input.text, Style::default().fg(self.c().text)),
+                Span::styled("█", Style::default().fg(self.c().accent)), // Cursor
+            ]),
+            Line::from(""),
+        ];
+
+        // Results count
+        let result_text = if self.search.results.is_empty() {
+            "No matches".to_string()
+        } else {
+            format!("{} match{}", self.search.results.len(), if self.search.results.len() == 1 { "" } else { "es" })
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default()),
+            Span::styled(result_text, Style::default().fg(self.c().text_muted)),
+        ]));
+        lines.push(Line::from(""));
+
+        // Show matching agents (up to 8)
+        for (i, &agent_idx) in self.search.results.iter().take(8).enumerate() {
+            if let Some(agent) = self.agents.items.get(agent_idx) {
+                let is_selected = i == self.search.selected;
+                let prefix = if is_selected { "▸ " } else { "  " };
+                let status_symbol = self.agent_status_symbol(agent.status);
+                let status_color = self.agent_status_color(agent.status);
+
+                let row_style = if is_selected {
+                    Style::default().bg(self.c().bg_highlight)
+                } else {
+                    Style::default()
+                };
+
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, Style::default().fg(self.c().accent)),
+                    Span::styled(format!("{} ", status_symbol), Style::default().fg(status_color)),
+                    Span::styled(&agent.name, Style::default().fg(self.c().text)),
+                    Span::styled(format!(" ({})", agent.namespace), Style::default().fg(self.c().text_muted)),
+                ]).style(row_style));
+            }
+        }
+
+        if self.search.results.len() > 8 {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(format!("  +{} more...", self.search.results.len() - 8), Style::default().fg(self.c().text_muted)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("  ↑↓", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Select  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Enter", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Jump  ", Style::default().fg(self.c().text_dim)),
+            Span::styled("Esc", Style::default().fg(self.c().text_muted)),
+            Span::styled(" Close", Style::default().fg(self.c().text_dim)),
+        ]));
+
+        let content = Paragraph::new(lines);
+        let dialog = content.block(
+            Block::default()
+                .title(Span::styled(
+                    " Search Agents ",
+                    Style::default().fg(self.c().accent).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(self.c().accent))
+                .style(Style::default().bg(self.c().bg)),
+        );
 
         f.render_widget(ratatui::widgets::Clear, popup_area);
         f.render_widget(dialog, popup_area);
