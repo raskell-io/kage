@@ -38,6 +38,8 @@
 
 Kage enables **Claude Code** agents to work autonomously while you're away, share context with each other, and scale across multiple repositories.
 
+> **Not your typical agent platform.** Kage is a CLI/TUI-first tool built for developers and power users who live in the terminal. No web dashboards, no drag-and-drop workflows, no managed cloud services. Just a single binary that gives you complete control over your AI agents through the command line.
+
 ## Quick Start
 
 ```bash
@@ -73,8 +75,11 @@ kage dashboard
 
 Running a single Claude Code session is straightforward. But what happens when you need agents working across multiple repositories? When you want to step away and let them work autonomously? When they need to share what they've learned?
 
-Kage solves these problems with a supervisor architecture:
+Kage solves these problems with a supervisor architecture designed for developers who prefer the terminal over browser-based interfaces. Unlike platforms like Copilot Workspace, Devin, or other agentic solutions that focus on web UIs and managed experiences, Kage is:
 
+- **CLI/TUI-first** — Every feature accessible from the command line, scriptable and composable
+- **Local and self-hosted** — Your machine, your data, your control. No cloud lock-in
+- **Transparent** — See exactly what agents are doing, no black-box abstractions
 - **Spawn agents with specific goals** — Give your agents clear objectives and let them work
 - **Monitor health and progress** — Track what your agents are doing in real-time
 - **Enforce iteration limits** — Set guardrails to prevent runaway execution
