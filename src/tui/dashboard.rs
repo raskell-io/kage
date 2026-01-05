@@ -3387,11 +3387,11 @@ impl Dashboard {
             && !self.setup_wizard.needs_setup;
 
         if self.prefix_active {
-            ("PENDING", Color::Rgb(250, 180, 100))  // Orange - waiting for command
+            ("PENDING", self.c().warning)  // Waiting for command
         } else if in_passthrough {
-            ("INSERT", Color::Rgb(130, 200, 130))   // Green - input goes to agent
+            ("INSERT", self.c().success)   // Input goes to agent
         } else {
-            ("NORMAL", Color::Rgb(130, 170, 230))   // Blue - navigating UI
+            ("NORMAL", self.c().info)      // Navigating UI
         }
     }
 
@@ -3496,7 +3496,7 @@ impl Dashboard {
         // Clear background
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Rgb(250, 180, 100))) // Orange like PENDING
+            .border_style(Style::default().fg(self.c().warning))
             .style(Style::default().bg(self.c().bg_surface));
         f.render_widget(block, popup_area);
 
@@ -3521,7 +3521,7 @@ impl Dashboard {
 
             let item_area = Rect { x, y, width: item_width, height: 1 };
             let item = Line::from(vec![
-                Span::styled(format!("{:<3}", key), Style::default().fg(Color::Rgb(250, 180, 100)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<3}", key), Style::default().fg(self.c().warning).add_modifier(Modifier::BOLD)),
                 Span::styled(*desc, Style::default().fg(self.c().text)),
             ]);
             f.render_widget(Paragraph::new(item), item_area);
@@ -5053,8 +5053,12 @@ pub async fn run() -> Result<()> {
         data_fetcher(fetch_tx, action_rx, socket_path).await;
     });
 
-    // Create dashboard with data channel
-    let mut dashboard = Dashboard::new().with_data_channel(rx, action_tx);
+    // Load theme from config
+    let config = crate::config::load().unwrap_or_default();
+    let theme = Theme::by_name(&config.tui.theme);
+
+    // Create dashboard with data channel and theme
+    let mut dashboard = Dashboard::with_theme(theme).with_data_channel(rx, action_tx);
 
     // Add initial log
     dashboard.logs.add_info("dashboard", "Starting dashboard...");

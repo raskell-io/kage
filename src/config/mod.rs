@@ -37,6 +37,10 @@ pub struct Config {
     #[serde(default)]
     pub secrets: SecretsConfig,
 
+    /// TUI settings
+    #[serde(default)]
+    pub tui: TuiConfig,
+
     /// Namespace definitions
     #[serde(default)]
     pub namespaces: std::collections::HashMap<String, NamespaceConfig>,
@@ -49,6 +53,7 @@ impl Default for Config {
             claude: ClaudeConfig::default(),
             memory: MemoryConfig::default(),
             secrets: SecretsConfig::default(),
+            tui: TuiConfig::default(),
             namespaces: std::collections::HashMap::new(),
         }
     }
@@ -172,6 +177,26 @@ impl Default for SecretsConfig {
     }
 }
 
+/// TUI configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TuiConfig {
+    /// Theme name (terminal, kage, catppuccin-mocha, catppuccin-latte, dracula, tokyo-night)
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+impl Default for TuiConfig {
+    fn default() -> Self {
+        Self {
+            theme: default_theme(),
+        }
+    }
+}
+
+fn default_theme() -> String {
+    "kage".to_string()
+}
+
 /// Namespace configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamespaceConfig {
@@ -276,15 +301,21 @@ pub fn mark_initialized() -> Result<()> {
 
 /// Load configuration from all sources
 pub fn load() -> Result<Config> {
-    // TODO: Implement full config loading with layering
-    Ok(Config::default())
+    let config_path = config_dir().join("config.toml");
+
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    } else {
+        Ok(Config::default())
+    }
 }
 
 /// Get the config directory path
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("kage")
+    // dirs::config_dir() already includes the app name via ProjectDirs
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 // Use dirs crate for XDG paths
